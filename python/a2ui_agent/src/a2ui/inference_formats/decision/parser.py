@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from a2ui.constants import A2UI_INFERENCE_CLOSE_TAG, A2UI_INFERENCE_OPEN_TAG
 from a2ui.core import A2uiError, CatalogApi
@@ -34,11 +34,36 @@ from a2ui.parser import (
     RawResponsePart,
     TextPart,
 )
+from a2ui.parser.messages import to_message_models
 
 from .decision_block import DecisionBlock, decision_block_from_messages
-from .models import SynthesisOutput, SynthesisStage
+from .models import SurfaceOperation, SynthesisOutput
 from .prompt_generator import DecisionPromptGenerator
 from .synthesizer import DecisionSynthesizer
+
+if TYPE_CHECKING:
+    from a2ui.utils import RendererState
+
+_ABSTAIN_HELP = "Add a 'fallbackDsl' field or configure fallback_fn on the synthesizer."
+
+
+def surface_operation_for(
+    block: DecisionBlock, state: RendererState | None, surface_id: str
+) -> tuple[SurfaceOperation, bool]:
+    """Decides how a block changes `surface_id`, from the renderer state.
+
+    Returns:
+        The operation (`REPLACE` when the block asks for it and the surface
+        exists, `UPDATE_ROOT` when the surface exists, else `CREATE`) and
+        whether the existing surface was created with `sendDataModel`.
+    """
+    surface = state.get_surface(surface_id) if state is not None else None
+    if surface is None:
+        return SurfaceOperation.CREATE, False
+    operation = (
+        SurfaceOperation.REPLACE if block.replace else SurfaceOperation.UPDATE_ROOT
+    )
+    return operation, bool(surface.send_data_model)
 
 
 class DecisionParser(Parser):
@@ -47,12 +72,19 @@ class DecisionParser(Parser):
     `compile` is synchronous by the `Parser` contract, so synthesis runs via
     `DecisionSynthesizer.synthesize_sync`, which works with or without a
     running event loop on the calling thread.
+
+    `parse_response` and `open_stream` go through `_apply_block`, which this
+    parser overrides to read the `RendererState` before synthesis: a block
+    whose surface already exists updates its root in place, or replaces it
+    when the block sets `replace`. `compile` has no state and always creates.
     """
 
     def __init__(
         self,
         synthesizer: DecisionSynthesizer,
         surface_id: str = "main",
+        *,
+        conversation_state: RendererState | None = None,
     ) -> None:
         """Creates a parser.
 
@@ -61,9 +93,13 @@ class DecisionParser(Parser):
             surface_id: Surface used when a block names none. A block's own
                 `surfaceId` wins; `SynthesisConfig.default_surface_id` is not
                 consulted on this path.
+            conversation_state: State used when a call passes none, so
+                surfaces persist across turns of one conversation. When None,
+                such calls get a new empty state, as with other formats.
         """
         self._synthesizer = synthesizer
         self.surface_id = surface_id
+        self._conversation_state = conversation_state
 
     @property
     def synthesizer(self) -> DecisionSynthesizer:
@@ -74,6 +110,70 @@ class DecisionParser(Parser):
     def catalogs(self) -> list[CatalogApi]:
         """A copy of the catalogs the synthesizer selects from."""
         return list(self._synthesizer.graph.catalogs)
+
+    def _empty_state(self) -> RendererState:
+        """Returns the conversation's state, or a new empty one."""
+        if self._conversation_state is not None:
+            return self._conversation_state
+        return super()._empty_state()
+
+    def _default_surface_id(self, idx: int, count: int) -> str:
+        return self.surface_id if count == 1 else f"{self.surface_id}_{idx}"
+
+    def _synthesize_block_sync(
+        self,
+        block: DecisionBlock,
+        default_id: str,
+        format_content: str,
+        state: RendererState | None,
+    ) -> SynthesisOutput:
+        """Synthesizes one block, mapping failures to compilation errors."""
+        target = block.surface_id or default_id
+        operation, sends_data_model = surface_operation_for(block, state, target)
+        try:
+            output = self._synthesizer.synthesize_sync(
+                block.intent,
+                block.payload,
+                operation=operation,
+                surface_sends_data_model=sends_data_model,
+                **block.to_synthesis_kwargs(default_surface_id=default_id),
+            )
+        except A2uiError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise A2uiCompilationValidationError(
+                message=str(exc), raw_content=format_content
+            ) from exc
+        except Exception as exc:
+            raise A2uiCompilationError(
+                f"Failed to compile A2UI block: {exc}", format_content
+            ) from exc
+        _require_messages(output, format_content)
+        return output
+
+    def _apply_block(
+        self, format_content: str, is_final: bool, state: RendererState
+    ) -> tuple[list[AgentToRendererMessage], list[str]]:
+        """Synthesizes each block against `state`, then applies its messages.
+
+        Each block's surface is looked up in `state` before synthesis (see
+        `surface_operation_for`), and its messages are applied before the
+        next block is synthesized.
+        """
+        del is_final
+        messages: list[AgentToRendererMessage] = []
+        touched: list[str] = []
+        blocks = self._extract_blocks(format_content)
+        for idx, block in enumerate(blocks, start=1):
+            default_id = self._default_surface_id(idx, len(blocks))
+            output = self._synthesize_block_sync(
+                block, default_id, format_content, state
+            )
+            for surface_id in state.apply(output.messages):
+                if surface_id not in touched:
+                    touched.append(surface_id)
+            messages.extend(output.messages)
+        return to_message_models(messages), touched
 
     def has_format_content(self, content: str, complete: bool = False) -> bool:
         """Checks whether `content` contains a decision block."""
@@ -184,20 +284,7 @@ class DecisionParser(Parser):
                 raise A2uiCompilationValidationError(
                     message=str(exc), raw_content=format_content
                 ) from exc
-            if not output.messages:
-                raise A2uiCompilationError(
-                    message=(
-                        "The decision model abstained"
-                        f" (confidence {output.confidence:.2f}) and no fallback"
-                        " produced messages."
-                    ),
-                    raw_content=format_content,
-                    help_message=(
-                        "Add a 'fallbackDsl' field, name a 'template', or enable"
-                        " fallback_card on the synthesizer."
-                    ),
-                )
-            assert output.stage in SynthesisStage
+            _require_messages(output, format_content)
             outputs.append(output)
         return outputs
 
@@ -205,6 +292,8 @@ class DecisionParser(Parser):
         self, format_content: str, *, is_final: bool = True
     ) -> list[AgentToRendererMessage]:
         """Synthesizes the messages for every decision block in `format_content`.
+
+        With no renderer state, every block creates its surface.
 
         Raises:
             A2uiCompilationParseError: If the block is not valid JSON.
@@ -217,37 +306,11 @@ class DecisionParser(Parser):
         messages_by_surface: dict[str, list[AgentToRendererMessage]] = {}
         blocks = self._extract_blocks(format_content)
         for idx, block in enumerate(blocks, start=1):
-            default_id = (
-                self.surface_id if len(blocks) == 1 else f"{self.surface_id}_{idx}"
+            default_id = self._default_surface_id(idx, len(blocks))
+            output = self._synthesize_block_sync(
+                block, default_id, format_content, None
             )
-            target_surface_id = block.surface_id or default_id
-            try:
-                output = self._synthesizer.synthesize_sync(
-                    block.intent,
-                    block.payload,
-                    **block.to_synthesis_kwargs(default_surface_id=default_id),
-                )
-            except A2uiError:
-                raise
-            except (TypeError, ValueError) as exc:
-                raise A2uiCompilationValidationError(
-                    message=str(exc), raw_content=format_content
-                ) from exc
-            if not output.messages:
-                raise A2uiCompilationError(
-                    message=(
-                        "The decision model abstained"
-                        f" (confidence {output.confidence:.2f}) and no fallback"
-                        " produced messages."
-                    ),
-                    raw_content=format_content,
-                    help_message=(
-                        "Add a 'fallbackDsl' field, name a 'template', or enable"
-                        " fallback_card on the synthesizer."
-                    ),
-                )
-            assert output.stage in SynthesisStage
-            messages_by_surface[target_surface_id] = list(output.messages)
+            messages_by_surface[block.surface_id or default_id] = list(output.messages)
         return [
             msg for surface_msgs in messages_by_surface.values() for msg in surface_msgs
         ]
@@ -263,4 +326,19 @@ class DecisionParser(Parser):
         )
 
 
-__all__ = ["DecisionParser"]
+def _require_messages(output: SynthesisOutput, format_content: str) -> None:
+    """Raises when synthesis produced no messages (abstention with no fallback)."""
+    if output.messages:
+        return
+    raise A2uiCompilationError(
+        message=(
+            "The decision model abstained"
+            f" (confidence {output.confidence:.2f}) and no fallback produced"
+            " messages."
+        ),
+        raw_content=format_content,
+        help_message=_ABSTAIN_HELP,
+    )
+
+
+__all__ = ["DecisionParser", "surface_operation_for"]

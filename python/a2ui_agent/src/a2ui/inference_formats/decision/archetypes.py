@@ -660,7 +660,7 @@ class ArchetypeGrammar:
                 "Archetype grammar failed lint:\n  " + "\n  ".join(findings)
             )
         return cls(
-            version=str(data["version"]),
+            version=str(data["grammarVersion"]),
             thresholds=thresholds,
             job=job,
             archetypes=archetypes,

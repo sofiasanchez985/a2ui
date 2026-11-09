@@ -31,7 +31,6 @@ from .decision import SynthesisConfig
 from .decision import SynthesisOutput
 from .decision import SynthesisStage
 from .decision import TemplateRegistry
-from .decision import calibrate_thresholds
 from .direct_json import DirectJsonDecompiler
 from .direct_json import DirectJsonFormat
 from .direct_json import DirectJsonFormatFactory
@@ -63,7 +62,6 @@ __all__ = [
     "SynthesisOutput",
     "SynthesisStage",
     "TemplateRegistry",
-    "calibrate_thresholds",
     "decision",
     "DirectJsonDecompiler",
     "DirectJsonFormat",

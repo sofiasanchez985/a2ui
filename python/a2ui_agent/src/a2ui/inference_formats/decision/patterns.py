@@ -238,9 +238,9 @@ class PatternLibrary(PatternCapabilities):
             for name, spec in raw_patterns.items()
         }
         return cls(
-            tuple(data["catalogIds"]),
+            (str(data["catalogId"]),),
             parsed,
-            version=str(data.get("version", "1")),
+            version=str(data.get("grammarVersion", "1")),
         )
 
     @classmethod
@@ -2048,8 +2048,32 @@ def _page_knobs(page: PageBindings, active_knobs: dict[str, str]) -> None:
         active_knobs.setdefault("stickyActions", "yes")
 
 
+@dataclass(frozen=True)
+class Expansion:
+    """Flat A2UI component dicts produced by one expansion, plus surface flags.
+
+    Attributes:
+        components: The emitted component dicts; the first is the root.
+        send_data_model: Whether the surface must be created with
+            `sendDataModel`. True only when some submit action in the
+            expansion resolves to no context bindings, so the agent needs the
+            whole data model with the event instead.
+    """
+
+    components: list[dict[str, Any]] = field(default_factory=list)
+    send_data_model: bool = False
+
+
 class PatternExpander:
-    """Expands catalog pattern templates into flat, validated A2UI component dicts."""
+    """Expands catalog pattern templates into flat, validated A2UI component dicts.
+
+    Stable block ids: a block's components keep the same ids every time the
+    same plan is expanded, so an `updateComponents` that replaces the root in
+    place reuses them. Every block's root component id is
+    ``<block_role>_root`` and every other component it emits is prefixed
+    ``<block_role>_``, where ``<block_role>`` is the grammar block id (the
+    caller's `id_prefix` when given). The page frame's root is ``root``.
+    """
 
     def __init__(
         self,
@@ -2118,7 +2142,7 @@ class PatternExpander:
         knobs: Mapping[str, str] | None = None,
         instances: Mapping[str, Mapping[str, str]] | None = None,
         id_prefix: str = "",
-    ) -> list[dict[str, Any]]:
+    ) -> Expansion:
         """Expands one block pattern into flat A2UI component dicts.
 
         Args:
@@ -2130,6 +2154,10 @@ class PatternExpander:
                 `PlannedBlock.instances` shape: element key to a mapping of
                 question name to option.
             id_prefix: Overrides `block_id` as the component id prefix.
+
+        Returns:
+            The block's components and whether any of its submit actions
+            needs `sendDataModel`.
         """
         active_knobs: dict[str, str] = dict(knobs or {})
         active_instances = _flatten_instances(instances)
@@ -2163,7 +2191,7 @@ class PatternExpander:
             scope,
             emitted,
         )
-        return _prune_empty_containers(emitted, root_id)
+        return Expansion(components=_prune_empty_containers(emitted, root_id))
 
     def expand_page(
         self,
@@ -2171,7 +2199,8 @@ class PatternExpander:
         block_roots: Sequence[str] = (),
         *,
         knobs: Mapping[str, str] | None = None,
-    ) -> list[dict[str, Any]]:
+        blocks: Sequence[Expansion] = (),
+    ) -> Expansion:
         """Expands the `page` pattern with ``root`` as the surface root component id.
 
         Args:
@@ -2179,6 +2208,13 @@ class PatternExpander:
             block_roots: Root component ids of the expanded blocks, in order.
             knobs: Extra page knobs; `page.dialog` and `page.sticky_actions`
                 set ``dialog`` and ``stickyActions`` unless given here.
+            blocks: The block expansions placed in the page, used to compute
+                the surface-wide `send_data_model`.
+
+        Returns:
+            The page frame's own components (block components are not
+            repeated), with `send_data_model` true when the page or any of
+            `blocks` needs it.
         """
         active_knobs: dict[str, str] = dict(knobs or {})
         _page_knobs(page, active_knobs)
@@ -2217,11 +2253,17 @@ class PatternExpander:
             mark_slot.bound or subtitle_slot.bound or block_roots
         ):
             emitted = [c for c in emitted if c.get("id") != "page_title"]
-        return _prune_empty_containers(emitted, "root", preserve_ids=set(block_roots))
+        return Expansion(
+            components=_prune_empty_containers(
+                emitted, "root", preserve_ids=set(block_roots)
+            ),
+            send_data_model=any(b.send_data_model for b in blocks),
+        )
 
 
 __all__ = [
     "CatalogPattern",
+    "Expansion",
     "MergedPatternLibrary",
     "PatternError",
     "PatternExpander",

@@ -38,6 +38,7 @@ from .archetypes import (
     SlotSpec,
 )
 from .models import (
+    ActionSpec,
     AuthoredCopy,
     BlockBindings,
     DecisionAnswer,
@@ -55,10 +56,10 @@ from .models import (
     SemanticType,
     SlotBinding,
     SynthesisConfig,
-    VarietyMode,
 )
 from .payload_inspector import PointerSummary, split_pointer
 from .semantic_types import humanize_key
+from .template_registry import SurfaceTemplate
 
 _PATTERN_VARIANT_REQ_RE = re.compile(r"^pattern:([a-z_]+):([a-z_]+)$")
 
@@ -128,7 +129,7 @@ class _AllCapabilities:
 
 @dataclass
 class PlannerState:
-    """State carried from `LayoutPlanner.build_batch` into `read` and `needs_reask`."""
+    """State carried from `LayoutPlanner.build_batch` into `read`."""
 
     intent: str
     pointers: tuple[PointerSummary, ...]
@@ -148,6 +149,10 @@ class PlannerState:
     action_gate_blocked: bool = False
     required_block_missing: bool = False
     copy: AuthoredCopy | None = None
+    templates: tuple[SurfaceTemplate, ...] = ()
+    """Registered templates whose required pointers the payload satisfies."""
+    actions: tuple[ActionSpec, ...] = ()
+    """The actions the decision block declared, in order."""
     seed: int | None = None
     rng: random.Random | None = None
 
@@ -1387,16 +1392,7 @@ def _try_recover_orphan_collection(
     planner: LayoutPlanner,
 ) -> None:
     """Appends a `collection` block when an unclaimed data array exists."""
-    arch_block_ids = (
-        set(state.selected_archetype.block_ids())
-        if state.selected_archetype is not None
-        else set()
-    )
-    gate_overridden = "collection" in arch_block_ids and (
-        "optional" in planner.config.threshold_overrides
-        or "expected" in planner.config.threshold_overrides
-    )
-    if gate_overridden or (present_ids & {"collection", "steps", "comparison"}):
+    if present_ids & {"collection", "steps", "comparison"}:
         return
     if not _has_uncovered_data_array(state.pointers, claimed):
         return
@@ -1852,17 +1848,16 @@ class LayoutPlanner:
 
     @property
     def config(self) -> SynthesisConfig:
-        """The `SynthesisConfig` governing pair budgets and threshold overrides."""
+        """The `SynthesisConfig` governing the pair budget and conservativeness."""
         return self._config
 
     def threshold(self, name: str) -> float:
-        """The effective threshold `name`: a `config.threshold_overrides` entry, else the grammar's.
+        """The grammar's threshold `name`.
 
         Raises:
-            KeyError: If neither the overrides nor the grammar define `name`.
+            KeyError: If the grammar does not define `name`.
         """
-        override = self._config.threshold_overrides.get(name)
-        return override if override is not None else self._grammar.threshold(name)
+        return self._grammar.threshold(name)
 
     def bind_slots(
         self,
@@ -2026,6 +2021,8 @@ class LayoutPlanner:
         brief: LayoutBrief | None = None,
         payload: Mapping[str, Any] | None = None,
         copy: AuthoredCopy | None = None,
+        templates: Sequence[SurfaceTemplate] = (),
+        actions: Sequence[ActionSpec] = (),
     ) -> tuple[DecisionBatch, PlannerState]:
         """Builds a speculative `DecisionBatch` and `PlannerState` for one surface.
 
@@ -2039,6 +2036,13 @@ class LayoutPlanner:
                 option values; questions degrade to key-derived text without it.
             copy: Optional authored title and summary strings supplied in the
                 decision block.
+            templates: Registered templates that match the payload. When any
+                are given, the batch carries one `template` choice question
+                (template ids plus ``"compose"``), read first by `read`
+                against the grammar's `template` threshold (`templateMutable`
+                when the payload has mutable pointers).
+            actions: The block's actions. They bind the `actions` block
+                instead of payload keys.
         """
         norm_pointers = _normalize_pointers(pointers)
         elig = (
@@ -2056,6 +2060,8 @@ class LayoutPlanner:
             batch=DecisionBatch(shared_context={}, questions=()),
             payload=dict(payload) if payload is not None else {},
             copy=copy,
+            templates=tuple(templates),
+            actions=tuple(actions),
         )
         questions: list[DecisionQuestion] = []
         self._append_job_questions(questions, state)
@@ -2082,8 +2088,14 @@ class LayoutPlanner:
         brief: LayoutBrief | None = None,
         payload: Mapping[str, Any] | None = None,
         copy: AuthoredCopy | None = None,
+        templates: Sequence[SurfaceTemplate] = (),
+        actions: Sequence[ActionSpec] = (),
     ) -> tuple[DecisionBatch, PlannerState]:
-        """Builds Stage 1 (`family`, `stakes`, `urgency`, and `archetype:*`) of a two-stage batch."""
+        """Builds Stage 1 (`family`, `stakes`, `urgency`, and `archetype:*`) of a two-stage batch.
+
+        `templates` and `actions` are as in `build_batch`; the `template`
+        question belongs to Stage 1.
+        """
         norm_pointers = _normalize_pointers(pointers)
         elig = (
             tuple(eligible)
@@ -2100,6 +2112,8 @@ class LayoutPlanner:
             batch=DecisionBatch(shared_context={}, questions=()),
             payload=dict(payload) if payload is not None else {},
             copy=copy,
+            templates=tuple(templates),
+            actions=tuple(actions),
         )
         questions: list[DecisionQuestion] = []
         self._append_job_questions(questions, state)
@@ -2714,15 +2728,14 @@ class LayoutPlanner:
         self,
         state: PlannerState,
         answers: Sequence[DecisionAnswer],
-        *,
-        seed: int | None = None,
     ) -> PlanOutcome:
-        """Reads backend `answers` into a validated `PlanOutcome`."""
-        state.seed = seed
-        if self._config.variety is VarietyMode.NEAR_TOP:
-            state.rng = random.Random(seed)
-        else:
-            state.rng = None
+        """Reads backend `answers` into a validated `PlanOutcome`.
+
+        When the batch carried a `template` question and its winner clears
+        the threshold, the plan's `LayoutPlan.template_id` names that
+        template; otherwise it is None.
+        """
+        state.rng = None
         self._validate_and_index_answers(state, answers)
         family = self._read_family(state)
         if family is None:
@@ -3095,32 +3108,9 @@ class LayoutPlanner:
         kind: str = "option",
         rng: random.Random | None = None,
     ) -> tuple[str, float]:
-        """Picks a winning option from `answer` using ARGMAX or NEAR_TOP sampling."""
-        if (
-            self._config.variety is not VarietyMode.NEAR_TOP
-            or rng is None
-            or not answer.distribution.probabilities
-        ):
-            return answer.top()
-
-        probs = {
-            opt: prob
-            for opt, prob in answer.distribution.probabilities.items()
-            if opt != "none"
-        }
-        if not probs:
-            return answer.top()
-
-        top_opt, top_prob = max(probs.items(), key=lambda item: item[1])
-        cutoff = top_prob - self._config.variety_margin
-        near_top = [(opt, prob) for opt, prob in probs.items() if prob >= cutoff]
-        if len(near_top) <= 1:
-            return top_opt, top_prob
-
-        candidates = [opt for opt, _ in near_top]
-        weights = [prob for _, prob in near_top]
-        chosen = rng.choices(candidates, weights=weights, k=1)[0]
-        return chosen, probs[chosen]
+        """Picks the highest-probability option from `answer`."""
+        del kind, rng
+        return answer.top()
 
     def _resolve_block_questions(
         self,
@@ -3388,32 +3378,6 @@ class LayoutPlanner:
             instances[label] = entry
         return instances
 
-    def needs_reask(
-        self, plan: LayoutPlan, state: PlannerState
-    ) -> tuple[DecisionQuestion, ...]:
-        """Returns depended-on questions whose winning probability is below `reask_below`."""
-        active_blocks = set(plan.block_ids())
-        active_ptrs: set[str] = set()
-        for block in plan.blocks:
-            active_ptrs.update(block.bindings.pointers())
-        reask: list[DecisionQuestion] = []
-        for question in state.batch.questions:
-            if not _question_affects_plan(
-                question.id, plan.family, active_blocks, active_ptrs
-            ):
-                continue
-            ans = state.answers_by_id.get(question.id)
-            if ans is None:
-                continue
-            win_prob = (
-                max(ans.yes, 1.0 - ans.yes)
-                if question.kind is QuestionKind.BOOLEAN
-                else ans.top()[1]
-            )
-            if win_prob < self.threshold("reask_below"):
-                reask.append(question)
-        return tuple(reask)
-
 
 _MAX_SALIENCE_QUESTIONS = 20
 
@@ -3441,30 +3405,3 @@ def _item_instance_applies(
         _single_apply_condition_holds(k, req, item, ptr)
         for k, req in q_spec.applies_when.items()
     )
-
-
-def _question_affects_plan(
-    question_id: str,
-    family: str,
-    active_blocks: set[str],
-    active_ptrs: set[str],
-) -> bool:
-    """Returns whether `question_id` governs a block or element present in `plan`."""
-    if question_id in {"family", f"archetype:{family}"}:
-        return True
-    if question_id.startswith("anatomy:"):
-        block_id = question_id[len("anatomy:") :].split(".", 1)[0]
-        return block_id in active_blocks
-    if question_id.startswith("instance:"):
-        rest = question_id[len("instance:") :]
-        block_id = rest.split(".", 1)[0]
-        if block_id not in active_blocks:
-            return False
-        _, _, elem_key = rest.partition(":")
-        if elem_key.startswith("/"):
-            return elem_key in active_ptrs
-        return True
-    if question_id.startswith("gate:"):
-        block_id = question_id[len("gate:") :]
-        return block_id in active_blocks
-    return False
