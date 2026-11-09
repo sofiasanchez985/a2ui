@@ -2,20 +2,23 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://a2ui.org/specification/v1_0/decision/pattern_definition.json",
   "title": "A2UI decision catalog pattern file",
-  "description": "How one component catalog draws the abstract layout patterns named by the decision archetype grammar.",
+  "description": "How one component catalog draws the abstract layout patterns named by the decision archetype grammar. Experimental and non-normative: the Python agent SDK (a2ui.inference_formats.decision) is the reference implementation. A catalog's pattern file is part of that catalog and must validate after any component change.",
   "type": "object",
-  "required": ["catalogIds", "version", "patterns"],
+  "required": ["catalogId", "grammarVersion", "patterns"],
   "additionalProperties": false,
   "properties": {
     "$schema": {"type": "string"},
-    "catalogIds": {
-      "type": "array",
-      "description": "Catalog ids (the `catalogId` of each catalog.json) this file applies to.",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": {"type": "string", "format": "uri", "minLength": 1}
+    "catalogId": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 1,
+      "description": "The `catalogId` of the one catalog.json this file applies to. Keep one pattern file per catalog and protocol version."
     },
-    "version": {"type": "string", "minLength": 1},
+    "grammarVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The `grammarVersion` of the archetype grammar these patterns target."
+    },
     "patterns": {
       "type": "object",
       "minProperties": 1,
@@ -119,7 +122,7 @@
         "$event": {"$ref": "#/$defs/eventDirective"},
         "$blocks": {"$ref": "#/$defs/blocksDirective"},
         "$knobValue": {"$ref": "#/$defs/knobValueDirective"},
-        "$item": {"$ref": "#/$defs/itemDirective"}
+        "$actionContext": {"$ref": "#/$defs/actionContextDirective"}
       },
       "patternProperties": {
         "^[^$]": {"$ref": "#/$defs/templateValue"}
@@ -137,7 +140,7 @@
     },
     "defaultDirective": {
       "$ref": "#/$defs/templateValue",
-      "description": "Literal used when the `$slot` or `$knobValue` beside it resolves to nothing."
+      "description": "Literal used when the `$slot`, `$knobValue`, or `$event` beside it resolves to nothing."
     },
     "ifDirective": {
       "type": "string",
@@ -188,7 +191,7 @@
     "eventDirective": {
       "type": "string",
       "minLength": 1,
-      "description": "Event name, or a slot whose value is slugged into the event name; emits `{\"event\": {\"name\": ...}}` plus `context`."
+      "description": "A slot bound to an agent action id, which becomes the event name. When the slot is unbound, `$default` beside it is the literal event name (the slot name itself if there is no `$default`). Labels never become event names. Emits `{\"event\": {\"name\": ...}}` plus `context`."
     },
     "blocksDirective": {
       "const": true,
@@ -199,9 +202,9 @@
       "minLength": 1,
       "description": "`knob.property` lookup into the plan; `$default` applies when absent."
     },
-    "itemDirective": {
+    "actionContextDirective": {
       "const": true,
-      "description": "Inside `$repeat`, the current element's pointer, bound as the event context."
+      "description": "Inside an `$event` `context`, resolves to the action's own context pointers; else, inside `$repeat`, a binding to the current item's key field; else, for a form submit, every editable pointer of the block."
     }
   }
 }
