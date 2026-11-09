@@ -279,7 +279,6 @@ class TestTemplateRegistry:
             messages=raw_messages,
             confidence=0.92,
             entropy=0.12,
-            component_tree_spec={"root_component": "TickerCard"},
         )
 
         promoted = registry.promote_synthesized(
