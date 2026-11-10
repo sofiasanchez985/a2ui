@@ -43,15 +43,15 @@ from .bindings import is_v10 as _is_v10
 from .bindings import make_data_binding, make_function_call
 from .catalog_graph import CatalogDecisionGraph
 from .models import (
+    ActionSpec,
     BlockBindings,
     PageBindings,
     PatternCapabilities,
     SlotBinding,
 )
-from .payload_inspector import PointerSummary
+from .payload_inspector import PointerSummary, split_pointer
 
 _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_$.]+)\}")
-_SLUG_RE = re.compile(r"[^a-zA-Z0-9_]+")
 _HEADING_LINE_RE = re.compile(r"^\s*#{1,6}\s")
 
 _OMIT = object()
@@ -201,26 +201,28 @@ def _split_pattern_query(name: str, variant: str | None) -> tuple[str, str | Non
 
 
 class PatternLibrary(PatternCapabilities):
-    """Pattern definitions loaded for one catalog (or versioned catalog family)."""
+    """Pattern definitions loaded for a single catalog."""
 
     def __init__(
         self,
-        catalog_ids: Sequence[str] | str,
+        catalog_id: str,
         patterns: Mapping[str, CatalogPattern],
         *,
-        version: str = "1",
+        grammar_version: str = "1",
     ) -> None:
-        if isinstance(catalog_ids, str):
-            ids: tuple[str, ...] = (catalog_ids,) if catalog_ids else ()
-        else:
-            ids = tuple(str(c) for c in catalog_ids if c)
-        self.catalog_ids: tuple[str, ...] = ids
-        self.catalog_id: str = ids[0] if ids else ""
-        self.version: str = version
+        clean_id = str(catalog_id) if catalog_id else ""
+        self.catalog_id: str = clean_id
+        self.catalog_ids: tuple[str, ...] = (clean_id,) if clean_id else ()
+        self.grammar_version: str = str(grammar_version)
         self.patterns: Mapping[str, CatalogPattern] = dict(patterns)
 
     @classmethod
-    def from_json(cls, data: Mapping[str, Any]) -> PatternLibrary:
+    def from_json(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        grammar: ArchetypeGrammar | None = None,
+    ) -> PatternLibrary:
         """Validates `data` against ``pattern_definition.json`` and returns a library."""
         if not isinstance(data, Mapping):
             raise PatternError("Pattern library JSON must be an object.")
@@ -232,25 +234,38 @@ class PatternLibrary(PatternCapabilities):
             first = errors[0]
             loc = "/".join(str(p) for p in first.absolute_path) or "<root>"
             raise PatternError(f"Invalid pattern definition at {loc}: {first.message}")
+        expected_version = (grammar or ArchetypeGrammar.default()).version
+        actual_version = str(data["grammarVersion"])
+        if actual_version != expected_version:
+            raise PatternError(
+                f"Pattern library for {data['catalogId']!r} targets"
+                f" grammarVersion {actual_version!r}, expected"
+                f" {expected_version!r}."
+            )
         raw_patterns = data["patterns"]
         parsed = {
             name: CatalogPattern.from_json(name, spec)
             for name, spec in raw_patterns.items()
         }
         return cls(
-            (str(data["catalogId"]),),
+            str(data["catalogId"]),
             parsed,
-            version=str(data.get("grammarVersion", "1")),
+            grammar_version=actual_version,
         )
 
     @classmethod
-    def from_file(cls, path: str | Path) -> PatternLibrary:
+    def from_file(
+        cls,
+        path: str | Path,
+        *,
+        grammar: ArchetypeGrammar | None = None,
+    ) -> PatternLibrary:
         """Loads and validates a `PatternLibrary` from a `patterns.json` file or directory."""
         resolved = Path(path)
         if resolved.is_dir():
             resolved = resolved / "patterns.json"
         raw = json.loads(resolved.read_text(encoding="utf-8"))
-        return cls.from_json(raw)
+        return cls.from_json(raw, grammar=grammar)
 
     def has_pattern(self, name: str, variant: str | None = None) -> bool:
         """Whether `name` (and `variant`, when given) is defined; implements `PatternCapabilities`."""
@@ -289,8 +304,8 @@ def _bundled_pattern_libraries() -> Mapping[str, PatternLibrary]:
     for entry in entries:
         raw = json.loads(entry.read_text(encoding="utf-8"))
         lib = PatternLibrary.from_json(raw)
-        for cat_id in lib.catalog_ids:
-            by_catalog_id[cat_id] = lib
+        if lib.catalog_id:
+            by_catalog_id[lib.catalog_id] = lib
     return by_catalog_id
 
 
@@ -303,9 +318,8 @@ class MergedPatternLibrary(PatternCapabilities):
         owners: dict[str, str] = {}
         cat_ids: list[str] = []
         for lib in self.libraries:
-            for cid in lib.catalog_ids:
-                if cid and cid not in cat_ids:
-                    cat_ids.append(cid)
+            if lib.catalog_id and lib.catalog_id not in cat_ids:
+                cat_ids.append(lib.catalog_id)
             for name, pat in lib.patterns.items():
                 if name not in merged:
                     merged[name] = pat
@@ -322,6 +336,7 @@ class MergedPatternLibrary(PatternCapabilities):
         the merged result always lists every catalog id.
         """
         bundled = _bundled_pattern_libraries()
+        default_ver = ArchetypeGrammar.default().version
         matched: list[PatternLibrary] = []
         for catalog in catalogs:
             cat_id = catalog.catalog_id
@@ -329,13 +344,13 @@ class MergedPatternLibrary(PatternCapabilities):
             if lib is not None:
                 matched.append(
                     PatternLibrary(
-                        (cat_id, *lib.catalog_ids),
+                        cat_id,
                         lib.patterns,
-                        version=lib.version,
+                        grammar_version=lib.grammar_version,
                     )
                 )
             else:
-                matched.append(PatternLibrary((cat_id,), {}))
+                matched.append(PatternLibrary(cat_id, {}, grammar_version=default_ver))
         return cls(matched)
 
     def has_pattern(self, name: str, variant: str | None = None) -> bool:
@@ -771,6 +786,13 @@ def shape_signature(pointers: Sequence[PointerSummary]) -> tuple[Any, ...]:
 # --- Pattern Expansion ---
 
 
+@dataclass
+class _ExpansionTracker:
+    """Mutable accumulator across a single `expand_block` or `expand_page` call."""
+
+    has_empty_non_item_action: bool = False
+
+
 @dataclass(frozen=True)
 class _ExpansionScope:
     """Context carried while expanding one pattern or `$repeat` item."""
@@ -786,7 +808,8 @@ class _ExpansionScope:
     item_index: int | None = None
     item_pointer: str | None = None
     in_template_repeat: bool = False
-    is_v10: bool = True
+    in_item_repeat: bool = False
+    tracker: _ExpansionTracker = field(default_factory=_ExpansionTracker)
 
 
 def _lookup_slot(scope: _ExpansionScope, slot_path: str) -> SlotBinding | None:
@@ -845,22 +868,35 @@ def _eval_text_directive(template: str, scope: _ExpansionScope) -> Any:
 
     interpolated = _PLACEHOLDER_RE.sub(_replace, template)
     if has_pointer:
-        return make_function_call(
-            "formatString", {"value": interpolated}, is_v10=scope.is_v10
-        )
+        return make_function_call("formatString", {"value": interpolated}, is_v10=True)
     return interpolated
 
 
 def _literal_to_str(val: Any) -> str:
     """Formats a literal slot value as a lowercase boolean or string."""
+    if isinstance(val, ActionSpec):
+        return val.id
     return str(val).lower() if isinstance(val, bool) else str(val)
 
 
+def _action_literal_id(slot: SlotBinding | None) -> str | None:
+    """Extracts the action id string from `slot`, when bound."""
+    if slot is None or slot.literal is None:
+        return None
+    if isinstance(slot.literal, ActionSpec):
+        return slot.literal.id
+    text = str(slot.literal)
+    return text if text else None
+
+
 def _item_identity_tokens(scope: _ExpansionScope) -> list[str]:
-    """Returns pointer, label, and index tokens identifying the current item."""
+    """Returns pointer, action id, label, and index tokens identifying the current item."""
     tokens: list[str] = []
     if scope.item_pointer:
         tokens.append(scope.item_pointer)
+    act_id = _action_literal_id(scope.item_fields.get("action"))
+    if act_id is not None:
+        tokens.append(act_id)
     label_slot = scope.item_fields.get("label")
     if label_slot is not None:
         if label_slot.literal is not None:
@@ -932,10 +968,12 @@ def _lookup_instance_or_knob(scope: _ExpansionScope, key: str) -> str | None:
 
 
 def _matches_item_identity(scope: _ExpansionScope, target: str) -> bool:
-    """Returns whether `target` matches the current item's index, pointer, or label."""
+    """Returns whether `target` matches the current item's index, pointer, action id, or label."""
     if scope.item_index is not None and target == str(scope.item_index):
         return True
     if scope.item_pointer and target == scope.item_pointer:
+        return True
+    if _action_literal_id(scope.item_fields.get("action")) == target:
         return True
     label_slot = scope.item_fields.get("label")
     if label_slot is not None and (
@@ -973,60 +1011,166 @@ def _eval_map_directive(directive: Mapping[str, Any], scope: _ExpansionScope) ->
     return next(iter(options.values()), "")
 
 
-def _slugify_event_name(raw: str) -> str:
-    """Converts a button label or pointer into a clean action event name."""
-    slug = _SLUG_RE.sub("_", raw.strip().lower()).strip("_")
-    return slug or "action"
+def _event_slot_name(raw_event: Any) -> str:
+    """Extracts the action slot name from an ``$event`` value."""
+    if isinstance(raw_event, Mapping) and "$action" in raw_event:
+        return str(raw_event["$action"])
+    return str(raw_event)
 
 
-def _resolve_event_name(raw_name: str, scope: _ExpansionScope) -> str:
-    """Resolves an ``$event`` slot or literal name into a clean event name."""
-    slot = _lookup_slot(scope, raw_name)
-    if slot is not None and slot.literal is not None:
-        return _slugify_event_name(str(slot.literal))
-    if slot is not None and slot.pointer:
-        return _slugify_event_name(slot.pointer.rsplit("/", 1)[-1])
-    return raw_name
+def _resolve_event_name(
+    directive: Mapping[str, Any], scope: _ExpansionScope
+) -> tuple[str, SlotBinding | None]:
+    """Resolves an ``$event`` directive to ``(event_name, action_slot)``."""
+    slot_name = _event_slot_name(directive["$event"])
+    slot = _lookup_slot(scope, slot_name)
+    act_id = _action_literal_id(slot)
+    if act_id is not None:
+        return act_id, slot
+    if "$default" in directive and str(directive["$default"]):
+        return str(directive["$default"]), slot
+    return slot_name, slot
+
+
+def _explicit_action_context(slot: SlotBinding | None) -> dict[str, Any]:
+    """Resolves `ActionSpec.context` pointers carried on `slot`, if any."""
+    if slot is None:
+        return {}
+    if isinstance(slot.literal, ActionSpec) and slot.literal.context:
+        return {
+            name: make_data_binding(ptr, is_v10=True)
+            for name, ptr in slot.literal.context.items()
+        }
+    ctx_meta = slot.fields.get("$context")
+    if ctx_meta is None or not ctx_meta.fields:
+        return {}
+    return {
+        name: make_data_binding(sb.pointer, is_v10=True)
+        for name, sb in ctx_meta.fields.items()
+        if sb.pointer
+    }
+
+
+def _item_key_name(slot: SlotBinding | None, scope: _ExpansionScope) -> str | None:
+    """Returns `ActionSpec.key`, else ``id`` when present on the repeated item."""
+    if slot is not None:
+        if isinstance(slot.literal, ActionSpec) and slot.literal.key:
+            return slot.literal.key
+        key_meta = slot.fields.get("$key")
+        if key_meta is not None and key_meta.literal:
+            return str(key_meta.literal)
+    id_slot = scope.item_fields.get("id")
+    if id_slot is not None and id_slot.bound:
+        return "id"
+    return None
+
+
+def _item_repeat_context(
+    slot: SlotBinding | None, scope: _ExpansionScope
+) -> dict[str, Any]:
+    """Resolves the item key binding inside an item `$repeat`."""
+    key_name = _item_key_name(slot, scope)
+    if not key_name:
+        return {}
+    field_slot = scope.item_fields.get(key_name)
+    if scope.in_template_repeat:
+        rel_path = (
+            field_slot.pointer
+            if field_slot is not None and field_slot.pointer
+            else key_name
+        ).lstrip("/")
+        return {key_name: make_data_binding(rel_path, is_v10=True)}
+    if field_slot is not None and field_slot.pointer:
+        return {key_name: make_data_binding(field_slot.pointer, is_v10=True)}
+    if scope.item_pointer:
+        joined = f"{scope.item_pointer.rstrip('/')}/{key_name.lstrip('/')}"
+        return {key_name: make_data_binding(joined, is_v10=True)}
+    return {}
+
+
+def _slot_item_pointers(slot: SlotBinding | None, key: str) -> list[str]:
+    """Extracts non-empty pointer strings from `slot.items[*][key]`."""
+    if slot is None or not slot.items:
+        return []
+    return [ptr for it in slot.items if key in it and (ptr := it[key].pointer)]
+
+
+def _mutable_context_pointers(bindings: BlockBindings) -> list[str]:
+    """Extracts mutable scalar pointers attached for form submission."""
+    mut_slot = bindings.slots.get("$mutable")
+    if mut_slot is not None and mut_slot.fields:
+        return [s.pointer for s in mut_slot.fields.values() if s.pointer]
+    return _slot_item_pointers(mut_slot, "pointer") or _slot_item_pointers(
+        bindings.slots.get("fields"), "value"
+    )
+
+
+def _form_submit_context(bindings: BlockBindings) -> dict[str, Any]:
+    """Binds every mutable pointer into a context map keyed by field name."""
+    pointers = _mutable_context_pointers(bindings)
+    if not pointers:
+        return {}
+    leaf_counts: dict[str, int] = {}
+    for ptr in pointers:
+        leaf = split_pointer(ptr)[1] or ptr.lstrip("/")
+        leaf_counts[leaf] = leaf_counts.get(leaf, 0) + 1
+    out: dict[str, Any] = {}
+    for ptr in pointers:
+        leaf = split_pointer(ptr)[1] or ptr.lstrip("/")
+        ctx_key = leaf if leaf_counts[leaf] == 1 else ptr.lstrip("/").replace("/", "_")
+        out[ctx_key] = make_data_binding(ptr, is_v10=True)
+    return out
+
+
+def _resolve_action_context(
+    action_slot: SlotBinding | None, scope: _ExpansionScope
+) -> dict[str, Any]:
+    """Resolves ``{"$actionContext": true}`` per the grammar contract."""
+    explicit = _explicit_action_context(action_slot)
+    if explicit:
+        return explicit
+    if scope.in_template_repeat or scope.in_item_repeat:
+        return _item_repeat_context(action_slot, scope)
+    return _form_submit_context(scope.bindings)
 
 
 def _resolve_event_context(
-    raw_ctx: Any, scope: _ExpansionScope
-) -> dict[str, Any] | None:
+    raw_ctx: Any, action_slot: SlotBinding | None, scope: _ExpansionScope
+) -> dict[str, Any]:
     """Resolves the optional ``context`` mapping on an ``$event`` directive."""
     if not isinstance(raw_ctx, Mapping):
-        return None
-    if raw_ctx.get("$item") is True:
-        if not scope.item_pointer:
-            return None
-        return {"item": make_data_binding(scope.item_pointer, is_v10=scope.is_v10)}
+        return {}
+    if raw_ctx.get("$actionContext") is True:
+        return _resolve_action_context(action_slot, scope)
     ctx_out: dict[str, Any] = {}
     for k, v in raw_ctx.items():
         resolved = _eval_property_value(v, scope)
         if resolved is not _OMIT and resolved is not None:
             ctx_out[k] = resolved
-    return ctx_out or None
+    return ctx_out
 
 
 def _eval_event_directive(
     directive: Mapping[str, Any], scope: _ExpansionScope
 ) -> dict[str, Any]:
-    """Evaluates an ``$event`` directive into an A2UI ``{"event": ...}`` dict."""
-    event_body: dict[str, Any] = {
-        "name": _resolve_event_name(str(directive["$event"]), scope)
-    }
-    ctx = _resolve_event_context(directive.get("context"), scope)
-    if ctx is not None:
+    """Evaluates an ``$event`` directive into an A2UI v1.0 ``{"event": ...}`` dict."""
+    event_name, action_slot = _resolve_event_name(directive, scope)
+    event_body: dict[str, Any] = {"name": event_name}
+    ctx = _resolve_event_context(directive.get("context"), action_slot, scope)
+    if ctx:
         event_body["context"] = ctx
+    elif not (scope.in_template_repeat or scope.in_item_repeat):
+        scope.tracker.has_empty_non_item_action = True
     return {"event": event_body}
 
 
 def _eval_slot_directive(directive: Mapping[str, Any], scope: _ExpansionScope) -> Any:
-    """Evaluates a ``$slot`` directive into a data binding, literal, or default."""
+    """Evaluates a ``$slot`` directive into a v1.0 data binding, literal, or default."""
     slot_name = str(directive["$slot"])
     binding = _lookup_slot(scope, slot_name)
     if binding is not None and binding.bound:
         if binding.pointer:
-            return make_data_binding(binding.pointer, is_v10=scope.is_v10)
+            return make_data_binding(binding.pointer, is_v10=True)
         if binding.literal is not None:
             return copy.deepcopy(binding.literal)
     if "$default" in directive:
@@ -1108,7 +1252,7 @@ def _eval_mapping_property(raw: Mapping[str, Any], scope: _ExpansionScope) -> An
         return make_function_call(
             str(call_fn),
             args if isinstance(args, Mapping) else {},
-            is_v10=scope.is_v10,
+            is_v10=True,
         )
     out: dict[str, Any] = {}
     for k, v in raw.items():
@@ -1214,182 +1358,6 @@ def _resolve_child_entry(
     return [prefix_fn(str(child_id))] if isinstance(child_id, str) else []
 
 
-def _normalize_options_list(raw: Any) -> list[dict[str, Any]]:
-    """Normalizes `ChoicePicker.options` into ``[{"label": ..., "value": ...}]``."""
-    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in raw:
-        if isinstance(item, Mapping) and "label" in item and "value" in item:
-            out.append({"label": item["label"], "value": str(item["value"])})
-        else:
-            text = str(item)
-            out.append({"label": text, "value": text})
-    return out
-
-
-_VALID_ICON_NAMES = frozenset({
-    "accountCircle",
-    "add",
-    "arrowBack",
-    "arrowForward",
-    "attachFile",
-    "calendarToday",
-    "call",
-    "camera",
-    "check",
-    "close",
-    "delete",
-    "download",
-    "edit",
-    "event",
-    "error",
-    "fastForward",
-    "favorite",
-    "favoriteOff",
-    "folder",
-    "help",
-    "home",
-    "info",
-    "locationOn",
-    "lock",
-    "lockOpen",
-    "mail",
-    "menu",
-    "moreVert",
-    "moreHoriz",
-    "notificationsOff",
-    "notifications",
-    "pause",
-    "payment",
-    "person",
-    "phone",
-    "photo",
-    "play",
-    "print",
-    "refresh",
-    "rewind",
-    "search",
-    "send",
-    "settings",
-    "share",
-    "shoppingCart",
-    "skipNext",
-    "skipPrevious",
-    "star",
-    "starHalf",
-    "starOff",
-    "stop",
-    "upload",
-    "visibility",
-    "visibilityOff",
-    "volumeDown",
-    "volumeMute",
-    "volumeOff",
-    "volumeUp",
-    "warning",
-})
-
-
-def _coerce_text(comp: dict[str, Any]) -> None:
-    """Normalizes `Text.text`."""
-    text_val = comp.get("text")
-    if text_val is None:
-        comp["text"] = ""
-    elif isinstance(text_val, (int, float, bool)):
-        comp["text"] = str(text_val)
-
-
-def _coerce_icon(comp: dict[str, Any]) -> None:
-    """Normalizes `Icon.name` against `BasicCatalog` `IconName` enum values."""
-    name_val = comp.get("name")
-    if name_val is None or (
-        isinstance(name_val, str) and name_val not in _VALID_ICON_NAMES
-    ):
-        comp["name"] = "info"
-
-
-def _coerce_checkbox(comp: dict[str, Any]) -> None:
-    """Normalizes `CheckBox` `label` and `value` properties."""
-    comp.setdefault("label", "")
-    if "value" not in comp or isinstance(comp["value"], str):
-        comp["value"] = bool(comp.get("value"))
-
-
-def _coerce_choice_picker(comp: dict[str, Any]) -> None:
-    """Normalizes `ChoicePicker` `options` and `value` properties."""
-    comp["options"] = _normalize_options_list(comp.get("options"))
-    val = comp.get("value")
-    if val is None:
-        comp["value"] = []
-    elif isinstance(val, Mapping):
-        return
-    elif isinstance(val, list):
-        comp["value"] = [str(x) for x in val]
-    else:
-        comp["value"] = [str(val)]
-
-
-def _coerce_slider(comp: dict[str, Any]) -> None:
-    """Normalizes `Slider` `min`, `max`, and `value` properties."""
-    if not isinstance(comp.get("min"), (int, float)) or isinstance(
-        comp.get("min"), bool
-    ):
-        comp["min"] = 0
-    if not isinstance(comp.get("max"), (int, float)) or isinstance(
-        comp.get("max"), bool
-    ):
-        comp["max"] = 100
-    val = comp.get("value")
-    if isinstance(val, Mapping):
-        return
-    if isinstance(val, bool) or not isinstance(val, (int, float)):
-        try:
-            comp["value"] = float(str(val))
-        except (TypeError, ValueError):
-            comp["value"] = 0
-
-
-def _coerce_text_field(comp: dict[str, Any]) -> None:
-    """Normalizes `TextField` `label` property."""
-    comp.setdefault("label", "")
-
-
-def _coerce_datetime_input(comp: dict[str, Any]) -> None:
-    """Normalizes `DateTimeInput` `value` property."""
-    comp.setdefault("value", "")
-
-
-_COMPONENT_COERCERS: Mapping[str, Callable[[dict[str, Any]], None]] = {
-    "Text": _coerce_text,
-    "Icon": _coerce_icon,
-    "ChoicePicker": _coerce_choice_picker,
-    "CheckBox": _coerce_checkbox,
-    "Slider": _coerce_slider,
-    "TextField": _coerce_text_field,
-    "DateTimeInput": _coerce_datetime_input,
-}
-
-
-def _coerce_component_schema_types(
-    comp: dict[str, Any], *, is_v10: bool = True
-) -> None:
-    """Ensures expanded component properties satisfy BasicCatalog schema types."""
-    comp_type = str(comp.get("component", ""))
-    if comp_type in ("Image", "Video", "AudioPlayer"):
-        comp.setdefault("url", "")
-        if comp_type == "Video" and not is_v10:
-            comp.pop("posterUrl", None)
-        return
-    if comp_type == "Button":
-        if not is_v10 and comp.get("variant") == "default":
-            comp.pop("variant", None)
-        return
-    coercer = _COMPONENT_COERCERS.get(comp_type)
-    if coercer is not None:
-        coercer(comp)
-
-
 def _order_repeat_items(
     items: Sequence[Mapping[str, SlotBinding]],
     order: str | None,
@@ -1411,7 +1379,7 @@ def _order_repeat_items(
             field_variants=scope.field_variants,
             item_fields=fields,
             item_index=idx,
-            is_v10=scope.is_v10,
+            tracker=scope.tracker,
         )
         return _lookup_instance_or_knob(sub_scope, "primary") in (
             "true",
@@ -1474,7 +1442,8 @@ def _prefix_for_scope(scope: _ExpansionScope, local_id: str) -> str:
     """Prefixes `local_id` with `scope.id_prefix` if not already prefixed."""
     if not scope.id_prefix:
         return local_id
-    if local_id == scope.id_prefix or local_id.startswith(f"{scope.id_prefix}_"):
+    reserved_root = f"{scope.id_prefix}_root"
+    if local_id.startswith(f"{scope.id_prefix}_") and local_id != reserved_root:
         return local_id
     return f"{scope.id_prefix}_{local_id}"
 
@@ -1547,7 +1516,6 @@ def _expand_inline_component(
             if resolved is not _OMIT:
                 comp_dict[key] = resolved
 
-    _coerce_component_schema_types(comp_dict, is_v10=scope.is_v10)
     emitted[emitted_index] = comp_dict
     return comp_id
 
@@ -1594,7 +1562,8 @@ def _expand_template_child_list(
         item_fields=rel_fields,
         item_pointer=binding.pointer,
         in_template_repeat=True,
-        is_v10=scope.is_v10,
+        in_item_repeat=True,
+        tracker=scope.tracker,
     )
     _ensure_template_emitted(tpl_local_id, tpl_id, templates_by_id, tpl_scope, emitted)
     comp_dict["children"] = {"path": binding.pointer, "componentId": tpl_id}
@@ -1611,6 +1580,8 @@ def _expand_single_repeat_item(
     scope: _ExpansionScope,
     prefix_fn: Any,
     emitted: list[dict[str, Any]],
+    *,
+    is_item_repeat: bool = True,
 ) -> str:
     """Expands one unrolled item in a `$repeat` container and returns its component ID."""
     elem_ptr = _infer_element_pointer(item_fields) or (
@@ -1627,7 +1598,8 @@ def _expand_single_repeat_item(
             item_fields=item_fields,
             item_index=orig_idx,
             item_pointer=elem_ptr,
-            is_v10=scope.is_v10,
+            in_item_repeat=is_item_repeat,
+            tracker=scope.tracker,
         )
         fv_template = _select_field_variant_template(
             str(comp_target["$byInstance"]), item_scope
@@ -1650,7 +1622,8 @@ def _expand_single_repeat_item(
         item_fields=item_fields,
         item_index=orig_idx,
         item_pointer=elem_ptr,
-        is_v10=scope.is_v10,
+        in_item_repeat=is_item_repeat,
+        tracker=scope.tracker,
     )
     return _expand_inline_component(
         templates_by_id[tpl_local_id],
@@ -1709,6 +1682,7 @@ def _expand_repeat_children(
         )
         return
 
+    is_item_repeat = slot_name != "buttons" and scope.block_id != "actions"
     items_to_expand = unrolled_items or _fallback_unrolled_items(binding)
     order = scope.knobs.get("order") or repeat_spec.get("order")
     ordered = _order_repeat_items(items_to_expand, str(order) if order else None, scope)
@@ -1724,6 +1698,7 @@ def _expand_repeat_children(
             scope,
             prefix_fn,
             emitted,
+            is_item_repeat=is_item_repeat,
         )
         for out_idx, (orig_idx, item_fields) in enumerate(ordered)
     ]
@@ -1787,14 +1762,12 @@ def _is_container_now_empty(
     preserve_ids: set[str],
 ) -> bool:
     """Updates container child references and returns whether the container is empty."""
-    ctype = comp.get("component")
-    if ctype in ("Row", "Column", "List"):
-        children = comp.get("children")
-        if isinstance(children, list):
-            comp["children"] = [x for x in children if x in by_id or x in preserve_ids]
-            return not comp["children"]
-    elif ctype == "Card":
-        child = comp.get("child")
+    children = comp.get("children")
+    if isinstance(children, list):
+        comp["children"] = [x for x in children if x in by_id or x in preserve_ids]
+        return not comp["children"]
+    child = comp.get("child")
+    if isinstance(child, str):
         return child not in by_id and child not in preserve_ids
     return False
 
@@ -2035,9 +2008,11 @@ def _compute_root_id(prefix: str, root_local_id: str) -> str:
     """Computes the surface or block root component ID for `prefix`."""
     if prefix == "root":
         return "root"
-    if root_local_id == prefix or root_local_id.startswith(f"{prefix}_"):
+    if not prefix:
         return root_local_id
-    return f"{prefix}_{root_local_id}"
+    if prefix.endswith("_root"):
+        return prefix
+    return f"{prefix}_root"
 
 
 def _page_knobs(page: PageBindings, active_knobs: dict[str, str]) -> None:
@@ -2048,6 +2023,58 @@ def _page_knobs(page: PageBindings, active_knobs: dict[str, str]) -> None:
         active_knobs.setdefault("stickyActions", "yes")
 
 
+def _block_has_mutable(block_id: str, bindings: BlockBindings) -> bool:
+    """Returns whether `block_id` / `bindings` represents mutable client state."""
+    plan_mut = bindings.slots.get("$plan_mutable")
+    if plan_mut is not None and bool(plan_mut.literal):
+        return True
+    if "$mutable" in bindings.slots and bindings.slots["$mutable"].bound:
+        return True
+    return block_id in {"form", "groups", "filters", "compose"} and bool(
+        bindings.pointers()
+    )
+
+
+def _prune_unbound_page_title(
+    emitted: list[dict[str, Any]],
+    page: PageBindings,
+    block_roots: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Removes `page_title` when `page.title` is unbound and other content exists."""
+    if not page.title.bound and (page.mark.bound or page.subtitle.bound or block_roots):
+        return [c for c in emitted if c.get("id") != "page_title"]
+    return emitted
+
+
+def _aggregate_page_send_data_model(
+    tracker: _ExpansionTracker, blocks: Sequence[Expansion]
+) -> tuple[bool, bool, bool]:
+    """Computes `(send_data_model, has_mutable, has_empty_non_item_action)` for a page."""
+    has_mut = any(b._has_mutable for b in blocks)
+    has_empty_act = tracker.has_empty_non_item_action or any(
+        b._has_empty_non_item_action for b in blocks
+    )
+    send_dm = any(b.send_data_model for b in blocks) or (has_mut and has_empty_act)
+    return send_dm, has_mut, has_empty_act
+
+
+def _validate_library_grammar_version(
+    library: PatternLibrary | MergedPatternLibrary,
+    grammar: ArchetypeGrammar,
+) -> None:
+    """Raises `PatternError` if any non-empty library mismatches `grammar.version`."""
+    libs = (
+        library.libraries if isinstance(library, MergedPatternLibrary) else (library,)
+    )
+    for lib in libs:
+        if lib.patterns and lib.grammar_version != grammar.version:
+            raise PatternError(
+                f"Pattern library for {lib.catalog_id!r} targets"
+                f" grammarVersion {lib.grammar_version!r}, expected"
+                f" {grammar.version!r}."
+            )
+
+
 @dataclass(frozen=True)
 class Expansion:
     """Flat A2UI component dicts produced by one expansion, plus surface flags.
@@ -2055,17 +2082,19 @@ class Expansion:
     Attributes:
         components: The emitted component dicts; the first is the root.
         send_data_model: Whether the surface must be created with
-            `sendDataModel`. True only when some submit action in the
-            expansion resolves to no context bindings, so the agent needs the
-            whole data model with the event instead.
+            `sendDataModel`. True only when the plan has mutable state and
+            some non-item action in the expansion resolves to no context
+            bindings, so the agent needs the whole data model with the event.
     """
 
     components: list[dict[str, Any]] = field(default_factory=list)
     send_data_model: bool = False
+    _has_mutable: bool = field(default=False, repr=False, compare=False)
+    _has_empty_non_item_action: bool = field(default=False, repr=False, compare=False)
 
 
 class PatternExpander:
-    """Expands catalog pattern templates into flat, validated A2UI component dicts.
+    """Expands catalog pattern templates into flat, validated A2UI v1.0 component dicts.
 
     Stable block ids: a block's components keep the same ids every time the
     same plan is expanded, so an `updateComponents` that replaces the root in
@@ -2081,28 +2110,29 @@ class PatternExpander:
         graph: CatalogDecisionGraph,
         *,
         grammar: ArchetypeGrammar | None = None,
-        protocol_version: str | None = None,
     ) -> None:
-        """Creates an expander.
+        """Creates an expander targeting A2UI v1.0.
 
         Args:
             library: Patterns to expand from.
-            graph: The catalog graph; supplies the protocol version by default.
-            grammar: Grammar consulted for fallback chains; defaults to
-                `ArchetypeGrammar.default()`.
-            protocol_version: A2UI protocol version the emitted components
-                target (``"0.9"``, ``"1.0"``, ...); defaults to
-                `graph.protocol_version`.
+            graph: The catalog graph; must target A2UI protocol v1.0.
+            grammar: Grammar consulted for fallback chains and version
+                compatibility; defaults to `ArchetypeGrammar.default()`.
+
+        Raises:
+            ValueError: If `graph.protocol_version` is not v1.0.
+            PatternError: If `library` targets a different `grammarVersion`.
         """
+        if not _is_v10(str(graph.protocol_version)):
+            raise ValueError(
+                "Decision pattern expansion supports A2UI protocol v1.0 only,"
+                f" got {graph.protocol_version!r}."
+            )
         self.library = library
         self.graph = graph
         self.grammar = grammar if grammar is not None else ArchetypeGrammar.default()
-        self.protocol_version: str = (
-            protocol_version
-            if protocol_version is not None
-            else str(graph.protocol_version)
-        )
-        self.is_v10 = _is_v10(self.protocol_version)
+        self.protocol_version: str = "1.0"
+        _validate_library_grammar_version(self.library, self.grammar)
 
     def _resolve_block_pattern(
         self,
@@ -2174,6 +2204,7 @@ class PatternExpander:
         prefix = id_prefix or block_id
         templates_by_id = {str(c["id"]): c for c in variant.components if "id" in c}
         root_id = _compute_root_id(prefix, variant.root)
+        tracker = _ExpansionTracker()
         scope = _ExpansionScope(
             block_id=block_id,
             id_prefix=prefix,
@@ -2181,7 +2212,7 @@ class PatternExpander:
             knobs=active_knobs,
             instances=active_instances,
             field_variants=cat_pattern.field_variants,
-            is_v10=self.is_v10,
+            tracker=tracker,
         )
         emitted: list[dict[str, Any]] = []
         _expand_inline_component(
@@ -2191,7 +2222,13 @@ class PatternExpander:
             scope,
             emitted,
         )
-        return Expansion(components=_prune_empty_containers(emitted, root_id))
+        has_mut = _block_has_mutable(block_id, effective_bindings)
+        return Expansion(
+            components=_prune_empty_containers(emitted, root_id),
+            send_data_model=has_mut and tracker.has_empty_non_item_action,
+            _has_mutable=has_mut,
+            _has_empty_non_item_action=tracker.has_empty_non_item_action,
+        )
 
     def expand_page(
         self,
@@ -2231,6 +2268,7 @@ class PatternExpander:
                 "mark": mark_slot,
             }
         )
+        tracker = _ExpansionTracker()
         scope = _ExpansionScope(
             block_id="page",
             id_prefix="",
@@ -2239,7 +2277,7 @@ class PatternExpander:
             instances={},
             field_variants=cat_pattern.field_variants,
             block_roots=tuple(block_roots),
-            is_v10=self.is_v10,
+            tracker=tracker,
         )
         emitted: list[dict[str, Any]] = []
         _expand_inline_component(
@@ -2249,15 +2287,17 @@ class PatternExpander:
             scope,
             emitted,
         )
-        if not title_slot.bound and (
-            mark_slot.bound or subtitle_slot.bound or block_roots
-        ):
-            emitted = [c for c in emitted if c.get("id") != "page_title"]
+        emitted = _prune_unbound_page_title(emitted, page, block_roots)
+        send_dm, has_mut, has_empty_act = _aggregate_page_send_data_model(
+            tracker, blocks
+        )
         return Expansion(
             components=_prune_empty_containers(
                 emitted, "root", preserve_ids=set(block_roots)
             ),
-            send_data_model=any(b.send_data_model for b in blocks),
+            send_data_model=send_dm,
+            _has_mutable=has_mut,
+            _has_empty_non_item_action=has_empty_act,
         )
 
 

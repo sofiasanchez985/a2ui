@@ -655,6 +655,14 @@ class ArchetypeGrammar:
             validate_threshold_relations(thresholds, "thresholds")
         except ValueError as exc:
             findings.append(str(exc))
+        tpl_thresh = thresholds.get("template")
+        tpl_mut_thresh = thresholds.get("templateMutable")
+        if (
+            tpl_thresh is not None
+            and tpl_mut_thresh is not None
+            and tpl_thresh > tpl_mut_thresh
+        ):
+            findings.append("thresholds: template must be <= templateMutable.")
         if findings:
             raise GrammarError(
                 "Archetype grammar failed lint:\n  " + "\n  ".join(findings)
