@@ -1,8 +1,14 @@
 # Decision layout grammar and catalog patterns
 
+> [!NOTE]
+> These files are experimental and non-normative. The Python agent SDK
+> (`a2ui.inference_formats.decision`) is the reference implementation, and the
+> schemas may change between grammar versions. Cross-language parity is not a
+> goal yet.
+
 This directory holds the data files behind the layout stage of the decision
-inference format. The format uses a small decision model (a local
-cross-encoder, a logprob endpoint, or a mock) to answer short questions about an
+inference format. The format uses a small decision model (a hosted decision
+service, a local decision server, or a logprob endpoint) to answer short questions about an
 intent and a data payload. The answers select a layout archetype, decide which
 blocks it shows, and bind payload pointers to the blocks' slots. The files here
 describe the archetypes and how each catalog draws them.
@@ -38,18 +44,25 @@ catalogs/
 ```
 
 The pattern file is a sidecar: it does not change `catalog.json` or the catalog
-definition schema. Its `catalogIds` array lists every catalog id the file
-applies to, so one file can serve two catalogs that share a component
-vocabulary. The basic file lists both the v1.0 and the v0.9 basic catalog ids.
+definition schema. It is still part of the catalog, so the catalog's
+maintainers keep it valid when components change. Its `catalogId` names the one
+catalog it applies to, and its `grammarVersion` names the grammar version it
+targets. The decision format supports protocol v1.0 only, so the basic file
+targets the v1.0 basic catalog.
 
 ## `archetypes.json`
 
 The grammar has five parts.
 
+`grammarVersion` is the compatibility version. Any change to blocks, slots,
+knobs, or pattern names bumps it, and an SDK rejects a pattern file that
+targets another version.
+
 `thresholds` are the probabilities at which a family, an archetype, an expected
 block, an optional block, or an instance answer counts as chosen. The section
-also holds `reask_below` (answers under it may be asked again with more
-context) and the action gate bounds `actionGateFloor` and `actionGateCap`.
+also holds the template thresholds (`template`, and `templateMutable` for
+editable payloads) and the action gate bounds `actionGateFloor` and
+`actionGateCap`.
 
 `job` holds the three questions asked for every surface: the `family` choice
 (browse, monitor, inspect, act, input, follow) and the `stakes` and `urgency`
@@ -100,23 +113,23 @@ id-less component templates picked per element by `$byInstance`.
 Component templates are ordinary component objects for the catalog, plus
 directives whose keys start with `$`:
 
-| Directive     | Value                              | Meaning                                                                                                                                        |
-| :------------ | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
-| `$slot`       | slot name                          | A data binding to the pointer bound to that slot. Relative inside `$repeat`. `$default` beside it supplies a literal when the slot is unbound. |
-| `$text`       | literal with `{slot}` placeholders | A formatted string. When a placeholder is bound the expander emits a `formatString` call; `{$index1}` is the 1-based element index.            |
-| `$default`    | any JSON                           | The value used when the `$slot` or `$knobValue` beside it resolves to nothing.                                                                 |
-| `$if`         | slot name                          | Emit the component only when the slot is bound.                                                                                                |
-| `$ifKnob`     | `{knob: [values]}`                 | Emit the component only when every named knob has one of the listed values.                                                                    |
-| `$ifSelf`     | `{"true": ..., "false": ...}`      | Pick a value by whether the element's author equals the `self` knob.                                                                           |
-| `$ifInstance` | `{answer: value}`                  | Emit the enclosing property only when the element's instance answers match.                                                                    |
-| `$byType`     | slot name                          | The sibling key equal to the slot's semantic type names the child id to emit.                                                                  |
-| `$byInstance` | instance answer name               | Pick a `fieldVariants` entry (or a sibling key) by the element's answer.                                                                       |
-| `$repeat`     | repeated slot name                 | Turn `children` into a template child list bound to the slot's array; the sibling `component` names the template.                              |
-| `$map`        | knob or answer name                | The sibling key equal to its value is the literal to emit.                                                                                     |
-| `$event`      | event name or slot                 | An action `{"event": {"name": ...}}`; `context` beside it is passed through.                                                                   |
-| `$blocks`     | `true`                             | In the page pattern, where the block roots go, in archetype order.                                                                             |
-| `$knobValue`  | `knob.property`                    | A value looked up in the plan, with `$default` when absent.                                                                                    |
-| `$item`       | `true`                             | Inside `$repeat`, the current element, bound as event context.                                                                                 |
+| Directive        | Value                              | Meaning                                                                                                                                        |
+| :--------------- | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$slot`          | slot name                          | A data binding to the pointer bound to that slot. Relative inside `$repeat`. `$default` beside it supplies a literal when the slot is unbound. |
+| `$text`          | literal with `{slot}` placeholders | A formatted string. When a placeholder is bound the expander emits a `formatString` call; `{$index1}` is the 1-based element index.            |
+| `$default`       | any JSON                           | The value used when the `$slot` or `$knobValue` beside it resolves to nothing.                                                                 |
+| `$if`            | slot name                          | Emit the component only when the slot is bound.                                                                                                |
+| `$ifKnob`        | `{knob: [values]}`                 | Emit the component only when every named knob has one of the listed values.                                                                    |
+| `$ifSelf`        | `{"true": ..., "false": ...}`      | Pick a value by whether the element's author equals the `self` knob.                                                                           |
+| `$ifInstance`    | `{answer: value}`                  | Emit the enclosing property only when the element's instance answers match.                                                                    |
+| `$byType`        | slot name                          | The sibling key equal to the slot's semantic type names the child id to emit.                                                                  |
+| `$byInstance`    | instance answer name               | Pick a `fieldVariants` entry (or a sibling key) by the element's answer.                                                                       |
+| `$repeat`        | repeated slot name                 | Turn `children` into a template child list bound to the slot's array; the sibling `component` names the template.                              |
+| `$map`           | knob or answer name                | The sibling key equal to its value is the literal to emit.                                                                                     |
+| `$event`         | action slot                        | An action `{"event": {"name": ...}}` named by the agent's action id bound to the slot, else by `$default`. Labels never become event names.    |
+| `$blocks`        | `true`                             | In the page pattern, where the block roots go, in archetype order.                                                                             |
+| `$knobValue`     | `knob.property`                    | A value looked up in the plan, with `$default` when absent.                                                                                    |
+| `$actionContext` | `true`                             | Inside `context`: the action's own context pointers, else the current item's key inside `$repeat`, else every editable pointer of a form.      |
 
 Component ids in a pattern are local. The expander prefixes them with the block
 id so a pattern can appear more than once on a surface. Headings use Markdown
@@ -125,14 +138,13 @@ id so a pattern can appear more than once on a surface. Headings use Markdown
 
 ## How an SDK uses these files
 
-An installed package cannot read this repository, so each SDK vendors a copy of
-the grammar, the two schemas, and the pattern files for the catalogs it bundles.
-The Python SDK keeps them under
-`python/a2ui_agent/src/a2ui/inference_formats/decision/assets/`, copies them
-with `python/a2ui_agent/scripts/sync_decision_assets.py`, and has a test that
-fails when a vendored copy differs from the file here. Other SDKs should do the
-same: treat the files in `catalogs/` as the source of truth and the vendored
-copies as build artifacts.
+An installed package cannot read this repository, so each SDK bundles a copy of
+the grammar, the two schemas, and the pattern files for the catalogs it ships.
+The Python SDK copies them into
+`python/a2ui_agent/src/a2ui/inference_formats/decision/assets/` at build time
+(the `force-include` tables in `python/a2ui_agent/pyproject.toml`). Treat the
+files in `catalogs/` as the source of truth and the bundled copies as build
+artifacts.
 
 At load time an SDK validates `archetypes.json` against
 `archetype_definition.json`, runs the lint checks listed in the grammar, and
@@ -140,6 +152,7 @@ validates each `patterns.json` against `pattern_definition.json`. A grammar or
 pattern file that fails is rejected rather than used in part.
 
 To add a pattern file for another catalog, create `patterns.json` beside that
-catalog's `catalog.json`, set `catalogIds` to the catalog's id, implement the
+catalog's `catalog.json`, set `catalogId` to the catalog's id and
+`grammarVersion` to the grammar's version, implement the
 patterns the catalog can draw with its own components, and leave out the rest.
 Archetypes that need a missing pattern are not offered for that catalog.

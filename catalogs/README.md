@@ -55,6 +55,9 @@ catalogs/
   generate and validate `patterns.json` (composable blocks), `templates.json`
   (fixed-surface `SurfaceTemplate` definitions), and `sample_payloads.json`
   alongside `catalog.json`.
+  A catalog's `patterns.json` is part of the catalog: after any component
+  change, it must still validate (run the `a2ui-generate-catalog-patterns`
+  skill's `validate` command). These decision files are experimental.
 - `basic/` is versioned by catalog major version (`v1/`), which is independent
   of the protocol version. Newer catalogs start unversioned
   (`catalogs/<catalog>/catalog.json`) and add a version directory only when

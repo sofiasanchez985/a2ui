@@ -24,21 +24,16 @@ from .archetypes import (
     SlotSpec,
 )
 from .backends import (
+    DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_TYPESAFE_MODEL,
+    BackendCapabilities,
+    Calibration,
     DecisionBackend,
     DeterministicMockBackend,
     JevHttpBackend,
-    PredictOnlyBackend,
     StepZeroLogprobBackend,
     answer_from_distribution,
     create_decision_backend,
-    ensure_batch_backend,
-)
-from .batching import BatchingDecisionBackend
-from .calibration import (
-    LabeledDecisionExample,
-    SynthesizerLike,
-    calibrate_thresholds,
-    compute_bayes_optimal_threshold,
 )
 from .catalog_graph import CatalogDecisionGraph
 from .decision_block import DecisionBlock, decision_block_from_messages
@@ -47,18 +42,18 @@ from .layout_lint import LintCode, LintFinding, LintSeverity, lint_components
 from .layout_planner import LayoutPlanner
 from .models import (
     MAX_BRIEF_SECTIONS,
+    ActionSpec,
+    ActionStyle,
     AuthoredCopy,
     BlockBindings,
     BriefSection,
-    CalibrationPoint,
-    CalibrationResult,
     ComponentNodeSpec,
     ComponentSlot,
     DecisionAnswer,
+    DecisionBackendError,
     DecisionBackendType,
     DecisionBatch,
     DecisionDistribution,
-    DecisionQuery,
     DecisionQuestion,
     DecisionRecord,
     DecisionTask,
@@ -76,15 +71,16 @@ from .models import (
     SemanticType,
     SlotBinding,
     SlotKind,
+    SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
     SynthesisStage,
-    VarietyMode,
     coerce_decision_payload,
 )
-from .parser import DecisionParser
+from .parser import DecisionParser, surface_operation_for
 from .patterns import (
     CatalogPattern,
+    Expansion,
     MergedPatternLibrary,
     PatternError,
     PatternExpander,
@@ -101,7 +97,11 @@ from .payload_inspector import (
 )
 from .prompt_generator import DecisionPromptGenerator, decision_rules
 from .semantic_types import classify_scalar, humanize_key
-from .synthesizer import DecisionSynthesizer, FallbackCallback
+from .synthesizer import (
+    DecisionSynthesizer,
+    FallbackCallback,
+    resolve_surface_operation,
+)
 from .template_registry import SurfaceTemplate, TemplateRegistry
 from .tool import DecisionRenderTool
 
@@ -118,21 +118,25 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "DECISION_RULES",
+    "DEFAULT_TIMEOUT_SECONDS",
+    "DEFAULT_TYPESAFE_MODEL",
     "MAX_BRIEF_SECTIONS",
+    "ActionSpec",
+    "ActionStyle",
     "ArchetypeGrammar",
     "AuthoredCopy",
-    "BatchingDecisionBackend",
+    "BackendCapabilities",
     "BlockBindings",
     "BlockSpec",
     "BriefSection",
-    "CalibrationPoint",
-    "CalibrationResult",
+    "Calibration",
     "CatalogDecisionGraph",
     "CatalogPattern",
     "ComponentNodeSpec",
     "ComponentSlot",
     "DecisionAnswer",
     "DecisionBackend",
+    "DecisionBackendError",
     "DecisionBackendType",
     "DecisionBatch",
     "DecisionBlock",
@@ -141,7 +145,6 @@ __all__ = [
     "DecisionFormatFactory",
     "DecisionParser",
     "DecisionPromptGenerator",
-    "DecisionQuery",
     "DecisionQuestion",
     "DecisionRecord",
     "DecisionRenderTool",
@@ -149,11 +152,11 @@ __all__ = [
     "DecisionTask",
     "DecisionWireFormat",
     "DeterministicMockBackend",
+    "Expansion",
     "FallbackCallback",
     "FallbackSource",
     "GrammarError",
     "JevHttpBackend",
-    "LabeledDecisionExample",
     "LayoutArchetype",
     "LayoutBrief",
     "LayoutPlan",
@@ -172,7 +175,6 @@ __all__ = [
     "PlanReason",
     "PlannedBlock",
     "PointerSummary",
-    "PredictOnlyBackend",
     "QuestionKind",
     "Requirement",
     "ResolvedPattern",
@@ -181,26 +183,24 @@ __all__ = [
     "SlotKind",
     "SlotSpec",
     "StepZeroLogprobBackend",
+    "SurfaceOperation",
     "SurfaceTemplate",
     "SynthesisConfig",
     "SynthesisOutput",
     "SynthesisStage",
-    "SynthesizerLike",
     "TemplateRegistry",
-    "VarietyMode",
     "answer_from_distribution",
-    "calibrate_thresholds",
     "classify_scalar",
     "coerce_decision_payload",
-    "compute_bayes_optimal_threshold",
     "create_decision_backend",
     "decision_block_from_messages",
     "decision_rules",
     "eligible_archetypes",
-    "ensure_batch_backend",
     "humanize_key",
     "inspect_payload_pointers",
     "lint_components",
     "resolve_fallback_pattern",
+    "resolve_surface_operation",
     "shape_signature",
+    "surface_operation_for",
 ]

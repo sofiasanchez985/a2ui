@@ -18,7 +18,9 @@ The four payloads are the worked examples from the layout design (a resort
 overview, host health, a transfer confirmation, and podcast settings).
 `ScriptedAnswers` turns a mapping of question ids to answers into a scorer for
 `DeterministicMockBackend`, so planner and end-to-end tests share one way of
-scripting a batch.
+scripting a batch. `mock_backend` builds a scripted mock backend directly;
+synthesizer, format, and tool tests pass it explicitly because constructors no
+longer pick a backend themselves.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from typing import Any
 
 from a2ui.inference_formats.decision import (
     DecisionDistribution,
-    DecisionQuery,
+    DecisionQuestion,
     DeterministicMockBackend,
 )
 
@@ -159,13 +161,11 @@ class ScriptedAnswers:
     answers: Mapping[str, ScriptedValue] = field(default_factory=dict)
     asked: list[str] = field(default_factory=list)
 
-    def scorer(self, query: DecisionQuery) -> DecisionDistribution:
-        """Scores a query built by `_AnswerViaPredict` from a `DecisionQuestion`."""
-        question_id = str(query.context.get("question_id") or query.task.value)
-        kind = str(query.context.get("question_kind", "choice"))
-        self.asked.append(question_id)
+    def scorer(self, question: DecisionQuestion) -> DecisionDistribution:
+        """Scores `question` from `answers`, recording its id in `asked`."""
+        self.asked.append(question.id)
         probs = self._probabilities(
-            self.answers.get(question_id), kind, query.candidates
+            self.answers.get(question.id), str(question.kind), question.candidates()
         )
         return DecisionDistribution(
             probabilities=probs, calibrated=True, top_logit_margin=2.5
@@ -192,3 +192,14 @@ class ScriptedAnswers:
         if kind == "score":
             return _score_distribution(float(scripted), candidates)
         raise ValueError(f"A choice question cannot be scripted with {scripted!r}.")
+
+
+def mock_backend(**scripted: ScriptedValue) -> DeterministicMockBackend:
+    """A mock backend that answers the scripted question ids.
+
+    Question ids contain colons, so pass them by unpacking a mapping:
+    ``mock_backend(**{"family": "inspect", "gate:collection": 0.9})``. Values
+    take the `ScriptedValue` forms; unscripted questions get the mock's
+    deterministic heuristic answer.
+    """
+    return DeterministicMockBackend(scripted_answers=scripted)

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-import random
 import re
 from typing import Any
 
@@ -38,6 +37,8 @@ from .archetypes import (
     SlotSpec,
 )
 from .models import (
+    ActionSpec,
+    ActionStyle,
     AuthoredCopy,
     BlockBindings,
     DecisionAnswer,
@@ -55,10 +56,10 @@ from .models import (
     SemanticType,
     SlotBinding,
     SynthesisConfig,
-    VarietyMode,
 )
 from .payload_inspector import PointerSummary, split_pointer
 from .semantic_types import humanize_key
+from .template_registry import SurfaceTemplate
 
 _PATTERN_VARIANT_REQ_RE = re.compile(r"^pattern:([a-z_]+):([a-z_]+)$")
 
@@ -128,7 +129,7 @@ class _AllCapabilities:
 
 @dataclass
 class PlannerState:
-    """State carried from `LayoutPlanner.build_batch` into `read` and `needs_reask`."""
+    """State carried from `LayoutPlanner.build_batch` into `read`."""
 
     intent: str
     pointers: tuple[PointerSummary, ...]
@@ -148,8 +149,10 @@ class PlannerState:
     action_gate_blocked: bool = False
     required_block_missing: bool = False
     copy: AuthoredCopy | None = None
-    seed: int | None = None
-    rng: random.Random | None = None
+    templates: tuple[SurfaceTemplate, ...] = ()
+    """Registered templates whose required pointers the payload satisfies."""
+    actions: tuple[ActionSpec, ...] = ()
+    """The actions the decision block declared, in order."""
 
 
 def _resolve_pointer_value(payload: Mapping[str, Any], pointer: str) -> Any:
@@ -248,8 +251,6 @@ def _matches_primary_type(sem_type: str, target: str, ptr: PointerSummary) -> bo
         return ptr.value_type in {"string", "number", "boolean"}
     if target == "mutable":
         return ptr.mutable_hint and ptr.value_type in {"string", "number", "boolean"}
-    if target == "action":
-        return _is_action_pointer(ptr)
     return False
 
 
@@ -272,14 +273,6 @@ def _pointer_matches_types(
     if not allow_fallback:
         return False
     return any(_matches_fallback_type(ptr.semantic_type, t) for t in from_types)
-
-
-def _is_action_pointer(ptr: PointerSummary) -> bool:
-    """Returns whether `ptr` represents an action list or button trigger."""
-    low = ptr.key.lower()
-    if low in {"actions", "buttons", "cta"}:
-        return True
-    return ptr.mutable_hint and ptr.value_type == "array" and not ptr.element_keys
 
 
 def _array_element_types(ptr: PointerSummary) -> set[str]:
@@ -543,12 +536,27 @@ def _is_eligible_scalar_candidate(
     return not _is_nested_mutable_setting(ptr, pointers)
 
 
+def _format_choice_options(raw: Any) -> list[dict[str, str]] | None:
+    """Converts a payload option sequence into `{label, value}` choice objects."""
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)) or not raw:
+        return None
+    formatted: list[dict[str, str]] = []
+    for elem in raw:
+        if isinstance(elem, Mapping) and "label" in elem and "value" in elem:
+            formatted.append({"label": str(elem["label"]), "value": str(elem["value"])})
+        elif not isinstance(elem, Mapping):
+            text = str(elem)
+            formatted.append({"label": text, "value": text})
+    return formatted or None
+
+
 def _bind_scalar_slot(
     slot: SlotSpec,
     pointers: Sequence[PointerSummary],
     used: set[str],
     *,
     preferred_paths: Sequence[str] = (),
+    payload: Mapping[str, Any] | None = None,
 ) -> SlotBinding:
     """Binds a single non-repeated `SlotSpec` against available `pointers`."""
     candidates = [
@@ -564,7 +572,37 @@ def _bind_scalar_slot(
         candidates,
         key=lambda p: _score_candidate_pointer(p, slot, preferred_paths),
     )
+    if slot.name == "categories" and payload:
+        opts = _format_choice_options(_resolve_pointer_value(payload, best.path))
+        if opts is not None:
+            return SlotBinding(
+                literal=opts,
+                items=({"$claimed": SlotBinding(pointer=best.path)},),
+            )
     return SlotBinding(pointer=best.path, semantic_type=best.semantic_type)
+
+
+def _action_slot_binding(
+    spec: ActionSpec, *, element_keys: Sequence[str] = ()
+) -> SlotBinding:
+    """Builds the `action` `SlotBinding` carrying `ActionSpec` metadata."""
+    meta: dict[str, SlotBinding] = {}
+    eff_key = spec.key or (
+        "id" if spec.scope is not None and "id" in element_keys else None
+    )
+    if eff_key:
+        meta["$key"] = SlotBinding(literal=eff_key)
+    if spec.scope:
+        meta["$scope"] = SlotBinding(literal=spec.scope)
+    if spec.context:
+        meta["$context"] = SlotBinding(
+            fields={
+                name: SlotBinding(pointer=ptr) for name, ptr in spec.context.items()
+            }
+        )
+    if spec.style is not None:
+        meta["$style"] = SlotBinding(literal=spec.style.value)
+    return SlotBinding(literal=spec.id, fields=meta)
 
 
 def _score_element_key(
@@ -661,6 +699,28 @@ def _bind_array_element_fields(
     return bound_fields
 
 
+def _unroll_single_array_item(
+    ptr: PointerSummary, idx: int, fields: Mapping[str, SlotBinding]
+) -> dict[str, SlotBinding]:
+    """Unrolls one indexed item from `fields` for `ptr`."""
+    row: dict[str, SlotBinding] = {}
+    for f_name, f_bind in fields.items():
+        if not f_bind.bound:
+            continue
+        if f_name == "action" and f_bind.pointer is None:
+            row[f_name] = f_bind
+        else:
+            row[f_name] = SlotBinding(
+                pointer=(
+                    f"{ptr.path}/{idx}/{f_bind.pointer}"
+                    if f_bind.pointer
+                    else f"{ptr.path}/{idx}"
+                ),
+                semantic_type=f_bind.semantic_type,
+            )
+    return row
+
+
 def _unroll_array_items(
     ptr: PointerSummary,
     fields: Mapping[str, SlotBinding],
@@ -671,21 +731,46 @@ def _unroll_array_items(
     limit = (
         min(ptr.cardinality, max_items) if max_items is not None else ptr.cardinality
     )
-    return tuple(
-        {
-            f_name: SlotBinding(
-                pointer=(
-                    f"{ptr.path}/{idx}/{f_bind.pointer}"
-                    if f_bind.pointer
-                    else f"{ptr.path}/{idx}"
-                ),
-                semantic_type=f_bind.semantic_type,
-            )
-            for f_name, f_bind in fields.items()
-            if f_bind.bound
-        }
-        for idx in range(limit)
+    return tuple(_unroll_single_array_item(ptr, idx, fields) for idx in range(limit))
+
+
+def _attach_collection_item_metadata(
+    ptr: PointerSummary,
+    fields: dict[str, SlotBinding],
+    scoped_actions: Sequence[ActionSpec],
+) -> None:
+    """Attaches implicit `id` field and scoped item action onto `fields`."""
+    if "id" in ptr.element_keys and "id" not in fields:
+        fields["id"] = SlotBinding(pointer="id")
+    scoped = next((a for a in scoped_actions if a.scope == ptr.path), None)
+    if scoped is not None:
+        fields["action"] = _action_slot_binding(scoped, element_keys=ptr.element_keys)
+
+
+def _try_bind_single_array(
+    block_id: str,
+    slot: SlotSpec,
+    ptr: PointerSummary,
+    scoped_actions: Sequence[ActionSpec],
+) -> SlotBinding | None:
+    """Attempts to bind repeated `slot` to array pointer `ptr`."""
+    fields = _bind_array_element_fields(ptr, slot.fields)
+    if any(
+        f_spec.required and f_name not in fields
+        for f_name, f_spec in slot.fields.items()
+    ):
+        return None
+    if block_id == "collection":
+        _attach_collection_item_metadata(ptr, fields, scoped_actions)
+    should_unroll = block_id == "steps" or not ptr.element_keys
+    items = (
+        _unroll_array_items(
+            ptr, fields, max_items=slot.max if slot.max is not None else 25
+        )
+        if should_unroll
+        else ()
     )
+    return SlotBinding(pointer=ptr.path, fields=fields, items=items)
 
 
 def _bind_array_repeated_slot(
@@ -693,78 +778,34 @@ def _bind_array_repeated_slot(
     slot: SlotSpec,
     pointers: Sequence[PointerSummary],
     used: set[str],
+    *,
+    scoped_actions: Sequence[ActionSpec] = (),
 ) -> SlotBinding:
     """Binds a repeated slot whose `from_types` is ``('array',)``."""
     for ptr in pointers:
         if ptr.path in used or ptr.value_type != "array" or ptr.cardinality <= 0:
             continue
-        if _is_action_pointer(ptr):
-            continue
-        fields = _bind_array_element_fields(ptr, slot.fields)
-        if all(
-            not f_spec.required or f_name in fields
-            for f_name, f_spec in slot.fields.items()
-        ):
-            items = (
-                _unroll_array_items(
-                    ptr, fields, max_items=slot.max if slot.max is not None else 25
-                )
-                if (block_id == "steps" or not ptr.element_keys)
-                else ()
-            )
-            return SlotBinding(pointer=ptr.path, fields=fields, items=items)
+        bound = _try_bind_single_array(block_id, slot, ptr, scoped_actions)
+        if bound is not None:
+            return bound
     return SlotBinding()
 
 
-def _labels_from_sequence(raw: Any) -> list[str]:
-    """Extracts string labels from a runtime sequence of strings or mappings."""
-    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
-        return []
-    labels: list[str] = []
-    for item in raw:
-        if isinstance(item, Mapping):
-            val = item.get("label") or item.get("title") or item.get("name") or ""
-            labels.append(str(val))
-        else:
-            labels.append(str(item))
-    return labels
-
-
-def _action_button_labels(
-    ptr: PointerSummary,
-    payload: Mapping[str, Any],
-    intent: str,
-    max_buttons: int | None,
-) -> list[str]:
-    """Extracts button label strings for an action pointer."""
-    labels = _labels_from_sequence(_resolve_pointer_value(payload, ptr.path))
-    if not labels:
-        labels = _labels_from_sequence(
-            ptr.hints.get("values") or ptr.hints.get("items")
-        )
-    if not labels and ptr.cardinality == 2 and "send" in intent.lower():
-        labels = ["Send", "Cancel"]
-    if not labels:
-        labels = [str(i) for i in range(max(ptr.cardinality, 1))]
-    return labels[:max_buttons] if max_buttons is not None else labels
-
-
-def _bind_actions_slot(
-    slot: SlotSpec,
-    pointers: Sequence[PointerSummary],
-    used: set[str],
-    payload: Mapping[str, Any],
-    intent: str,
-) -> SlotBinding:
-    """Binds the `actions.buttons` repeated slot from an action array pointer."""
-    for ptr in pointers:
-        if ptr.path in used or not _is_action_pointer(ptr):
-            continue
-        labels = _action_button_labels(ptr, payload, intent, slot.max)
-        items = tuple({"label": SlotBinding(literal=lbl)} for lbl in labels if lbl)
-        if items:
-            return SlotBinding(pointer=ptr.path, items=items)
-    return SlotBinding()
+def _bind_actions_slot(slot: SlotSpec, actions: Sequence[ActionSpec]) -> SlotBinding:
+    """Binds `actions.buttons` from surface-level `ActionSpec` entries."""
+    surface_actions = [a for a in actions if a.scope is None]
+    if not surface_actions:
+        return SlotBinding()
+    if slot.max is not None:
+        surface_actions = surface_actions[: slot.max]
+    items = tuple(
+        {
+            "action": _action_slot_binding(act),
+            "label": SlotBinding(literal=act.label),
+        }
+        for act in surface_actions
+    )
+    return SlotBinding(items=items)
 
 
 def _bind_groups_slot(
@@ -802,10 +843,41 @@ def _bind_groups_slot(
     return SlotBinding(items=tuple(group_items))
 
 
+def _bind_sibling_item_field(
+    block_id: str,
+    f_name: str,
+    sib: PointerSummary,
+    payload: Mapping[str, Any] | None,
+) -> SlotBinding:
+    """Binds a sibling field on a scalar-repeated item."""
+    if block_id == "form" and payload:
+        raw = _resolve_pointer_value(payload, sib.path)
+        if (
+            f_name in {"min", "max"}
+            and isinstance(raw, (int, float))
+            and not isinstance(raw, bool)
+        ):
+            return SlotBinding(
+                literal=raw,
+                items=({"$claimed": SlotBinding(pointer=sib.path)},),
+            )
+        if f_name == "options":
+            opts = _format_choice_options(raw)
+            if opts is not None:
+                return SlotBinding(
+                    literal=opts,
+                    items=({"$claimed": SlotBinding(pointer=sib.path)},),
+                )
+    return SlotBinding(pointer=sib.path)
+
+
 def _build_scalar_item_mapping(
     ptr: PointerSummary,
     slot: SlotSpec,
     pointers: Sequence[PointerSummary],
+    *,
+    block_id: str = "",
+    payload: Mapping[str, Any] | None = None,
 ) -> dict[str, SlotBinding]:
     """Builds the per-element field mapping for one scalar pointer in `items`/`rows`."""
     item: dict[str, SlotBinding] = {}
@@ -817,7 +889,7 @@ def _build_scalar_item_mapping(
                 ptr, f_spec.sibling, f_spec.from_types, pointers
             )
             if sib is not None:
-                item[f_name] = SlotBinding(pointer=sib.path)
+                item[f_name] = _bind_sibling_item_field(block_id, f_name, sib, payload)
         elif f_name == "value" or "any" in f_spec.from_types:
             item[f_name] = SlotBinding(pointer=ptr.path)
     return item
@@ -872,6 +944,8 @@ def _bind_scalar_repeated_slot(
     used: set[str],
     salience_scores: Mapping[str, float],
     salience_spec: QuestionSpec | None,
+    *,
+    payload: Mapping[str, Any] | None = None,
 ) -> SlotBinding:
     """Binds a repeated slot assembled from scalar pointers (`headline`, `facts`, `form`)."""
     absorbed = _collect_absorbed_siblings(pointers)
@@ -885,7 +959,12 @@ def _bind_scalar_repeated_slot(
     selected = _select_candidates_by_salience(
         candidates, slot, salience_scores, salience_spec
     )
-    items = tuple(_build_scalar_item_mapping(ptr, slot, pointers) for ptr in selected)
+    items = tuple(
+        _build_scalar_item_mapping(
+            ptr, slot, pointers, block_id=block_id, payload=payload
+        )
+        for ptr in selected
+    )
     return SlotBinding(items=items)
 
 
@@ -1238,6 +1317,27 @@ def _apply_authored_prose_summary(
     )
 
 
+def _apply_compose_action(
+    block_id: str,
+    bindings: BlockBindings,
+    plan_block_ids: set[str],
+    actions: Sequence[ActionSpec],
+) -> BlockBindings:
+    """Binds `compose` send action from surface `ActionSpec` when `actions` block is absent."""
+    if block_id != "compose" or "actions" in plan_block_ids:
+        return bindings
+    surface_act = next((a for a in actions if a.scope is None), None)
+    if surface_act is None:
+        return bindings
+    return BlockBindings(
+        slots={
+            **bindings.slots,
+            "action": _action_slot_binding(surface_act),
+            "sendLabel": SlotBinding(literal=surface_act.label),
+        }
+    )
+
+
 def apply_pointer_once_per_region(
     plan: LayoutPlan,
     state: PlannerState,
@@ -1245,6 +1345,7 @@ def apply_pointer_once_per_region(
 ) -> LayoutPlan:
     """Rule `pointer-once-per-region`: blocks claim pointers in archetype order."""
     used: set[str] = set(state.page_claimed_pointers)
+    plan_ids = {b.block_id for b in plan.blocks}
     updated: list[PlannedBlock] = []
     for block in plan.blocks:
         spec = planner.grammar.block(block.block_id)
@@ -1260,16 +1361,19 @@ def apply_pointer_once_per_region(
             payload=state.payload,
             intent=state.intent,
             preferred_paths=preferred,
+            actions=state.actions,
         )
         bindings = _apply_authored_prose_summary(block.block_id, bindings, state)
+        bindings = _apply_compose_action(
+            block.block_id, bindings, plan_ids, state.actions
+        )
         used.update(bindings.pointers())
         knobs, instances = planner._resolve_block_questions(
             spec,
             bindings,
             state,
-            actions_allowed=plan.actions_allowed,
+            actions_allowed=True,
             preset_knobs=block.variant_knobs,
-            rng=state.rng,
         )
         updated.append(
             replace(
@@ -1367,11 +1471,10 @@ def _is_pointer_covered(path: str, claimed: set[str]) -> bool:
 def _has_uncovered_data_array(
     pointers: Sequence[PointerSummary], claimed: set[str]
 ) -> bool:
-    """Returns whether `pointers` has an unclaimed non-action, non-image array."""
+    """Returns whether `pointers` has an unclaimed non-image array."""
     return any(
         p.value_type == "array"
         and p.cardinality > 0
-        and not _is_action_pointer(p)
         and not _is_pointer_covered(p.path, claimed)
         and "image_url" not in p.element_semantic_types.values()
         for p in pointers
@@ -1387,16 +1490,7 @@ def _try_recover_orphan_collection(
     planner: LayoutPlanner,
 ) -> None:
     """Appends a `collection` block when an unclaimed data array exists."""
-    arch_block_ids = (
-        set(state.selected_archetype.block_ids())
-        if state.selected_archetype is not None
-        else set()
-    )
-    gate_overridden = "collection" in arch_block_ids and (
-        "optional" in planner.config.threshold_overrides
-        or "expected" in planner.config.threshold_overrides
-    )
-    if gate_overridden or (present_ids & {"collection", "steps", "comparison"}):
+    if present_ids & {"collection", "steps", "comparison"}:
         return
     if not _has_uncovered_data_array(state.pointers, claimed):
         return
@@ -1412,6 +1506,7 @@ def _try_recover_orphan_collection(
         salience_scores=state.salience_scores,
         payload=state.payload,
         intent=state.intent,
+        actions=state.actions,
     )
     if not col_bindings.is_bound("items"):
         return
@@ -1421,7 +1516,6 @@ def _try_recover_orphan_collection(
         state,
         actions_allowed=plan.actions_allowed,
         preset_knobs=col_preset,
-        rng=state.rng,
     )
     blocks.append(
         PlannedBlock(
@@ -1439,6 +1533,11 @@ def _try_recover_orphan_collection(
 _SECRET_FACT_AVOID_KEYS = ("ssn", "api_key", "token", "iban", "password", "secret")
 
 
+def is_secret_pointer(ptr: PointerSummary) -> bool:
+    """Whether `ptr` names a credential or identity number that facts must not show."""
+    return _is_avoided_key(ptr, _SECRET_FACT_AVOID_KEYS)
+
+
 def _uncovered_scalar_fact_pointers(
     state: PlannerState,
     claimed: set[str],
@@ -1453,7 +1552,7 @@ def _uncovered_scalar_fact_pointers(
         if not p.parent
         and p.value_type in {"string", "number", "boolean"}
         and not _is_nested_mutable_setting(p, state.pointers)
-        and not _is_avoided_key(p, _SECRET_FACT_AVOID_KEYS)
+        and not is_secret_pointer(p)
         and not _is_pointer_covered(p.path, claimed)
         and (
             p.semantic_type not in _NON_FACT_SEMANTIC_TYPES
@@ -1502,7 +1601,6 @@ def _merge_or_insert_facts_rows(
         state,
         actions_allowed=plan.actions_allowed,
         preset_knobs=facts_preset,
-        rng=state.rng,
     )
     insert_idx = next(
         (idx for idx, b in enumerate(blocks) if b.block_id in {"actions", "compose"}),
@@ -1642,7 +1740,9 @@ def _gate_single_block(
 ) -> PlannedBlock | None:
     """Applies the `actions_allowed == False` gate to one `PlannedBlock`."""
     if block.block_id in {"actions", "compose"}:
-        if block.block_id in required_ids and block.bindings.pointers():
+        if block.block_id in required_ids and any(
+            b.bound for b in block.bindings.slots.values()
+        ):
             state.action_gate_blocked = True
         return None
     if block.block_id == "filters":
@@ -1657,18 +1757,33 @@ def _gate_single_block(
     return block
 
 
+def _compute_action_gate(
+    stakes: float, floor: float, cap: float, conservativeness: float
+) -> float:
+    """Computes the action gate threshold scaled by `stakes` and `conservativeness`."""
+    clamped_stakes = min(max(stakes / 3.0, 0.0), 1.0)
+    base = floor + (cap - floor) * clamped_stakes
+    c = min(max(conservativeness, 0.0), 1.0)
+    if c <= 0.5:
+        return floor + (base - floor) * (c / 0.5)
+    return base + (cap - base) * ((c - 0.5) / 0.5)
+
+
 def apply_actions_gate(
     plan: LayoutPlan,
     state: PlannerState,
     floor: float,
     cap: float,
+    *,
+    conservativeness: float = 0.5,
 ) -> LayoutPlan:
     """Rule `actions-gate`: computes `actions_allowed` and gates interactive blocks.
 
-    The gate is ``floor + (cap - floor) * stakes / 3``; `floor` and `cap` are
-    the grammar's ``actionGateFloor`` and ``actionGateCap`` thresholds.
+    At default ``conservativeness=0.5`` the gate is
+    ``floor + (cap - floor) * stakes / 3``; ``conservativeness=0.0`` lowers it
+    to `floor` and ``1.0`` raises it to `cap`.
     """
-    gate = floor + (cap - floor) * (plan.stakes / 3.0)
+    gate = _compute_action_gate(plan.stakes, floor, cap, conservativeness)
     allowed = plan.confidence >= gate
     plan = replace(plan, actions_allowed=allowed)
     if allowed:
@@ -1683,17 +1798,45 @@ def apply_actions_gate(
     return replace(plan, blocks=tuple(updated))
 
 
+def _button_meta(idx: int, item: Mapping[str, SlotBinding]) -> tuple[str, str, str]:
+    """Extracts `(action_id, label, style)` from a bound `actions.buttons` item."""
+    act_slot = item.get("action")
+    lbl_slot = item.get("label")
+    act_id = (
+        str(act_slot.literal)
+        if act_slot is not None and act_slot.literal is not None
+        else str(idx)
+    )
+    label = (
+        str(lbl_slot.literal)
+        if lbl_slot is not None and lbl_slot.literal is not None
+        else act_id
+    )
+    style_slot = act_slot.fields.get("$style") if act_slot is not None else None
+    style = (
+        str(style_slot.literal)
+        if style_slot is not None and style_slot.literal is not None
+        else ""
+    )
+    return act_id, label, style
+
+
 def _extract_button_records(
     raw_items: Sequence[Mapping[str, SlotBinding]],
     instances: Mapping[str, Mapping[str, str]],
     stakes: float,
-) -> list[tuple[Mapping[str, SlotBinding], str, bool, bool]]:
-    """Builds ``(item, label, is_primary, is_destructive)`` tuples for action buttons."""
-    records: list[tuple[Mapping[str, SlotBinding], str, bool, bool]] = []
+) -> list[tuple[Mapping[str, SlotBinding], str, str, bool, bool]]:
+    """Builds ``(item, act_id, label, is_primary, is_destructive)`` tuples."""
+    records: list[tuple[Mapping[str, SlotBinding], str, str, bool, bool]] = []
     seen_primary = False
     for idx, item in enumerate(raw_items):
-        label = str(item["label"].literal or idx)
-        inst = instances.get(label) or instances.get(str(idx)) or {}
+        act_id, label, _ = _button_meta(idx, item)
+        inst = (
+            instances.get(act_id)
+            or instances.get(label)
+            or instances.get(str(idx))
+            or {}
+        )
         is_dest = inst.get("destructive") == "true"
         is_prim = (
             inst.get("primary") == "true"
@@ -1702,7 +1845,7 @@ def _extract_button_records(
         )
         if is_prim:
             seen_primary = True
-        records.append((item, label, is_prim, is_dest))
+        records.append((item, act_id, label, is_prim, is_dest))
     return records
 
 
@@ -1712,16 +1855,17 @@ def _reorder_and_enforce_actions(block: PlannedBlock, stakes: float) -> PlannedB
     if buttons is None or not buttons.items:
         return block
     records = _extract_button_records(buttons.items, block.instances, stakes)
-    sort_idx = 3 if (stakes >= 2.0 and any(r[3] for r in records)) else 2
+    sort_idx = 4 if (stakes >= 2.0 and any(r[4] for r in records)) else 3
     records.sort(key=lambda r: (1 if r[sort_idx] else 0))
     new_items = tuple(r[0] for r in records)
     new_instances: dict[str, dict[str, str]] = {}
-    for idx, (_, label, is_prim, is_dest) in enumerate(records):
+    for idx, (_, act_id, label, is_prim, is_dest) in enumerate(records):
         entry = {
             "primary": "true" if is_prim else "false",
             "destructive": "true" if is_dest else "false",
         }
         new_instances[str(idx)] = entry
+        new_instances[act_id] = entry
         new_instances[label] = entry
     new_buttons = replace(buttons, items=new_items)
     new_bindings = BlockBindings(slots={**block.bindings.slots, "buttons": new_buttons})
@@ -1829,6 +1973,64 @@ def apply_no_empty_container(
     return replace(plan, blocks=kept)
 
 
+def _scoped_collection_action(
+    bindings: BlockBindings, actions: Sequence[ActionSpec]
+) -> ActionSpec | None:
+    """Returns the first `ActionSpec` scoped to `bindings`'s `items` pointer."""
+    items = bindings.get("items")
+    if items is None or not items.pointer:
+        return None
+    return next((a for a in actions if a.scope == items.pointer), None)
+
+
+def _form_mutable_pointers(plan: LayoutPlan) -> tuple[str, ...]:
+    """Collects mutable pointers bound in `form.fields` across `plan.blocks`."""
+    found: list[str] = []
+    for block in plan.blocks:
+        if block.block_id != "form":
+            continue
+        fields_slot = block.bindings.get("fields")
+        if fields_slot is None:
+            continue
+        for item in fields_slot.items:
+            val_slot = item.get("value")
+            if val_slot is not None and val_slot.pointer:
+                found.append(val_slot.pointer)
+    return tuple(found)
+
+
+def _decorate_action_block(
+    block: PlannedBlock, form_ptrs: Sequence[str], has_plan_mutable: bool
+) -> PlannedBlock:
+    """Attaches `$mutable` and `$plan_mutable` slots to one action/compose block."""
+    if block.block_id not in {"actions", "compose"}:
+        return block
+    extra: dict[str, SlotBinding] = {}
+    if has_plan_mutable:
+        extra["$plan_mutable"] = SlotBinding(literal=True)
+    if block.block_id == "actions" and form_ptrs:
+        extra["$mutable"] = SlotBinding(
+            fields={p: SlotBinding(pointer=p) for p in form_ptrs}
+        )
+    if not extra:
+        return block
+    return replace(
+        block, bindings=BlockBindings(slots={**block.bindings.slots, **extra})
+    )
+
+
+def _attach_plan_action_metadata(plan: LayoutPlan, state: PlannerState) -> LayoutPlan:
+    """Attaches `$mutable` and `$plan_mutable` metadata onto surviving action blocks."""
+    form_ptrs = _form_mutable_pointers(plan)
+    has_plan_mutable = any(p.mutable_hint for p in state.pointers)
+    if not form_ptrs and not has_plan_mutable:
+        return plan
+    updated = tuple(
+        _decorate_action_block(b, form_ptrs, has_plan_mutable) for b in plan.blocks
+    )
+    return replace(plan, blocks=updated)
+
+
 class LayoutPlanner:
     """Speculative single-batch layout planner for archetype-driven A2UI synthesis."""
 
@@ -1852,17 +2054,16 @@ class LayoutPlanner:
 
     @property
     def config(self) -> SynthesisConfig:
-        """The `SynthesisConfig` governing pair budgets and threshold overrides."""
+        """The `SynthesisConfig` governing the pair budget and conservativeness."""
         return self._config
 
     def threshold(self, name: str) -> float:
-        """The effective threshold `name`: a `config.threshold_overrides` entry, else the grammar's.
+        """The grammar's threshold `name`.
 
         Raises:
-            KeyError: If neither the overrides nor the grammar define `name`.
+            KeyError: If the grammar does not define `name`.
         """
-        override = self._config.threshold_overrides.get(name)
-        return override if override is not None else self._grammar.threshold(name)
+        return self._grammar.threshold(name)
 
     def bind_slots(
         self,
@@ -1874,6 +2075,7 @@ class LayoutPlanner:
         payload: Mapping[str, Any] | None = None,
         intent: str = "",
         preferred_paths: Sequence[str] = (),
+        actions: Sequence[ActionSpec] = (),
     ) -> BlockBindings:
         """Deterministically binds `spec.slots` against `pointers` excluding `used`."""
         norm_pointers = _normalize_pointers(pointers)
@@ -1889,6 +2091,7 @@ class LayoutPlanner:
                 payload=payload or {},
                 intent=intent,
                 preferred_paths=preferred_paths,
+                actions=actions,
             )
             if binding.bound:
                 bound_slots[slot_name] = binding
@@ -1906,18 +2109,27 @@ class LayoutPlanner:
         payload: Mapping[str, Any],
         intent: str,
         preferred_paths: Sequence[str],
+        actions: Sequence[ActionSpec],
     ) -> SlotBinding:
         """Dispatches binding for a single `SlotSpec`."""
+        del intent
         if not slot.repeat:
             return _bind_scalar_slot(
-                slot, pointers, used, preferred_paths=preferred_paths
+                slot,
+                pointers,
+                used,
+                preferred_paths=preferred_paths,
+                payload=payload,
             )
         if slot.from_types == ("action",):
-            return _bind_actions_slot(slot, pointers, used, payload, intent)
+            return _bind_actions_slot(slot, actions)
         if slot.from_types == ("object",):
             return _bind_groups_slot(pointers, used)
         if slot.from_types == ("array",):
-            return _bind_array_repeated_slot(spec.id, slot, pointers, used)
+            scoped = tuple(a for a in actions if a.scope is not None)
+            return _bind_array_repeated_slot(
+                spec.id, slot, pointers, used, scoped_actions=scoped
+            )
         return _bind_scalar_repeated_slot(
             spec.id,
             slot,
@@ -1925,28 +2137,45 @@ class LayoutPlanner:
             used,
             salience_scores,
             spec.salience,
+            payload=payload,
         )
+
+    def _block_shape_holds(
+        self,
+        spec: BlockSpec,
+        pointers: Sequence[PointerSummary],
+        actions: Sequence[ActionSpec],
+    ) -> bool:
+        """Returns whether `spec.shape` holds against `pointers` and `actions`."""
+        if spec.id == "actions":
+            return any(a.scope is None for a in actions)
+        return _matches_shape(spec.shape, pointers)
 
     def _is_required_block_viable(
         self,
         req_id: str,
         pointers: Sequence[PointerSummary],
         base_used: set[str],
+        *,
+        actions: Sequence[ActionSpec] = (),
     ) -> bool:
         """Returns whether required block `req_id` resolves and binds on `pointers`."""
         spec = self._grammar.block(req_id)
         if _resolve_block_pattern(spec, self._capabilities) is None:
             return False
-        if not _matches_shape(spec.shape, pointers):
+        if not self._block_shape_holds(spec, pointers, actions):
             return False
-        bindings = self.bind_slots(spec, pointers, set(base_used))
+        bindings = self.bind_slots(spec, pointers, set(base_used), actions=actions)
         return _block_has_required_bindings(
             PlannedBlock(block_id=req_id, pattern=spec.pattern, bindings=bindings),
             spec,
         )
 
     def _default_eligible(
-        self, pointers: Sequence[PointerSummary]
+        self,
+        pointers: Sequence[PointerSummary],
+        *,
+        actions: Sequence[ActionSpec] = (),
     ) -> tuple[LayoutArchetype, ...]:
         """Filters `grammar.archetypes` by shape, catalog support, and required slots."""
         page_ptr = _page_title_pointer(pointers)
@@ -1956,41 +2185,53 @@ class LayoutPlanner:
             for arch in self._grammar.archetypes
             if _matches_shape(arch.shape, pointers)
             and all(
-                self._is_required_block_viable(req_id, pointers, base_used)
+                self._is_required_block_viable(
+                    req_id, pointers, base_used, actions=actions
+                )
                 for req_id in arch.required_block_ids()
             )
         )
 
+    def _block_satisfied_for_prior(
+        self,
+        spec: BlockSpec,
+        pointers: Sequence[PointerSummary],
+        base_used: set[str],
+        actions: Sequence[ActionSpec],
+    ) -> bool:
+        """Returns whether `spec` counts as satisfied when ordering prior archetypes."""
+        if spec.shape.is_empty:
+            bindings = self.bind_slots(spec, pointers, set(base_used), actions=actions)
+            return _block_has_required_bindings(
+                PlannedBlock(block_id=spec.id, pattern=spec.pattern, bindings=bindings),
+                spec,
+            )
+        return self._block_shape_holds(spec, pointers, actions)
+
     def _satisfied_block_count(
-        self, arch: LayoutArchetype, pointers: Sequence[PointerSummary]
+        self,
+        arch: LayoutArchetype,
+        pointers: Sequence[PointerSummary],
+        actions: Sequence[ActionSpec] = (),
     ) -> int:
         """Counts how many blocks in `arch` satisfy their shape filter on `pointers`."""
         page_ptr = _page_title_pointer(pointers)
         base_used = {page_ptr.path} if page_ptr is not None else set()
-        count = 0
-        for ref in arch.blocks:
-            spec = self._grammar.block(ref.id)
-            if spec.shape.is_empty:
-                bindings = self.bind_slots(spec, pointers, set(base_used))
-                if _block_has_required_bindings(
-                    PlannedBlock(
-                        block_id=ref.id, pattern=spec.pattern, bindings=bindings
-                    ),
-                    spec,
-                ):
-                    count += 1
-            elif spec.id == "actions":
-                if any(_is_action_pointer(p) for p in pointers):
-                    count += 1
-            elif _matches_shape(spec.shape, pointers):
-                count += 1
-        return count
+        return sum(
+            1
+            for ref in arch.blocks
+            if self._block_satisfied_for_prior(
+                self._grammar.block(ref.id), pointers, base_used, actions
+            )
+        )
 
     def prior_archetypes(
         self,
         eligible: Sequence[LayoutArchetype],
         pointers: Sequence[PointerSummary],
         brief: LayoutBrief | None = None,
+        *,
+        actions: Sequence[ActionSpec] = (),
     ) -> tuple[LayoutArchetype, ...]:
         """Orders `eligible` archetypes by brief pin first, then satisfied block shapes."""
         norm = _normalize_pointers(pointers)
@@ -2012,10 +2253,53 @@ class LayoutPlanner:
                 is_pinned = 2
             elif pinned_blocks and pinned_blocks.issubset(set(arch.block_ids())):
                 is_pinned = 1
-            satisfied = self._satisfied_block_count(arch, norm)
+            satisfied = self._satisfied_block_count(arch, norm, actions)
             return (-is_pinned, -satisfied, grammar_order.get(arch.id, 999))
 
         return tuple(sorted(eligible, key=_sort_key))
+
+    def _init_planner_state(
+        self,
+        intent: str,
+        pointers: Sequence[PointerSummary],
+        *,
+        eligible: Sequence[LayoutArchetype] | None,
+        brief: LayoutBrief | None,
+        payload: Mapping[str, Any] | None,
+        copy: AuthoredCopy | None,
+        templates: Sequence[SurfaceTemplate],
+        actions: Sequence[ActionSpec],
+    ) -> tuple[PlannerState, tuple[LayoutArchetype, ...]]:
+        """Initializes `PlannerState` and prioritized archetypes for batch building."""
+        norm_pointers = _normalize_pointers(pointers)
+        action_tuple = tuple(actions)
+        if eligible is None:
+            elig = self._default_eligible(norm_pointers, actions=action_tuple)
+        else:
+            has_surface_act = any(a.scope is None for a in action_tuple)
+            elig = tuple(
+                a
+                for a in eligible
+                if has_surface_act or "actions" not in a.required_block_ids()
+            )
+        prior = self.prior_archetypes(elig, norm_pointers, brief, actions=action_tuple)
+        available_paths = {p.path for p in norm_pointers}
+        matching_templates = tuple(
+            t for t in templates if t.matches_payload(available_paths)
+        )
+        state = PlannerState(
+            intent=intent,
+            pointers=norm_pointers,
+            eligible=elig,
+            prior_archetypes=tuple(a.id for a in prior),
+            brief=brief,
+            batch=DecisionBatch(shared_context={}, questions=()),
+            payload=dict(payload) if payload is not None else {},
+            copy=copy,
+            templates=matching_templates,
+            actions=action_tuple,
+        )
+        return state, prior
 
     def build_batch(
         self,
@@ -2026,38 +2310,22 @@ class LayoutPlanner:
         brief: LayoutBrief | None = None,
         payload: Mapping[str, Any] | None = None,
         copy: AuthoredCopy | None = None,
+        templates: Sequence[SurfaceTemplate] = (),
+        actions: Sequence[ActionSpec] = (),
     ) -> tuple[DecisionBatch, PlannerState]:
-        """Builds a speculative `DecisionBatch` and `PlannerState` for one surface.
-
-        Args:
-            intent: The author's natural-language intent.
-            pointers: Payload pointer summaries from `inspect_payload_pointers`.
-            eligible: Archetypes to consider; defaults to those whose shape and
-                required blocks the payload satisfies.
-            brief: Optional `LayoutBrief` pinning roles to pointers.
-            payload: The payload itself, used to read action labels and
-                option values; questions degrade to key-derived text without it.
-            copy: Optional authored title and summary strings supplied in the
-                decision block.
-        """
-        norm_pointers = _normalize_pointers(pointers)
-        elig = (
-            tuple(eligible)
-            if eligible is not None
-            else self._default_eligible(norm_pointers)
-        )
-        prior = self.prior_archetypes(elig, norm_pointers, brief)
-        state = PlannerState(
-            intent=intent,
-            pointers=norm_pointers,
-            eligible=elig,
-            prior_archetypes=tuple(a.id for a in prior),
+        """Builds a speculative `DecisionBatch` and `PlannerState` for one surface."""
+        state, prior = self._init_planner_state(
+            intent,
+            pointers,
+            eligible=eligible,
             brief=brief,
-            batch=DecisionBatch(shared_context={}, questions=()),
-            payload=dict(payload) if payload is not None else {},
+            payload=payload,
             copy=copy,
+            templates=templates,
+            actions=actions,
         )
         questions: list[DecisionQuestion] = []
+        self._append_template_question(questions, state)
         self._append_job_questions(questions, state)
         self._append_archetype_questions(questions, state)
         self._append_gate_and_anatomy_questions(questions, state)
@@ -2066,7 +2334,7 @@ class LayoutPlanner:
         batch = DecisionBatch(
             shared_context={
                 "intent": intent,
-                "pointers": [p.path for p in norm_pointers],
+                "pointers": [p.path for p in state.pointers],
             },
             questions=tuple(questions),
         )
@@ -2082,32 +2350,28 @@ class LayoutPlanner:
         brief: LayoutBrief | None = None,
         payload: Mapping[str, Any] | None = None,
         copy: AuthoredCopy | None = None,
+        templates: Sequence[SurfaceTemplate] = (),
+        actions: Sequence[ActionSpec] = (),
     ) -> tuple[DecisionBatch, PlannerState]:
-        """Builds Stage 1 (`family`, `stakes`, `urgency`, and `archetype:*`) of a two-stage batch."""
-        norm_pointers = _normalize_pointers(pointers)
-        elig = (
-            tuple(eligible)
-            if eligible is not None
-            else self._default_eligible(norm_pointers)
-        )
-        prior = self.prior_archetypes(elig, norm_pointers, brief)
-        state = PlannerState(
-            intent=intent,
-            pointers=norm_pointers,
-            eligible=elig,
-            prior_archetypes=tuple(a.id for a in prior),
+        """Builds Stage 1 (`template`, `family`, `stakes`, `urgency`, and `archetype:*`)."""
+        state, _ = self._init_planner_state(
+            intent,
+            pointers,
+            eligible=eligible,
             brief=brief,
-            batch=DecisionBatch(shared_context={}, questions=()),
-            payload=dict(payload) if payload is not None else {},
+            payload=payload,
             copy=copy,
+            templates=templates,
+            actions=actions,
         )
         questions: list[DecisionQuestion] = []
+        self._append_template_question(questions, state)
         self._append_job_questions(questions, state)
         self._append_archetype_questions(questions, state)
         batch = DecisionBatch(
             shared_context={
                 "intent": intent,
-                "pointers": [p.path for p in norm_pointers],
+                "pointers": [p.path for p in state.pointers],
             },
             questions=tuple(questions),
         )
@@ -2136,6 +2400,11 @@ class LayoutPlanner:
     ) -> DecisionBatch:
         """Builds Stage 2 (`gate`, `anatomy`, `salience`, and `instance` for the winning archetype)."""
         self._validate_and_index_answers(state, stage1_answers)
+        if self._read_template(state) is not None:
+            state.trace.clear()
+            return DecisionBatch(
+                shared_context=dict(state.batch.shared_context), questions=()
+            )
         family = self._read_family(state)
         archetype = (
             self._read_archetype(state, family)[0] if family is not None else None
@@ -2208,6 +2477,36 @@ class LayoutPlanner:
         if state.brief is None:
             return []
         return [r for r in state.brief.roles() if r in self._grammar.families()]
+
+    def _append_template_question(
+        self, questions: list[DecisionQuestion], state: PlannerState
+    ) -> None:
+        """Emits the `template` choice question when matching templates exist."""
+        if not state.templates:
+            return
+        seen_ids = {q.id for q in questions}
+        self._try_add_question(
+            questions,
+            DecisionQuestion(
+                id="template",
+                kind=QuestionKind.CHOICE,
+                prompt=(
+                    "Which registered template best fits this surface, or"
+                    " should a layout be composed?"
+                ),
+                options=(*(t.template_id for t in state.templates), "compose"),
+                option_texts=(
+                    *(t.description for t in state.templates),
+                    (
+                        "Compose a layout from archetypes instead of using a fixed"
+                        " template."
+                    ),
+                ),
+                allow_none=False,
+            ),
+            state,
+            seen_ids=seen_ids,
+        )
 
     def _append_job_questions(
         self, questions: list[DecisionQuestion], state: PlannerState
@@ -2298,7 +2597,7 @@ class LayoutPlanner:
                     continue
                 seen.add(ref.id)
                 spec = self._grammar.block(ref.id)
-                if _matches_shape(spec.shape, state.pointers):
+                if self._block_shape_holds(spec, state.pointers, state.actions):
                     gated.append(spec)
         return gated
 
@@ -2329,6 +2628,34 @@ class LayoutPlanner:
                 )
         self._append_anatomy_for_blocks(questions, gated_blocks, state, seen_ids)
 
+    def _append_single_block_anatomy(
+        self,
+        questions: list[DecisionQuestion],
+        spec: BlockSpec,
+        bindings: BlockBindings,
+        by_path: Mapping[str, PointerSummary],
+        state: PlannerState,
+        seen_ids: set[str],
+    ) -> None:
+        """Emits `anatomy:<block>.<knob>` questions for a single `BlockSpec`."""
+        has_scoped_act = (
+            spec.id == "collection"
+            and _scoped_collection_action(bindings, state.actions) is not None
+        )
+        for knob, q_spec in spec.anatomy.items():
+            if has_scoped_act and knob == "trailing":
+                continue
+            derived = _derive_anatomy_from_hints(q_spec, bindings, by_path)
+            if derived is not None:
+                state.derived_anatomy[(spec.id, knob)] = derived
+                continue
+            applies, fmt_vars = _anatomy_applies(q_spec, bindings, by_path)
+            if not applies or q_spec.options_from is not None:
+                continue
+            q_obj = self._build_anatomy_question(spec.id, knob, q_spec, fmt_vars)
+            if q_obj is not None:
+                self._try_add_question(questions, q_obj, state, seen_ids=seen_ids)
+
     def _append_anatomy_for_blocks(
         self,
         questions: list[DecisionQuestion],
@@ -2347,18 +2674,11 @@ class LayoutPlanner:
                 set(base_used),
                 payload=state.payload,
                 intent=state.intent,
+                actions=state.actions,
             )
-            for knob, q_spec in spec.anatomy.items():
-                derived = _derive_anatomy_from_hints(q_spec, bindings, by_path)
-                if derived is not None:
-                    state.derived_anatomy[(spec.id, knob)] = derived
-                    continue
-                applies, fmt_vars = _anatomy_applies(q_spec, bindings, by_path)
-                if not applies or q_spec.options_from is not None:
-                    continue
-                q_obj = self._build_anatomy_question(spec.id, knob, q_spec, fmt_vars)
-                if q_obj is not None:
-                    self._try_add_question(questions, q_obj, state, seen_ids=seen_ids)
+            self._append_single_block_anatomy(
+                questions, spec, bindings, by_path, state, seen_ids
+            )
 
     def _build_anatomy_question(
         self,
@@ -2484,7 +2804,9 @@ class LayoutPlanner:
                     continue
                 seen_blocks.add(ref.id)
                 spec = self._grammar.block(ref.id)
-                if not spec.instance or not _matches_shape(spec.shape, state.pointers):
+                if not spec.instance or not self._block_shape_holds(
+                    spec, state.pointers, state.actions
+                ):
                     continue
                 bindings = self.bind_slots(
                     spec,
@@ -2492,6 +2814,7 @@ class LayoutPlanner:
                     set(base_used),
                     payload=state.payload,
                     intent=state.intent,
+                    actions=state.actions,
                 )
                 for q_obj in self._build_block_instance_questions(
                     spec, bindings, state
@@ -2543,6 +2866,32 @@ class LayoutPlanner:
             )
         return built
 
+    def _build_primary_action_question(
+        self,
+        prim_spec: QuestionSpec | None,
+        metas: Sequence[tuple[str, str, str]],
+    ) -> DecisionQuestion | None:
+        """Builds `instance:actions.primary:buttons` unless style pins primary."""
+        if prim_spec is None or any(
+            st == ActionStyle.PRIMARY.value for _, _, st in metas
+        ):
+            return None
+        excluded = {
+            ActionStyle.SECONDARY.value,
+            ActionStyle.DESTRUCTIVE.value,
+        }
+        candidates = [(aid, lbl) for aid, lbl, st in metas if st not in excluded]
+        if not candidates:
+            return None
+        return DecisionQuestion(
+            id="instance:actions.primary:buttons",
+            kind=QuestionKind.CHOICE,
+            prompt=prim_spec.question,
+            options=tuple(aid for aid, _ in candidates),
+            option_texts=tuple(lbl for _, lbl in candidates),
+            allow_none=prim_spec.allow_none,
+        )
+
     def _build_actions_instance_questions(
         self, spec: BlockSpec, bindings: BlockBindings
     ) -> list[DecisionQuestion]:
@@ -2550,34 +2899,26 @@ class LayoutPlanner:
         buttons = bindings.get("buttons")
         if buttons is None or not buttons.items:
             return []
-        ptr_path = buttons.pointer or "/actions"
-        labels = tuple(
-            str(item["label"].literal or idx) for idx, item in enumerate(buttons.items)
-        )
+        metas = [_button_meta(idx, item) for idx, item in enumerate(buttons.items)]
         built: list[DecisionQuestion] = []
-        prim_spec = spec.instance.get("primary")
-        if prim_spec is not None and labels:
-            built.append(
-                DecisionQuestion(
-                    id=f"instance:actions.primary:{ptr_path}",
-                    kind=QuestionKind.CHOICE,
-                    prompt=prim_spec.question,
-                    options=labels,
-                    allow_none=prim_spec.allow_none,
-                )
-            )
+        prim_q = self._build_primary_action_question(
+            spec.instance.get("primary"), metas
+        )
+        if prim_q is not None:
+            built.append(prim_q)
         dest_spec = spec.instance.get("destructive")
         if dest_spec is not None:
-            for idx, label in enumerate(labels):
-                built.append(
-                    DecisionQuestion(
-                        id=f"instance:actions.destructive:{idx}",
-                        kind=QuestionKind.BOOLEAN,
-                        prompt=dest_spec.question.format(label=label),
-                        context={"yes": dest_spec.yes, "no": dest_spec.no},
-                        allow_none=False,
-                    )
+            built.extend(
+                DecisionQuestion(
+                    id=f"instance:actions.destructive:{aid}",
+                    kind=QuestionKind.BOOLEAN,
+                    prompt=dest_spec.question.format(label=lbl),
+                    context={"yes": dest_spec.yes, "no": dest_spec.no},
+                    allow_none=False,
                 )
+                for aid, lbl, st in metas
+                if st != ActionStyle.DESTRUCTIVE.value
+            )
         return built
 
     def _build_single_group_row_question(
@@ -2710,20 +3051,68 @@ class LayoutPlanner:
             allow_none=q_spec.allow_none,
         )
 
+    def _read_template(self, state: PlannerState) -> tuple[str, float] | None:
+        """Reads the `template` choice question against `template`/`templateMutable`."""
+        q_map = {q.id: q for q in state.batch.questions}
+        tpl_q = q_map.get("template")
+        tpl_ans = state.answers_by_id.get("template")
+        if tpl_q is None or tpl_ans is None:
+            return None
+        chosen, prob = tpl_ans.top()
+        tpl_by_id = {t.template_id: t for t in state.templates}
+        chosen_tpl = tpl_by_id.get(chosen)
+        is_mut = any(p.mutable_hint for p in state.pointers) or (
+            chosen_tpl is not None and chosen_tpl.is_mutable
+        )
+        thresh = self.threshold("templateMutable" if is_mut else "template")
+        if chosen != "compose" and chosen_tpl is not None and prob >= thresh:
+            state.trace.append(
+                DecisionRecord(
+                    question=tpl_q,
+                    answer=tpl_ans,
+                    threshold=thresh,
+                    outcome=chosen,
+                )
+            )
+            return chosen, prob
+        state.trace.append(
+            DecisionRecord(
+                question=tpl_q,
+                answer=tpl_ans,
+                threshold=thresh,
+                outcome="compose",
+            )
+        )
+        return None
+
     def read(
         self,
         state: PlannerState,
         answers: Sequence[DecisionAnswer],
-        *,
-        seed: int | None = None,
     ) -> PlanOutcome:
-        """Reads backend `answers` into a validated `PlanOutcome`."""
-        state.seed = seed
-        if self._config.variety is VarietyMode.NEAR_TOP:
-            state.rng = random.Random(seed)
-        else:
-            state.rng = None
+        """Reads backend `answers` into a validated `PlanOutcome`.
+
+        When the batch carried a `template` question and its winner clears
+        the threshold, the plan's `LayoutPlan.template_id` names that
+        template; otherwise it is None.
+        """
         self._validate_and_index_answers(state, answers)
+        tpl_winner = self._read_template(state)
+        if tpl_winner is not None:
+            tpl_id, tpl_prob = tpl_winner
+            stakes, urgency = self._read_stakes_and_urgency(state)
+            return PlanOutcome(
+                plan=LayoutPlan(
+                    archetype="",
+                    family="",
+                    blocks=(),
+                    stakes=stakes,
+                    urgency=urgency,
+                    confidence=tpl_prob,
+                    template_id=tpl_id,
+                ),
+                reason=PlanReason.PLANNED,
+            )
         family = self._read_family(state)
         if family is None:
             return PlanOutcome(plan=None, reason=PlanReason.NO_FAMILY)
@@ -2974,7 +3363,7 @@ class LayoutPlanner:
 
     def _block_matches_gate_shape(self, spec: BlockSpec, state: PlannerState) -> bool:
         """Returns whether `spec` satisfies shape constraints or authored prose copy."""
-        if _matches_shape(spec.shape, state.pointers):
+        if self._block_shape_holds(spec, state.pointers, state.actions):
             return True
         return bool(
             spec.id == "prose" and state.copy is not None and state.copy.summary
@@ -3077,50 +3466,35 @@ class LayoutPlanner:
             state,
             self.threshold("actionGateFloor"),
             self.threshold("actionGateCap"),
+            conservativeness=self._config.conservativeness,
         )
         plan = apply_one_primary_action(plan, state)
         plan = apply_urgency_terse(plan, state, self._capabilities)
         plan = apply_no_orphaned_pointers(plan, state, self)
         plan = apply_no_empty_container(plan, state, self._grammar)
+        plan = _attach_plan_action_metadata(plan, state)
         if state.action_gate_blocked:
             return PlanOutcome(plan=None, reason=PlanReason.ACTION_GATE)
         if state.required_block_missing or not plan.blocks:
             return PlanOutcome(plan=None, reason=PlanReason.REQUIRED_BLOCK_MISSING)
         return PlanOutcome(plan=plan, reason=PlanReason.PLANNED)
 
-    def _pick_option(
+    def _apply_scoped_collection_knobs(
         self,
-        answer: DecisionAnswer,
+        spec: BlockSpec,
+        bindings: BlockBindings,
+        state: PlannerState,
+        knobs: dict[str, str],
         *,
-        kind: str = "option",
-        rng: random.Random | None = None,
-    ) -> tuple[str, float]:
-        """Picks a winning option from `answer` using ARGMAX or NEAR_TOP sampling."""
-        if (
-            self._config.variety is not VarietyMode.NEAR_TOP
-            or rng is None
-            or not answer.distribution.probabilities
-        ):
-            return answer.top()
-
-        probs = {
-            opt: prob
-            for opt, prob in answer.distribution.probabilities.items()
-            if opt != "none"
-        }
-        if not probs:
-            return answer.top()
-
-        top_opt, top_prob = max(probs.items(), key=lambda item: item[1])
-        cutoff = top_prob - self._config.variety_margin
-        near_top = [(opt, prob) for opt, prob in probs.items() if prob >= cutoff]
-        if len(near_top) <= 1:
-            return top_opt, top_prob
-
-        candidates = [opt for opt, _ in near_top]
-        weights = [prob for _, prob in near_top]
-        chosen = rng.choices(candidates, weights=weights, k=1)[0]
-        return chosen, probs[chosen]
+        actions_allowed: bool,
+    ) -> None:
+        """Attaches `trailing='button'` and `trailing.label` for scoped item actions."""
+        if spec.id != "collection" or not actions_allowed:
+            return
+        scoped_act = _scoped_collection_action(bindings, state.actions)
+        if scoped_act is not None:
+            knobs["trailing"] = "button"
+            knobs["trailing.label"] = scoped_act.label
 
     def _resolve_block_questions(
         self,
@@ -3130,7 +3504,6 @@ class LayoutPlanner:
         *,
         actions_allowed: bool,
         preset_knobs: Mapping[str, str],
-        rng: random.Random | None = None,
     ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
         """Resolves measures, anatomy knobs, and instance answers for `spec`."""
         by_path = {p.path: p for p in state.pointers}
@@ -3155,11 +3528,13 @@ class LayoutPlanner:
                 bindings,
                 state,
                 actions_allowed=actions_allowed,
-                rng=rng,
             )
             if chosen is not None:
                 knobs[knob] = chosen
-        instances = self._resolve_block_instances(spec, bindings, state, rng=rng)
+        self._apply_scoped_collection_knobs(
+            spec, bindings, state, knobs, actions_allowed=actions_allowed
+        )
+        instances = self._resolve_block_instances(spec, bindings, state)
         if spec.id in {"banner", "outcome"}:
             for elem_map in instances.values():
                 if "tone" in elem_map:
@@ -3174,14 +3549,12 @@ class LayoutPlanner:
         bindings: BlockBindings,
         state: PlannerState,
         actions_allowed: bool,
-        *,
-        rng: random.Random | None = None,
     ) -> str | None:
         """Selects the highest-ranked choice option whose `requires` hold."""
         if ans is None:
             ranked = list(q_spec.options)
         else:
-            picked, _ = self._pick_option(ans, kind="anatomy", rng=rng)
+            picked, _ = ans.top()
             other_opts = [
                 opt
                 for opt, _ in sorted(
@@ -3218,7 +3591,6 @@ class LayoutPlanner:
         state: PlannerState,
         *,
         actions_allowed: bool,
-        rng: random.Random | None = None,
     ) -> str | None:
         """Resolves one anatomy knob answer with constraint-aware argmax."""
         if q_spec.kind is QuestionKind.BOOLEAN:
@@ -3249,7 +3621,6 @@ class LayoutPlanner:
             bindings,
             state,
             actions_allowed,
-            rng=rng,
         )
 
     def _record_single_instance_answer(
@@ -3259,16 +3630,10 @@ class LayoutPlanner:
         ans: DecisionAnswer,
         thresh: float,
         state: PlannerState,
-        *,
-        rng: random.Random | None = None,
     ) -> str:
         """Evaluates one instance `DecisionAnswer` and appends a `DecisionRecord`."""
         is_bool = q_spec.kind is QuestionKind.BOOLEAN
-        val = (
-            ("true" if ans.yes >= thresh else "false")
-            if is_bool
-            else self._pick_option(ans, kind="instance", rng=rng)[0]
-        )
+        val = ("true" if ans.yes >= thresh else "false") if is_bool else ans.top()[0]
         if q_obj is not None:
             state.trace.append(
                 DecisionRecord(
@@ -3285,12 +3650,10 @@ class LayoutPlanner:
         spec: BlockSpec,
         bindings: BlockBindings,
         state: PlannerState,
-        *,
-        rng: random.Random | None = None,
     ) -> dict[str, dict[str, str]]:
         """Reads instance answers for `spec` into an element-keyed mapping."""
         if spec.id == "actions":
-            return self._resolve_actions_instances(bindings, state, rng=rng)
+            return self._resolve_actions_instances(bindings, state)
         q_map = {q.id: q for q in state.batch.questions}
         thresh = self.threshold("instance")
         instances: dict[str, dict[str, str]] = {}
@@ -3306,25 +3669,23 @@ class LayoutPlanner:
             ):
                 continue
             val = self._record_single_instance_answer(
-                q_spec, q_map.get(q_id), ans, thresh, state, rng=rng
+                q_spec, q_map.get(q_id), ans, thresh, state
             )
             instances.setdefault(elem_key, {})[q_name] = val
         return instances
 
     def _read_primary_action_choice(
         self,
-        ptr_path: str,
+        target: str,
         q_map: Mapping[str, DecisionQuestion],
         state: PlannerState,
-        *,
-        rng: random.Random | None = None,
     ) -> str:
-        """Reads the winning button option from `instance:actions.primary:<ptr>`."""
-        prim_id = f"instance:actions.primary:{ptr_path}"
+        """Reads the winning button option from `instance:actions.primary:<target>`."""
+        prim_id = f"instance:actions.primary:{target}"
         prim_ans = state.answers_by_id.get(prim_id)
         if prim_ans is None:
             return ""
-        chosen = self._pick_option(prim_ans, kind="primary_action", rng=rng)[0]
+        chosen = prim_ans.top()[0]
         if prim_id in q_map:
             state.trace.append(
                 DecisionRecord(
@@ -3337,14 +3698,18 @@ class LayoutPlanner:
 
     def _read_button_destructive_flag(
         self,
+        act_id: str,
         idx: int,
         thresh: float,
         q_map: Mapping[str, DecisionQuestion],
         state: PlannerState,
     ) -> bool:
-        """Reads `instance:actions.destructive:<idx>` and appends a trace record."""
-        dest_id = f"instance:actions.destructive:{idx}"
+        """Reads `instance:actions.destructive:<act_id>` and appends a trace record."""
+        dest_id = f"instance:actions.destructive:{act_id}"
         dest_ans = state.answers_by_id.get(dest_id)
+        if dest_ans is None:
+            dest_id = f"instance:actions.destructive:{idx}"
+            dest_ans = state.answers_by_id.get(dest_id)
         if dest_ans is None:
             return False
         is_dest = dest_ans.yes >= thresh
@@ -3359,12 +3724,42 @@ class LayoutPlanner:
             )
         return is_dest
 
+    def _resolve_single_button_flags(
+        self,
+        idx: int,
+        item: Mapping[str, SlotBinding],
+        chosen_prim: str,
+        thresh: float,
+        q_map: Mapping[str, DecisionQuestion],
+        state: PlannerState,
+    ) -> tuple[str, str, dict[str, str]]:
+        """Computes `(act_id, label, instance_flags)` for a single action button."""
+        act_id, label, style = _button_meta(idx, item)
+        is_dest = style == ActionStyle.DESTRUCTIVE.value or (
+            self._read_button_destructive_flag(act_id, idx, thresh, q_map, state)
+        )
+        if style == ActionStyle.PRIMARY.value:
+            is_prim = True
+        elif style in {
+            ActionStyle.SECONDARY.value,
+            ActionStyle.DESTRUCTIVE.value,
+        }:
+            is_prim = False
+        else:
+            is_prim = chosen_prim in {act_id, label, str(idx)}
+        return (
+            act_id,
+            label,
+            {
+                "primary": "true" if is_prim else "false",
+                "destructive": "true" if is_dest else "false",
+            },
+        )
+
     def _resolve_actions_instances(
         self,
         bindings: BlockBindings,
         state: PlannerState,
-        *,
-        rng: random.Random | None = None,
     ) -> dict[str, dict[str, str]]:
         """Resolves `actions.primary` and `actions.destructive` per button."""
         buttons = bindings.get("buttons")
@@ -3372,47 +3767,16 @@ class LayoutPlanner:
             return {}
         q_map = {q.id: q for q in state.batch.questions}
         thresh = self.threshold("instance")
-        chosen_prim = self._read_primary_action_choice(
-            buttons.pointer or "/actions", q_map, state, rng=rng
-        )
+        chosen_prim = self._read_primary_action_choice("buttons", q_map, state)
         instances: dict[str, dict[str, str]] = {}
         for idx, item in enumerate(buttons.items):
-            label = str(item["label"].literal or idx)
-            is_dest = self._read_button_destructive_flag(idx, thresh, q_map, state)
-            is_prim = chosen_prim in {label, str(idx)}
-            entry = {
-                "primary": "true" if is_prim else "false",
-                "destructive": "true" if is_dest else "false",
-            }
+            act_id, label, entry = self._resolve_single_button_flags(
+                idx, item, chosen_prim, thresh, q_map, state
+            )
             instances[str(idx)] = entry
+            instances[act_id] = entry
             instances[label] = entry
         return instances
-
-    def needs_reask(
-        self, plan: LayoutPlan, state: PlannerState
-    ) -> tuple[DecisionQuestion, ...]:
-        """Returns depended-on questions whose winning probability is below `reask_below`."""
-        active_blocks = set(plan.block_ids())
-        active_ptrs: set[str] = set()
-        for block in plan.blocks:
-            active_ptrs.update(block.bindings.pointers())
-        reask: list[DecisionQuestion] = []
-        for question in state.batch.questions:
-            if not _question_affects_plan(
-                question.id, plan.family, active_blocks, active_ptrs
-            ):
-                continue
-            ans = state.answers_by_id.get(question.id)
-            if ans is None:
-                continue
-            win_prob = (
-                max(ans.yes, 1.0 - ans.yes)
-                if question.kind is QuestionKind.BOOLEAN
-                else ans.top()[1]
-            )
-            if win_prob < self.threshold("reask_below"):
-                reask.append(question)
-        return tuple(reask)
 
 
 _MAX_SALIENCE_QUESTIONS = 20
@@ -3441,30 +3805,3 @@ def _item_instance_applies(
         _single_apply_condition_holds(k, req, item, ptr)
         for k, req in q_spec.applies_when.items()
     )
-
-
-def _question_affects_plan(
-    question_id: str,
-    family: str,
-    active_blocks: set[str],
-    active_ptrs: set[str],
-) -> bool:
-    """Returns whether `question_id` governs a block or element present in `plan`."""
-    if question_id in {"family", f"archetype:{family}"}:
-        return True
-    if question_id.startswith("anatomy:"):
-        block_id = question_id[len("anatomy:") :].split(".", 1)[0]
-        return block_id in active_blocks
-    if question_id.startswith("instance:"):
-        rest = question_id[len("instance:") :]
-        block_id = rest.split(".", 1)[0]
-        if block_id not in active_blocks:
-            return False
-        _, _, elem_key = rest.partition(":")
-        if elem_key.startswith("/"):
-            return elem_key in active_ptrs
-        return True
-    if question_id.startswith("gate:"):
-        block_id = question_id[len("gate:") :]
-        return block_id in active_blocks
-    return False

@@ -16,10 +16,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import copy
 from typing import Any
-
-import pytest
 
 from a2ui.core import Catalog
 from a2ui.core.basic_catalog import BasicCatalog
@@ -28,26 +27,32 @@ from a2ui.inference_formats.decision.archetypes import (
     load_asset,
 )
 from a2ui.inference_formats.decision.catalog_graph import CatalogDecisionGraph
+from a2ui.inference_formats.decision.layout_planner import LayoutPlanner
 from a2ui.inference_formats.decision.models import (
+    ActionSpec,
     BlockBindings,
     PageBindings,
+    SemanticType,
     SlotBinding,
 )
 from a2ui.inference_formats.decision.patterns import (
     MergedPatternLibrary,
-    ResolvedPattern,
     PatternError,
     PatternExpander,
     PatternLibrary,
+    PatternRef,
+    ResolvedPattern,
     eligible_archetypes,
     resolve_fallback_pattern,
+    shape_signature,
 )
 from a2ui.inference_formats.decision.payload_inspector import (
     inspect_payload_pointers,
 )
 from a2ui.utils import validate_payload
+import pytest
 
-from .layout_fixtures import HOST, RESORT, SETTINGS, TRANSFER
+from .layout_fixtures import HOST, RESORT, SETTINGS, TRANSFER, mock_backend
 
 
 def _two_component_domain_catalog() -> Catalog:
@@ -78,12 +83,10 @@ def _two_component_domain_catalog() -> Catalog:
     })
 
 
-def _wrap_surface(
-    components: list[dict[str, Any]], *, version: str = "1.0"
-) -> list[dict[str, Any]]:
-    """Wraps expanded `components` in a valid `createSurface` + `updateComponents` envelope."""
+def _wrap_surface(components: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Wraps expanded v1.0 `components` in a valid `createSurface` + `updateComponents` envelope."""
     has_root = any(c.get("id") == "root" for c in components)
-    all_comps = list(components)
+    all_comps = [dict(c) for c in components]
     if not has_root:
         first_id = str(all_comps[0]["id"])
         all_comps.insert(
@@ -94,18 +97,17 @@ def _wrap_surface(
                 "children": [first_id],
             },
         )
-    wire_version = "1.0" if version == "1.0" else "v0.9"
-    catalog_id = BasicCatalog(wire_version).catalog_id
+    catalog_id = BasicCatalog("1.0").catalog_id
     return [
         {
-            "version": wire_version,
+            "version": "1.0",
             "createSurface": {
                 "surfaceId": "test_surface",
                 "catalogId": catalog_id,
             },
         },
         {
-            "version": wire_version,
+            "version": "1.0",
             "updateComponents": {
                 "surfaceId": "test_surface",
                 "components": all_comps,
@@ -114,7 +116,7 @@ def _wrap_surface(
     ]
 
 
-# --- 1. Schema Rejection of Malformed Pattern Files ---
+# --- 1. Schema Rejection & Grammar Version Mismatch ---
 
 
 def test_pattern_library_rejects_missing_root() -> None:
@@ -138,26 +140,49 @@ def test_pattern_library_rejects_non_mapping_json() -> None:
         PatternLibrary.from_json(["not", "a", "dict"])  # type: ignore[arg-type]
 
 
-# --- 2 & 3. Catalog Matching & Pattern Capabilities ---
+def test_pattern_library_single_catalog_id_and_grammar_version_mismatch() -> None:
+    raw = copy.deepcopy(load_asset("patterns/basic_v1_0.json"))
+    lib = PatternLibrary.from_json(raw)
+    assert lib.catalog_id == BasicCatalog("v1.0").catalog_id
+    assert lib.grammar_version == "1"
+
+    mismatched = copy.deepcopy(raw)
+    mismatched["grammarVersion"] = "2"
+    with pytest.raises(PatternError, match="grammarVersion '2'.*expected '1'"):
+        PatternLibrary.from_json(mismatched)
+
+    mismatched_lib = PatternLibrary(lib.catalog_id, lib.patterns, grammar_version="2")
+    catalog = BasicCatalog("v1.0")
+    graph = CatalogDecisionGraph([catalog])
+    with pytest.raises(PatternError, match="grammarVersion '2'.*expected '1'"):
+        PatternExpander(mismatched_lib, graph, grammar=ArchetypeGrammar.default())
 
 
-def test_for_catalogs_matches_v1_0_and_v0_9_basic_catalogs() -> None:
-    lib_v10 = MergedPatternLibrary.for_catalogs([BasicCatalog("v1.0")])
-    lib_v09 = MergedPatternLibrary.for_catalogs([BasicCatalog("v0.9")])
+# --- 2 & 3. v1.0-Only Catalog Matching & Pattern Capabilities ---
 
-    for lib in (lib_v10, lib_v09):
-        assert lib.has_pattern("page")
-        assert lib.has_pattern("headline")
-        assert lib.has_pattern("collection", "rows")
-        assert lib.has_pattern("collection", "cards")
-        assert lib.has_pattern("collection", "reel")
-        assert lib.has_pattern("collection:cards")
-        assert lib.has_pattern("collection:reel")
-        assert not lib.has_pattern("collection", "grid")
-        assert not lib.has_pattern("collection:grid")
-        assert not lib.has_pattern("chart")
-        assert not lib.has_pattern("timeline")
-        assert not lib.has_pattern("map")
+
+def test_for_catalogs_matches_v1_0_only_and_rejects_v0_9_expander() -> None:
+    cat_v10 = BasicCatalog("v1.0")
+    cat_v09 = BasicCatalog("v0.9")
+
+    lib_v10 = MergedPatternLibrary.for_catalogs([cat_v10])
+    assert lib_v10.has_pattern("page")
+    assert lib_v10.has_pattern("headline")
+    assert lib_v10.has_pattern("collection", "rows")
+    assert lib_v10.has_pattern("collection", "cards")
+    assert lib_v10.has_pattern("collection", "reel")
+    assert lib_v10.has_pattern("collection:cards")
+    assert lib_v10.has_pattern("collection:reel")
+    assert not lib_v10.has_pattern("collection", "grid")
+    assert not lib_v10.has_pattern("collection:grid")
+    assert not lib_v10.has_pattern("chart")
+    assert not lib_v10.has_pattern("timeline")
+    assert not lib_v10.has_pattern("map")
+
+    lib_v09 = MergedPatternLibrary.for_catalogs([cat_v09])
+    assert not lib_v09.has_pattern("page")
+    with pytest.raises(ValueError, match="v1.0 only"):
+        PatternExpander(lib_v10, CatalogDecisionGraph([cat_v09]))
 
 
 # --- 4. Multi-Catalog Merge & Primary Catalog Precedence ---
@@ -168,8 +193,8 @@ def test_multi_catalog_merge_and_primary_precedence() -> None:
     basic_lib = PatternLibrary.from_json(basic_raw)
 
     domain_raw = {
-        "version": "1",
-        "catalogIds": ["https://example.com/catalogs/domain/v1/catalog.json"],
+        "grammarVersion": "1",
+        "catalogId": "https://example.com/catalogs/domain/v1/catalog.json",
         "patterns": {
             "chart": {
                 "slots": ["series", "title"],
@@ -181,12 +206,12 @@ def test_multi_catalog_merge_and_primary_precedence() -> None:
                 }],
             },
             "headline": {
-                "slots": ["headline"],
+                "slots": ["items"],
                 "root": "domain_headline",
                 "components": [{
                     "id": "domain_headline",
                     "component": "Text",
-                    "text": {"$slot": "headline"},
+                    "text": {"$slot": "items", "$default": "Headline"},
                 }],
             },
         },
@@ -241,7 +266,6 @@ def test_eligibility_on_four_layout_fixtures_against_basic_v1() -> None:
     settings_ids = {a.id for a in eligible_archetypes(grammar, lib, settings_ptrs)}
     assert {"settings", "form"} <= settings_ids
 
-    # `grid` is not offered by basic_v1_0.json on collection
     assert not lib.has_pattern("collection", "grid")
     assert eligible_archetypes(grammar, lib, ()) == ()
 
@@ -258,118 +282,112 @@ def test_eligibility_two_component_domain_catalog_has_zero_archetypes() -> None:
         assert eligible_archetypes(grammar, lib, ptrs) == ()
 
 
-# --- 7. Expander on Every Basic v1 Pattern (v1.0 & v0.9 Validation) ---
+# --- 7. Expander on Every Basic v1 Pattern (Zero Coercion) ---
 
 
-@pytest.mark.parametrize("version", ["1.0", "0.9"])
-def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
-    catalog = BasicCatalog(f"v{version}")
+def test_expand_every_basic_v1_pattern_validates_without_coercion() -> None:
+    catalog = BasicCatalog("v1.0")
     lib = MergedPatternLibrary.for_catalogs([catalog])
     graph = CatalogDecisionGraph([catalog])
     expander = PatternExpander(lib, graph)
 
     # 1. banner
-    banner_comps = expander.expand_block(
+    banner_exp = expander.expand_block(
         "banner",
         "banner",
-        BlockBindings(slots={"message": SlotBinding(pointer="/notice")}),
+        BlockBindings(
+            slots={
+                "title": SlotBinding(pointer="/notice"),
+                "text": SlotBinding(literal="Scheduled maintenance"),
+            }
+        ),
         knobs={"tone": "warning"},
     )
-    validate_payload([catalog], _wrap_surface(banner_comps, version=version))
+    assert banner_exp.components[0]["id"] == "banner_root"
+    validate_payload([catalog], _wrap_surface(banner_exp.components))
 
-    # 2. picture (single & gallery)
-    pic_single = expander.expand_block(
-        "hero_media",
-        "picture",
-        BlockBindings(
-            slots={
-                "source": SlotBinding(pointer="/photos/0/url"),
-                "caption": SlotBinding(literal="Pool at dusk"),
-            }
-        ),
-        knobs={"count": "single"},
-    )
-    validate_payload([catalog], _wrap_surface(pic_single, version=version))
-
-    pic_gallery = expander.expand_block(
-        "hero_media",
-        "picture",
-        BlockBindings(
-            slots={
-                "source": SlotBinding(
-                    pointer="/photos",
-                    fields={"source": SlotBinding(pointer="/url")},
-                ),
-                "caption": SlotBinding(literal="Gallery"),
-            }
-        ),
-        knobs={"count": "gallery"},
-    )
-    validate_payload([catalog], _wrap_surface(pic_gallery, version=version))
-
-    # 3. media (video & audio)
-    media_video = expander.expand_block(
-        "player",
-        "media",
-        BlockBindings(
-            slots={
-                "source": SlotBinding(literal="https://example.com/clip.mp4"),
-                "poster": SlotBinding(literal="https://example.com/poster.jpg"),
-                "caption": SlotBinding(literal="Keynote"),
-            }
-        ),
-    )
-    validate_payload([catalog], _wrap_surface(media_video, version=version))
-
-    media_audio = expander.expand_block(
-        "player",
-        "media",
-        BlockBindings(
-            slots={
-                "source": SlotBinding(literal="https://example.com/ep1.mp3"),
-                "caption": SlotBinding(literal="Episode 1"),
-            }
-        ),
-    )
-    validate_payload([catalog], _wrap_surface(media_audio, version=version))
-
-    # 4. filters (tabs & chips)
-    for style in ("tabs", "chips"):
-        filters_comps = expander.expand_block(
-            "filter_bar",
-            "filters",
+    # 2. picture (header & feature variants)
+    for prominence in ("full", "supporting"):
+        pic_exp = expander.expand_block(
+            "picture",
+            "picture",
             BlockBindings(
                 slots={
-                    "query": SlotBinding(pointer="/query"),
-                    "categories": SlotBinding(
-                        literal=["All", "Active"],
-                        fields={"selected": SlotBinding(pointer="/selected")},
-                    ),
+                    "picture": SlotBinding(pointer="/photos/0/url"),
+                    "caption": SlotBinding(literal="Pool at dusk"),
                 }
             ),
-            knobs={"style": style},
+            knobs={"framing": "banner", "prominence": prominence},
         )
-        validate_payload([catalog], _wrap_surface(filters_comps, version=version))
+        assert pic_exp.components[0]["id"] == "picture_root"
+        validate_payload([catalog], _wrap_surface(pic_exp.components))
+
+    # 3. media (video & audio)
+    for src, title in (
+        ("https://example.com/clip.mp4", "Keynote"),
+        ("https://example.com/ep1.mp3", "Episode 1"),
+    ):
+        media_exp = expander.expand_block(
+            "media",
+            "media",
+            BlockBindings(
+                slots={
+                    "source": SlotBinding(literal=src),
+                    "poster": SlotBinding(literal="https://example.com/poster.jpg"),
+                    "title": SlotBinding(literal=title),
+                    "duration": SlotBinding(literal="12:34"),
+                }
+            ),
+        )
+        assert media_exp.components[0]["id"] == "media_root"
+        validate_payload([catalog], _wrap_surface(media_exp.components))
+
+    # 4. filters
+    filters_exp = expander.expand_block(
+        "filters",
+        "filters",
+        BlockBindings(
+            slots={
+                "query": SlotBinding(pointer="/query"),
+                "categories": SlotBinding(
+                    literal=[
+                        {"label": "All", "value": "All"},
+                        {"label": "Active", "value": "Active"},
+                    ],
+                    fields={"selected": SlotBinding(pointer="/selected")},
+                ),
+            }
+        ),
+    )
+    assert filters_exp.components[0]["id"] == "filters_root"
+    validate_payload([catalog], _wrap_surface(filters_exp.components))
 
     # 5. headline
-    headline_comps = expander.expand_block(
-        "header",
+    headline_exp = expander.expand_block(
+        "headline",
         "headline",
         BlockBindings(
             slots={
-                "headline": SlotBinding(pointer="/name"),
-                "subhead": SlotBinding(literal=" Boutique Resort"),
-                "eyebrow": SlotBinding(literal="Featured"),
-                "status": SlotBinding(literal="Open"),
-                "icon": SlotBinding(literal="star"),
+                "items": SlotBinding(
+                    items=(
+                        {
+                            "label": SlotBinding(literal="Rating"),
+                            "value": SlotBinding(pointer="/rating"),
+                            "delta": SlotBinding(literal="+0.2"),
+                            "max": SlotBinding(literal=5),
+                        },
+                    )
+                )
             }
         ),
+        knobs={"deltas": "yes", "gauge": "yes"},
     )
-    validate_payload([catalog], _wrap_surface(headline_comps, version=version))
+    assert headline_exp.components[0]["id"] == "headline_root"
+    validate_payload([catalog], _wrap_surface(headline_exp.components))
 
     # 6. facts
-    facts_comps = expander.expand_block(
-        "key_facts",
+    facts_exp = expander.expand_block(
+        "facts",
         "facts",
         BlockBindings(
             slots={
@@ -378,7 +396,6 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
                         {
                             "label": SlotBinding(literal="CPU"),
                             "value": SlotBinding(pointer="/cpu"),
-                            "note": SlotBinding(pointer="/cpuDelta"),
                         },
                         {
                             "label": SlotBinding(literal="Host"),
@@ -388,74 +405,98 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
                 )
             }
         ),
-        instances={"0": {"prominent": "true"}},
     )
-    validate_payload([catalog], _wrap_surface(facts_comps, version=version))
+    assert facts_exp.components[0]["id"] == "facts_root"
+    validate_payload([catalog], _wrap_surface(facts_exp.components))
 
     # 7. prose
-    prose_comps = expander.expand_block(
-        "body_copy",
+    prose_exp = expander.expand_block(
+        "prose",
         "prose",
         BlockBindings(
             slots={
-                "title": SlotBinding(literal="Overview"),
+                "heading": SlotBinding(literal="Overview"),
                 "body": SlotBinding(pointer="/about"),
             }
         ),
+        knobs={"length": "article"},
     )
-    validate_payload([catalog], _wrap_surface(prose_comps, version=version))
+    assert prose_exp.components[0]["id"] == "prose_root"
+    validate_payload([catalog], _wrap_surface(prose_exp.components))
 
     # 8. collection (rows, cards, reel)
     for layout_knob in ("rows", "cards", "reel"):
-        coll_comps = expander.expand_block(
-            "items_list",
+        coll_exp = expander.expand_block(
+            "collection",
             "collection",
             BlockBindings(
                 slots={
                     "items": SlotBinding(
                         pointer="/photos",
                         fields={
-                            "headline": SlotBinding(pointer="/caption"),
-                            "picture": SlotBinding(pointer="/url"),
+                            "headline": SlotBinding(pointer="caption"),
+                            "picture": SlotBinding(pointer="url"),
                             "supporting": SlotBinding(literal="View details"),
+                            "action": SlotBinding(
+                                literal="open_photo",
+                                fields={"$key": SlotBinding(literal="id")},
+                            ),
                         },
                     )
                 }
             ),
-            knobs={"layout": layout_knob, "trailing": "button"},
+            knobs={
+                "layout": layout_knob,
+                "trailing": "button",
+                "trailing.label": "View",
+            },
         )
-        validate_payload([catalog], _wrap_surface(coll_comps, version=version))
+        assert coll_exp.components[0]["id"] == "collection_root"
+        validate_payload([catalog], _wrap_surface(coll_exp.components))
 
     # 9. comparison
-    comp_comps = expander.expand_block(
-        "options_table",
+    comp_exp = expander.expand_block(
+        "comparison",
         "comparison",
         BlockBindings(
             slots={
                 "options": SlotBinding(
                     items=(
                         {
-                            "title": SlotBinding(literal="Basic"),
-                            "price": SlotBinding(literal="$10"),
-                            "action": SlotBinding(literal="Choose Basic"),
+                            "headline": SlotBinding(literal="Basic"),
+                            "highlight": SlotBinding(literal="$10/mo"),
+                            "attributes": SlotBinding(
+                                items=(
+                                    {
+                                        "label": SlotBinding(literal="Seats"),
+                                        "value": SlotBinding(literal="1"),
+                                    },
+                                )
+                            ),
                         },
                         {
-                            "title": SlotBinding(literal="Pro"),
-                            "price": SlotBinding(literal="$25"),
-                            "highlight": SlotBinding(literal="Popular"),
-                            "action": SlotBinding(literal="Choose Pro"),
+                            "headline": SlotBinding(literal="Pro"),
+                            "highlight": SlotBinding(literal="$25/mo"),
+                            "attributes": SlotBinding(
+                                items=(
+                                    {
+                                        "label": SlotBinding(literal="Seats"),
+                                        "value": SlotBinding(literal="10"),
+                                    },
+                                )
+                            ),
                         },
                     )
                 )
             }
         ),
-        instances={"1": {"recommended": "true"}},
     )
-    validate_payload([catalog], _wrap_surface(comp_comps, version=version))
+    assert comp_exp.components[0]["id"] == "comparison_root"
+    validate_payload([catalog], _wrap_surface(comp_exp.components))
 
     # 10. steps
-    steps_comps = expander.expand_block(
-        "progress_steps",
+    steps_exp = expander.expand_block(
+        "steps",
         "steps",
         BlockBindings(
             slots={
@@ -476,9 +517,14 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
         ),
         knobs={"numbered": "yes"},
     )
-    validate_payload([catalog], _wrap_surface(steps_comps, version=version))
+    assert steps_exp.components[0]["id"] == "steps_root"
+    validate_payload([catalog], _wrap_surface(steps_exp.components))
 
     # 11. form (all 9 fieldVariants)
+    choice_opts = [
+        {"label": "Alpha", "value": "A"},
+        {"label": "Beta", "value": "B"},
+    ]
     form_items = []
     for idx, control in enumerate((
         "shortText",
@@ -494,16 +540,19 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
         form_items.append({
             "label": SlotBinding(literal=f"Field {idx}"),
             "value": SlotBinding(pointer=f"/f{idx}"),
-            "options": SlotBinding(literal=["A", "B"]),
+            "options": SlotBinding(literal=choice_opts),
+            "min": SlotBinding(literal=0),
+            "max": SlotBinding(literal=100),
             "control": SlotBinding(literal=control),
         })
-    form_comps = expander.expand_block(
-        "input_fields",
+    form_exp = expander.expand_block(
+        "form",
         "form",
         BlockBindings(slots={"fields": SlotBinding(items=tuple(form_items))}),
     )
-    validate_payload([catalog], _wrap_surface(form_comps, version=version))
-    form_comp_types = {c["component"] for c in form_comps}
+    assert form_exp.components[0]["id"] == "form_root"
+    validate_payload([catalog], _wrap_surface(form_exp.components))
+    form_comp_types = {c["component"] for c in form_exp.components}
     assert {
         "TextField",
         "CheckBox",
@@ -533,8 +582,8 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
             "row_kind": SlotBinding(literal="danger"),
         },
     ]
-    groups_comps = expander.expand_block(
-        "setting_groups",
+    groups_exp = expander.expand_block(
+        "groups",
         "groups",
         BlockBindings(
             slots={
@@ -549,46 +598,55 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(groups_comps, version=version))
-    groups_comp_types = {c["component"] for c in groups_comps}
+    assert groups_exp.components[0]["id"] == "groups_root"
+    validate_payload([catalog], _wrap_surface(groups_exp.components))
+    groups_comp_types = {c["component"] for c in groups_exp.components}
     assert {"CheckBox", "Button", "Text"} <= groups_comp_types
 
     # 13. actions
-    actions_comps = expander.expand_block(
-        "action_bar",
+    actions_exp = expander.expand_block(
+        "actions",
         "actions",
         BlockBindings(
             slots={
                 "buttons": SlotBinding(
                     items=(
-                        {"label": SlotBinding(literal="Send")},
-                        {"label": SlotBinding(literal="Cancel")},
+                        {
+                            "action": SlotBinding(literal="send"),
+                            "label": SlotBinding(literal="Send"),
+                        },
+                        {
+                            "action": SlotBinding(literal="cancel"),
+                            "label": SlotBinding(literal="Cancel"),
+                        },
                     )
                 )
             }
         ),
         knobs={"order": "primaryLast"},
-        instances={"0": {"primary": "true"}},
+        instances={"send": {"primary": "true"}},
     )
-    validate_payload([catalog], _wrap_surface(actions_comps, version=version))
+    assert actions_exp.components[0]["id"] == "actions_root"
+    validate_payload([catalog], _wrap_surface(actions_exp.components))
 
     # 14. outcome
-    outcome_comps = expander.expand_block(
-        "outcome_banner",
+    outcome_exp = expander.expand_block(
+        "outcome",
         "outcome",
         BlockBindings(
             slots={
                 "headline": SlotBinding(literal="Transfer Complete"),
                 "detail": SlotBinding(literal="Ref #1024"),
-                "status": SlotBinding(literal="success"),
+                "tone": SlotBinding(literal="success"),
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(outcome_comps, version=version))
+    assert outcome_exp.components[0]["id"] == "outcome_root"
+    validate_payload([catalog], _wrap_surface(outcome_exp.components))
 
     # 15. conversation
-    conv_comps = expander.expand_block(
-        "messages",
+    conv_exp = expander.expand_block(
+        "conversation",
         "conversation",
         BlockBindings(
             slots={
@@ -596,28 +654,26 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
                     items=(
                         {
                             "author": SlotBinding(literal="Alex"),
-                            "body": SlotBinding(literal="Hello!"),
+                            "text": SlotBinding(literal="Hello!"),
                             "time": SlotBinding(literal="10:00"),
                         },
                         {
                             "author": SlotBinding(literal="me"),
-                            "body": SlotBinding(literal="Hi Alex!"),
+                            "text": SlotBinding(literal="Hi Alex!"),
                             "time": SlotBinding(literal="10:01"),
                         },
                     )
-                ),
-                "suggestions": SlotBinding(
-                    items=({"label": SlotBinding(literal="Thanks!")},)
-                ),
+                )
             }
         ),
         knobs={"self": "me"},
     )
-    validate_payload([catalog], _wrap_surface(conv_comps, version=version))
+    assert conv_exp.components[0]["id"] == "conversation_root"
+    validate_payload([catalog], _wrap_surface(conv_exp.components))
 
     # 16. compose
-    compose_comps = expander.expand_block(
-        "composer",
+    compose_exp = expander.expand_block(
+        "compose",
         "compose",
         BlockBindings(
             slots={
@@ -626,26 +682,232 @@ def test_expand_every_basic_v1_pattern_validates(version: str) -> None:
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(compose_comps, version=version))
+    assert compose_exp.components[0]["id"] == "compose_root"
+    validate_payload([catalog], _wrap_surface(compose_exp.components))
 
     # 17. page (default & dialog)
     for dialog in (False, True):
-        page_comps = expander.expand_page(
+        page_exp = expander.expand_page(
             PageBindings(
                 title=SlotBinding(literal="Casa Verde"),
                 subtitle=SlotBinding(literal="Hillside Resort"),
-                mark=SlotBinding(literal="home"),
+                mark=SlotBinding(literal="https://example.com/logo.png"),
                 dialog=dialog,
             ),
-            block_roots=[headline_comps[0]["id"]],
+            block_roots=[headline_exp.components[0]["id"]],
+            blocks=[headline_exp],
         )
+        assert page_exp.components[0]["id"] == "root"
         validate_payload(
             [catalog],
-            _wrap_surface(page_comps + headline_comps, version=version),
+            _wrap_surface((*page_exp.components, *headline_exp.components)),
         )
 
 
-# --- 8. Unbound Optional Slots Omit Child Component & Parent Reference ---
+# --- 8. Explicit Actions, Non-Latin Labels, `$actionContext`, & `send_data_model` ---
+
+
+def test_non_latin_action_labels_preserve_action_ids() -> None:
+    catalog = BasicCatalog("v1.0")
+    expander = PatternExpander(
+        MergedPatternLibrary.for_catalogs([catalog]),
+        CatalogDecisionGraph([catalog]),
+    )
+    planner = LayoutPlanner()
+    bindings = planner.bind_slots(
+        planner.grammar.block("actions"),
+        (),
+        set(),
+        actions=(
+            ActionSpec(id="confirm_payment", label="支払いを確定"),
+            ActionSpec(id="cancel_order", label="キャンセル"),
+        ),
+    )
+    expanded = expander.expand_block(
+        "actions",
+        "actions",
+        bindings,
+        instances={"confirm_payment": {"primary": "true"}},
+    )
+    validate_payload([catalog], _wrap_surface(expanded.components))
+    buttons = [c for c in expanded.components if c["component"] == "Button"]
+    assert {b["action"]["event"]["name"] for b in buttons} == {
+        "confirm_payment",
+        "cancel_order",
+    }
+    texts = {c["text"] for c in expanded.components if c["component"] == "Text"}
+    assert {"支払いを確定", "キャンセル"} <= texts
+
+
+def test_action_context_explicit_item_key_and_form_submit_mutable_bindings() -> None:
+    catalog = BasicCatalog("v1.0")
+    expander = PatternExpander(
+        MergedPatternLibrary.for_catalogs([catalog]),
+        CatalogDecisionGraph([catalog]),
+    )
+    planner = LayoutPlanner()
+
+    # 1. Explicit context pointers on ActionSpec
+    explicit_bindings = planner.bind_slots(
+        planner.grammar.block("actions"),
+        (),
+        set(),
+        actions=(
+            ActionSpec(
+                id="approve_transfer",
+                label="Approve",
+                context={"transferId": "/transfer/id", "amount": "/transfer/amount"},
+            ),
+        ),
+    )
+    explicit_exp = expander.expand_block("actions", "actions", explicit_bindings)
+    btn = next(c for c in explicit_exp.components if c["component"] == "Button")
+    assert btn["action"] == {
+        "event": {
+            "name": "approve_transfer",
+            "context": {
+                "transferId": {"@path": "/transfer/id"},
+                "amount": {"@path": "/transfer/amount"},
+            },
+        }
+    }
+
+    # 2. Scoped item action inside `$repeat`: uses `key` when given, else `id` when present
+    flights_payload = {
+        "flights": [
+            {"id": "fl-1", "sku": "SKU-9", "title": "SFO -> NRT"},
+        ]
+    }
+    flights_ptrs = inspect_payload_pointers(flights_payload)
+    for act, expected_key in (
+        (
+            ActionSpec(id="book_flight", label="Book", scope="/flights", key="sku"),
+            "sku",
+        ),
+        (
+            ActionSpec(id="select_flight", label="Select", scope="/flights"),
+            "id",
+        ),
+    ):
+        col_bindings = planner.bind_slots(
+            planner.grammar.block("collection"),
+            flights_ptrs,
+            set(),
+            payload=flights_payload,
+            actions=(act,),
+        )
+        col_exp = expander.expand_block(
+            "collection",
+            "collection",
+            col_bindings,
+            knobs={"layout": "rows", "trailing": "button", "trailing.label": act.label},
+        )
+        validate_payload([catalog], _wrap_surface(col_exp.components))
+        item_btn = next(c for c in col_exp.components if c["component"] == "Button")
+        assert item_btn["action"] == {
+            "event": {
+                "name": act.id,
+                "context": {expected_key: {"@path": expected_key}},
+            }
+        }
+        assert col_exp.send_data_model is False
+
+    # 3. Form submit resolves `$actionContext` to all mutable form pointers
+    submit_bindings = BlockBindings(
+        slots={
+            "buttons": SlotBinding(
+                items=(
+                    {
+                        "action": SlotBinding(literal="save_profile"),
+                        "label": SlotBinding(literal="Save"),
+                    },
+                )
+            ),
+            "$mutable": SlotBinding(
+                fields={
+                    "/profile/email": SlotBinding(pointer="/profile/email"),
+                    "/profile/name": SlotBinding(pointer="/profile/name"),
+                }
+            ),
+            "$plan_mutable": SlotBinding(literal=True),
+        }
+    )
+    submit_exp = expander.expand_block("actions", "actions", submit_bindings)
+    submit_btn = next(c for c in submit_exp.components if c["component"] == "Button")
+    assert submit_btn["action"] == {
+        "event": {
+            "name": "save_profile",
+            "context": {
+                "email": {"@path": "/profile/email"},
+                "name": {"@path": "/profile/name"},
+            },
+        }
+    }
+    assert submit_exp.send_data_model is False
+
+
+def test_send_data_model_true_only_for_mutable_surface_with_empty_non_item_action() -> (
+    None
+):
+    catalog = BasicCatalog("v1.0")
+    expander = PatternExpander(
+        MergedPatternLibrary.for_catalogs([catalog]),
+        CatalogDecisionGraph([catalog]),
+    )
+
+    # Read-only surface + empty-context button -> send_data_model is False
+    readonly_act = expander.expand_block(
+        "actions",
+        "actions",
+        BlockBindings(
+            slots={
+                "buttons": SlotBinding(
+                    items=(
+                        {
+                            "action": SlotBinding(literal="refresh"),
+                            "label": SlotBinding(literal="Refresh"),
+                        },
+                    )
+                )
+            }
+        ),
+    )
+    assert readonly_act.send_data_model is False
+
+    # Mutable surface (`groups`) + empty-context surface button -> send_data_model is True
+    groups_exp = expander.expand_block(
+        "groups",
+        "groups",
+        BlockBindings(
+            slots={
+                "groups": SlotBinding(
+                    items=(
+                        {
+                            "heading": SlotBinding(literal="Prefs"),
+                            "rows": SlotBinding(
+                                items=(
+                                    {
+                                        "label": SlotBinding(literal="Auto"),
+                                        "value": SlotBinding(pointer="/prefs/auto"),
+                                        "row_kind": SlotBinding(literal="switch"),
+                                    },
+                                )
+                            ),
+                        },
+                    )
+                )
+            }
+        ),
+    )
+    page_exp = expander.expand_page(
+        PageBindings(title=SlotBinding(literal="Settings")),
+        block_roots=["groups_root", "actions_root"],
+        blocks=[groups_exp, readonly_act],
+    )
+    assert page_exp.send_data_model is True
+
+
+# --- 9. Unbound Optional Slots & Stable IDs ---
 
 
 def test_unbound_optional_slots_omitted_from_components_and_children() -> None:
@@ -654,21 +916,19 @@ def test_unbound_optional_slots_omitted_from_components_and_children() -> None:
     graph = CatalogDecisionGraph([catalog])
     expander = PatternExpander(lib, graph)
 
-    # Expand `outcome` with ONLY `headline` bound (`detail` unbound)
-    comps = expander.expand_block(
-        "outcome_block",
+    exp = expander.expand_block(
+        "outcome",
         "outcome",
         BlockBindings(slots={"headline": SlotBinding(literal="Done")}),
     )
-    by_id = {c["id"]: c for c in comps}
-    assert "outcome_block_outcome_headline" in by_id
-    assert "outcome_block_outcome_detail" not in by_id
-    root_children = by_id["outcome_block_outcome_col"]["children"]
-    assert "outcome_block_outcome_detail" not in root_children
+    by_id = {c["id"]: c for c in exp.components}
+    assert "outcome_root" in by_id
+    assert "outcome_headline" in by_id
+    assert "outcome_detail" not in by_id
+    assert "outcome_detail" not in by_id["outcome_root"]["children"]
 
-    # Expand `collection` (`cards`) with `meta`, `rating`, `trailing` unbound -> `item_footer` pruned
-    coll_comps = expander.expand_block(
-        "cards_block",
+    coll_exp = expander.expand_block(
+        "collection",
         "collection",
         BlockBindings(
             slots={
@@ -684,49 +944,57 @@ def test_unbound_optional_slots_omitted_from_components_and_children() -> None:
         ),
         knobs={"layout": "cards", "trailing": "none"},
     )
-    coll_by_id = {c["id"]: c for c in coll_comps}
-    assert "cards_block_0_item_supporting" not in coll_by_id
-    assert "cards_block_0_item_footer" not in coll_by_id
+    coll_by_id = {c["id"]: c for c in coll_exp.components}
+    assert "collection_root" in coll_by_id
+    assert "collection_0_item_supporting" not in coll_by_id
+    assert "collection_0_item_footer" not in coll_by_id
     assert (
-        "cards_block_0_item_footer"
-        not in coll_by_id["cards_block_0_item_col"]["children"]
+        "collection_0_item_footer"
+        not in coll_by_id["collection_0_item_col"]["children"]
     )
 
 
-# --- 9. Actions Button Ordering (`primaryLast` vs `primaryFirst`) ---
+# --- 10. Actions Button Ordering (`primaryLast` vs `primaryFirst`) ---
 
 
 def test_actions_button_ordering_primary_last_and_primary_first() -> None:
     catalog = BasicCatalog("v1.0")
     lib = MergedPatternLibrary.for_catalogs([catalog])
     graph = CatalogDecisionGraph([catalog])
-    expander = PatternExpander(lib, graph, protocol_version="1.0")
+    expander = PatternExpander(lib, graph)
 
     bindings = BlockBindings(
         slots={
             "buttons": SlotBinding(
                 items=(
-                    {"label": SlotBinding(literal="Send")},
-                    {"label": SlotBinding(literal="Cancel")},
+                    {
+                        "action": SlotBinding(literal="send"),
+                        "label": SlotBinding(literal="Send"),
+                    },
+                    {
+                        "action": SlotBinding(literal="cancel"),
+                        "label": SlotBinding(literal="Cancel"),
+                    },
                 )
             )
         }
     )
 
     for instances_arg in (
+        {"send": {"primary": "true"}},
         {"Send": {"primary": "true"}},
         {"0": {"primary": "true"}},
     ):
-        last_comps = expander.expand_block(
-            "action_bar",
+        last_exp = expander.expand_block(
+            "actions",
             "actions",
             bindings,
             {"order": "primaryLast"},
             instances_arg,
-            "action_bar",
+            "actions",
         )
-        last_by_id = {c["id"]: c for c in last_comps}
-        last_btn_ids = last_by_id["action_bar_actions_row"]["children"]
+        last_by_id = {c["id"]: c for c in last_exp.components}
+        last_btn_ids = last_by_id["actions_root"]["children"]
         first_btn = last_by_id[last_btn_ids[0]]
         second_btn = last_by_id[last_btn_ids[1]]
         assert first_btn.get("variant") == "default"
@@ -734,60 +1002,19 @@ def test_actions_button_ordering_primary_last_and_primary_first() -> None:
         assert second_btn.get("variant") == "primary"
         assert last_by_id[second_btn["child"]]["text"] == "Send"
 
-    first_comps = expander.expand_block(
-        "action_bar",
+    first_exp = expander.expand_block(
+        "actions",
         "actions",
         bindings,
         knobs={"order": "primaryFirst"},
-        instances={"0": {"primary": "true"}},
+        instances={"send": {"primary": "true"}},
     )
-    first_by_id = {c["id"]: c for c in first_comps}
-    first_btn_ids = first_by_id["action_bar_actions_row"]["children"]
+    first_by_id = {c["id"]: c for c in first_exp.components}
+    first_btn_ids = first_by_id["actions_root"]["children"]
     assert first_by_id[first_btn_ids[0]].get("variant") == "primary"
     assert first_by_id[first_by_id[first_btn_ids[0]]["child"]]["text"] == "Send"
     assert first_by_id[first_btn_ids[1]].get("variant") == "default"
     assert first_by_id[first_by_id[first_btn_ids[1]]["child"]]["text"] == "Cancel"
-
-
-# --- 10. v0.9 Catalog `$repeat` Template ChildList & Binding Syntax ---
-
-
-def test_v09_repeat_template_child_list_and_bindings() -> None:
-    catalog = BasicCatalog("v0.9")
-    lib = MergedPatternLibrary.for_catalogs([catalog])
-    graph = CatalogDecisionGraph([catalog])
-    expander = PatternExpander(lib, graph)
-
-    comps = expander.expand_block(
-        "items_list",
-        "collection",
-        BlockBindings(
-            slots={
-                "items": SlotBinding(
-                    pointer="/photos",
-                    fields={
-                        "headline": SlotBinding(pointer="/caption"),
-                        "picture": SlotBinding(pointer="/url"),
-                    },
-                )
-            }
-        ),
-        knobs={"layout": "cards"},
-    )
-    by_id = {c["id"]: c for c in comps}
-    list_comp = by_id["items_list_list"]
-    assert list_comp["children"] == {
-        "path": "/photos",
-        "componentId": "items_list_item",
-    }
-    img_comp = by_id["items_list_item_img"]
-    assert img_comp["url"] == {"path": "url"}
-    title_comp = by_id["items_list_item_headline"]
-    assert title_comp["text"] == {
-        "call": "formatString",
-        "args": {"value": "**${caption}**"},
-    }
-    validate_payload([catalog], _wrap_surface(comps, version="0.9"))
 
 
 # --- 11. Markdown Heading Escaping, `formatString`, & Fallback Walking ---
@@ -799,26 +1026,24 @@ def test_markdown_heading_escapes_hash_and_newlines_and_emits_format_string() ->
     graph = CatalogDecisionGraph([catalog])
     expander = PatternExpander(lib, graph)
 
-    # Literal with `#` and newline inside a `## {headline}` template (`outcome`)
-    lit_comps = expander.expand_block(
-        "header",
+    lit_exp = expander.expand_block(
+        "outcome",
         "outcome",
         BlockBindings(slots={"headline": SlotBinding(literal="Room #4\nSuite")}),
     )
-    lit_by_id = {c["id"]: c for c in lit_comps}
-    title_text = lit_by_id["header_outcome_headline"]["text"]
+    lit_by_id = {c["id"]: c for c in lit_exp.components}
+    title_text = lit_by_id["outcome_headline"]["text"]
     assert isinstance(title_text, str)
     assert "\n" not in title_text
     assert r"\#4" in title_text
 
-    # Bound pointer inside `## {headline}` emits `formatString` function call
-    ptr_comps = expander.expand_block(
-        "header",
+    ptr_exp = expander.expand_block(
+        "outcome",
         "outcome",
         BlockBindings(slots={"headline": SlotBinding(pointer="/name")}),
     )
-    ptr_by_id = {c["id"]: c for c in ptr_comps}
-    assert ptr_by_id["header_outcome_headline"]["text"] == {
+    ptr_by_id = {c["id"]: c for c in ptr_exp.components}
+    assert ptr_by_id["outcome_headline"]["text"] == {
         "@call": "formatString",
         "args": {"value": "## ${/name}"},
     }
@@ -835,7 +1060,7 @@ def test_fallback_chain_walking_for_timeline_and_map() -> None:
     assert timeline_block is not None
     assert resolve_fallback_pattern(timeline_block, lib) == ResolvedPattern("steps")
 
-    timeline_comps = expander.expand_block(
+    timeline_exp = expander.expand_block(
         "timeline",
         "timeline",
         BlockBindings(
@@ -851,13 +1076,13 @@ def test_fallback_chain_walking_for_timeline_and_map() -> None:
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(timeline_comps))
+    validate_payload([catalog], _wrap_surface(timeline_exp.components))
 
     map_block = grammar.block("map")
     assert map_block is not None
     assert resolve_fallback_pattern(map_block, lib) == ResolvedPattern("facts")
 
-    map_comps = expander.expand_block(
+    map_exp = expander.expand_block(
         "map",
         "map",
         BlockBindings(
@@ -867,13 +1092,13 @@ def test_fallback_chain_walking_for_timeline_and_map() -> None:
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(map_comps))
+    validate_payload([catalog], _wrap_surface(map_exp.components))
 
     chart_block = grammar.block("chart")
     assert chart_block is not None
     assert resolve_fallback_pattern(chart_block, lib) == ResolvedPattern("headline")
 
-    chart_comps = expander.expand_block(
+    chart_exp = expander.expand_block(
         "chart",
         "chart",
         BlockBindings(
@@ -889,9 +1114,8 @@ def test_fallback_chain_walking_for_timeline_and_map() -> None:
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(chart_comps))
+    validate_payload([catalog], _wrap_surface(chart_exp.components))
 
-    # Fallback when `comparison` is absent -> `collection:cards`
     raw_without_cmp = copy.deepcopy(load_asset("patterns/basic_v1_0.json"))
     del raw_without_cmp["patterns"]["comparison"]
     lib_without_cmp = PatternLibrary.from_json(raw_without_cmp)
@@ -901,7 +1125,7 @@ def test_fallback_chain_walking_for_timeline_and_map() -> None:
         "collection", {"layout": "cards"}
     )
     exp_without_cmp = PatternExpander(lib_without_cmp, graph)
-    fb_cmp_comps = exp_without_cmp.expand_block(
+    fb_cmp_exp = exp_without_cmp.expand_block(
         "comparison",
         "comparison",
         BlockBindings(
@@ -917,37 +1141,34 @@ def test_fallback_chain_walking_for_timeline_and_map() -> None:
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(fb_cmp_comps))
+    validate_payload([catalog], _wrap_surface(fb_cmp_exp.components))
 
     with pytest.raises(PatternError, match="not available"):
         expander.expand_block("unknown_block", "nonexistent_pattern", BlockBindings())
 
 
 def test_by_type_honors_slot_binding_semantic_type_and_fallback_remaps() -> None:
-    """Tests `SlotBinding.semantic_type` dispatch (H2), root pruning (M4), and fallback slot adaptation (M5)."""
     catalog = BasicCatalog("v1.0")
     lib = MergedPatternLibrary.for_catalogs([catalog])
     graph = CatalogDecisionGraph([catalog])
     expander = PatternExpander(lib, graph)
 
-    # H2: /stream/resource has no audio/video substring in the path, but carries semantic_type="audio_url"
-    media_comps = expander.expand_block(
-        "player",
+    media_exp = expander.expand_block(
+        "media",
         "media",
         BlockBindings(
             slots={
                 "source": SlotBinding(
                     pointer="/stream/resource",
-                    semantic_type="audio_url",
+                    semantic_type=SemanticType.AUDIO_URL,
                 ),
-                "caption": SlotBinding(literal="Episode 42"),
+                "title": SlotBinding(literal="Episode 42"),
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(media_comps))
-    assert any(c["component"] == "AudioPlayer" for c in media_comps)
+    validate_payload([catalog], _wrap_surface(media_exp.components))
+    assert any(c["component"] == "AudioPlayer" for c in media_exp.components)
 
-    # M5: headline -> facts fallback remaps `items` -> `rows`, and timeline -> collection remaps `title` -> `headline`
     raw_no_hl_tl = copy.deepcopy(load_asset("patterns/basic_v1_0.json"))
     del raw_no_hl_tl["patterns"]["headline"]
     del raw_no_hl_tl["patterns"]["steps"]
@@ -969,10 +1190,9 @@ def test_by_type_honors_slot_binding_semantic_type_and_fallback_remaps() -> None
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(hl_as_facts))
-    assert any(c.get("text") == "82%" for c in hl_as_facts)
+    validate_payload([catalog], _wrap_surface(hl_as_facts.components))
+    assert any(c.get("text") == "82%" for c in hl_as_facts.components)
 
-    # M5: timeline -> collection fallback remaps `title` -> `headline`
     tl_as_col = exp_fallback.expand_block(
         "timeline",
         "timeline",
@@ -989,10 +1209,9 @@ def test_by_type_honors_slot_binding_semantic_type_and_fallback_remaps() -> None
             }
         ),
     )
-    validate_payload([catalog], _wrap_surface(tl_as_col))
-    assert any("Shipped" in str(c.get("text", "")) for c in tl_as_col)
+    validate_payload([catalog], _wrap_surface(tl_as_col.components))
+    assert any("Shipped" in str(c.get("text", "")) for c in tl_as_col.components)
 
-    # M4: empty container child of pattern root is pruned from root["children"]
     raw_pat = copy.deepcopy(load_asset("patterns/basic_v1_0.json"))
     raw_pat["patterns"]["media"]["components"][0]["children"].append(
         {"id": "empty_sub"}
@@ -1005,16 +1224,15 @@ def test_by_type_honors_slot_binding_semantic_type_and_fallback_remaps() -> None
     raw_pat["patterns"]["media"]["components"].append(
         {"id": "opt_txt", "component": "Text", "text": "Never"}
     )
-    custom_lib = PatternLibrary.from_json(raw_pat)
-    custom_exp = PatternExpander(custom_lib, graph)
-    pruned_comps = custom_exp.expand_block(
+    custom_exp = PatternExpander(PatternLibrary.from_json(raw_pat), graph)
+    pruned_exp = custom_exp.expand_block(
         "media",
         "media",
         BlockBindings(slots={"source": SlotBinding(literal="https://a/b.mp4")}),
     )
-    validate_payload([catalog], _wrap_surface(pruned_comps))
-    defined_ids = {c["id"] for c in pruned_comps}
-    for comp in pruned_comps:
+    validate_payload([catalog], _wrap_surface(pruned_exp.components))
+    defined_ids = {c["id"] for c in pruned_exp.components}
+    for comp in pruned_exp.components:
         if isinstance(comp.get("children"), list):
             assert all(cid in defined_ids for cid in comp["children"])
 
@@ -1022,23 +1240,19 @@ def test_by_type_honors_slot_binding_semantic_type_and_fallback_remaps() -> None
 def test_pattern_ref_parses_one_separator_and_libraries_reject_dotted_variants() -> (
     None
 ):
-    from a2ui.inference_formats.decision.patterns import PatternRef
-
     assert PatternRef.parse("collection") == PatternRef("collection")
     assert PatternRef.parse("collection:grid") == PatternRef("collection", "grid")
     assert str(PatternRef("collection", "cards")) == "collection:cards"
     lib = MergedPatternLibrary.for_catalogs([BasicCatalog("v1.0")])
     assert lib.has_pattern("collection:cards")
     assert lib.has_pattern("collection", "cards")
-    # The dotted spelling is no longer a variant query; it names an unknown pattern.
     assert not lib.has_pattern("collection.cards")
     assert not hasattr(lib, "has")
 
 
 def test_eligible_archetypes_is_pure_and_synthesizer_cache_is_per_instance() -> None:
     import a2ui.inference_formats.decision.patterns as patterns_module
-    from a2ui.inference_formats.decision import DecisionSynthesizer, DeterministicMockBackend
-    from a2ui.inference_formats.decision.patterns import shape_signature
+    from a2ui.inference_formats.decision import DecisionSynthesizer
 
     assert not hasattr(patterns_module, "_ELIGIBILITY_CACHE")
     grammar = ArchetypeGrammar.default()
@@ -1051,8 +1265,8 @@ def test_eligible_archetypes_is_pure_and_synthesizer_cache_is_per_instance() -> 
         inspect_payload_pointers(RESORT.payload)
     )
 
-    synth_a = DecisionSynthesizer([catalog], DeterministicMockBackend())
-    synth_b = DecisionSynthesizer([catalog], DeterministicMockBackend())
+    synth_a = DecisionSynthesizer([catalog], mock_backend())
+    synth_b = DecisionSynthesizer([catalog], mock_backend())
     assert synth_a._eligible_archetypes(ptrs) == first
     assert synth_a._eligibility_cache is not synth_b._eligibility_cache
     assert len(synth_b._eligibility_cache) == 0
@@ -1062,8 +1276,8 @@ def test_is_self_author_resolves_item_qualified_instance_keys() -> None:
     catalog = BasicCatalog("v1.0")
     graph = CatalogDecisionGraph([catalog])
     expander = PatternExpander(MergedPatternLibrary.for_catalogs([catalog]), graph)
-    comps = expander.expand_block(
-        "messages",
+    exp = expander.expand_block(
+        "conversation",
         "conversation",
         BlockBindings(
             slots={
@@ -1079,5 +1293,8 @@ def test_is_self_author_resolves_item_qualified_instance_keys() -> None:
         ),
         instances={"0": {"self": "Alex"}},
     )
-    validate_payload([catalog], _wrap_surface(comps))
-    assert any(c["id"] == "messages_msg_0" and c.get("justify") == "end" for c in comps)
+    validate_payload([catalog], _wrap_surface(exp.components))
+    assert any(
+        c["id"] == "conversation_msg_0" and c.get("justify") == "end"
+        for c in exp.components
+    )
