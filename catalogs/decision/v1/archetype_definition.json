@@ -69,7 +69,8 @@
         "template",
         "templateMutable",
         "actionGateFloor",
-        "actionGateCap"
+        "actionGateCap",
+        "noFit"
       ],
       "additionalProperties": false,
       "properties": {
@@ -87,7 +88,11 @@
           "description": "Template threshold when the payload or the template is editable."
         },
         "actionGateFloor": {"$ref": "#/$defs/unitInterval"},
-        "actionGateCap": {"$ref": "#/$defs/unitInterval"}
+        "actionGateCap": {"$ref": "#/$defs/unitInterval"},
+        "noFit": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum probability of the job.family option `none` at which the planner gives up on archetypes and returns a no_fit outcome, so the caller falls back to free-form synthesis."
+        }
       }
     },
     "job": {
@@ -95,7 +100,10 @@
       "required": ["family", "stakes", "urgency"],
       "additionalProperties": false,
       "properties": {
-        "family": {"$ref": "#/$defs/choiceQuestion"},
+        "family": {
+          "$ref": "#/$defs/choiceQuestion",
+          "description": "Which kind of job the surface serves. Every option except `none` names the family of one or more archetypes. The option `none` has no archetypes: it lets the model say that no layout fits, and wins once its probability reaches thresholds.noFit."
+        },
         "stakes": {"$ref": "#/$defs/scoreQuestion"},
         "urgency": {"$ref": "#/$defs/scoreQuestion"}
       }
