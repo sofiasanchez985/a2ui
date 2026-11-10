@@ -102,6 +102,7 @@ class InspectReport:
 
     catalog_id: str
     protocol_version: str
+    grammar_version: str
     target_dir: str
     recommended_files: tuple[str, ...]
     mode: Literal["composable", "fixed_surface", "hybrid"]
@@ -109,6 +110,7 @@ class InspectReport:
     components: tuple[ComponentSummary, ...]
     blocks: tuple[BlockCandidates, ...]
     template_candidates: tuple[TemplateCandidate, ...]
+    patterns_scaffold: Mapping[str, Any]
     notes: tuple[str, ...]
 
 
@@ -416,9 +418,18 @@ def inspect_catalog(loaded: LoadedCatalog) -> InspectReport:
     rec_files.append(str(loaded.target_dir / "sample_payloads.json"))
 
     notes = _collect_notes(mode, page_candidates, summaries, blocks, templates)
+    patterns_scaffold: dict[str, Any] = {
+        "$schema": (
+            "https://a2ui.org/specification/v1_0/decision/pattern_definition.json"
+        ),
+        "catalogId": loaded.catalog.catalog_id,
+        "grammarVersion": loaded.grammar.version,
+        "patterns": {},
+    }
     return InspectReport(
         catalog_id=loaded.catalog.catalog_id,
         protocol_version=loaded.graph.protocol_version,
+        grammar_version=loaded.grammar.version,
         target_dir=str(loaded.target_dir),
         recommended_files=tuple(rec_files),
         mode=mode,
@@ -426,6 +437,7 @@ def inspect_catalog(loaded: LoadedCatalog) -> InspectReport:
         components=summaries,
         blocks=blocks,
         template_candidates=templates,
+        patterns_scaffold=patterns_scaffold,
         notes=notes,
     )
 
@@ -435,10 +447,12 @@ def report_to_dict(report: InspectReport) -> dict[str, Any]:
     return {
         "catalogId": report.catalog_id,
         "protocolVersion": report.protocol_version,
+        "grammarVersion": report.grammar_version,
         "targetDir": report.target_dir,
         "recommendedFiles": list(report.recommended_files),
         "mode": report.mode,
         "pageCandidates": list(report.page_candidates),
+        "patternsScaffold": dict(report.patterns_scaffold),
         "components": [
             {
                 "name": c.name,
@@ -521,6 +535,7 @@ def report_to_markdown(report: InspectReport) -> str:
         f"# Catalog Inspection: `{report.catalog_id}`",
         "",
         f"- **Protocol Version**: `{report.protocol_version}`",
+        f"- **Grammar Version**: `{report.grammar_version}`",
         f"- **Synthesis Mode**: `{report.mode}`",
         f"- **Target Output Directory**: `{report.target_dir}`",
         (
@@ -531,6 +546,17 @@ def report_to_markdown(report: InspectReport) -> str:
             "- **Page Container Candidates**:"
             f" {', '.join(f'`{p}`' for p in report.page_candidates) or 'none'}"
         ),
+        "",
+        "## Patterns Scaffold (`patterns.json`)",
+        "",
+        "```json",
+        "{",
+        f'  "$schema": "{report.patterns_scaffold["$schema"]}",',
+        f'  "catalogId": "{report.catalog_id}",',
+        f'  "grammarVersion": "{report.grammar_version}",',
+        '  "patterns": {}',
+        "}",
+        "```",
         "",
         "## Components",
         "",

@@ -206,74 +206,80 @@ def print_results_summary(log_data: dict[str, Any]) -> None:
     print("==================================")
 
 
-def strategy_summary(log_data: dict[str, Any]) -> dict[str, Any]:
-    """Computes aggregate performance metrics for a strategy run.
+def _numeric_metadata_values(samples: list[dict[str, Any]], key: str) -> list[float]:
+    """Collects non-null numeric metadata values for `key` across `samples`."""
+    values: list[float] = []
+    for sample in samples:
+        raw = (sample.get("metadata") or {}).get(key)
+        if raw is not None:
+            values.append(float(raw))
+    return values
 
-    Returns a mapping of summary metrics:
-      - total_samples: int
-      - algorithmic_pass_rate: float (0.0 to 1.0)
-      - judge_pass_rate: float (0.0 to 1.0)
-      - combined_pass_rate: float (0.0 to 1.0)
-      - median_input_tokens: float | None
-      - median_output_tokens: float | None
-      - median_duration_seconds: float | None
-      - median_decision_latency_ms: float | None
-      - fallback_rate: float
-      - reask_rate: float
-      - decision_backend: str | None
-      - cached: bool
-    """
+
+def _first_string_metadata(samples: list[dict[str, Any]], key: str) -> str | None:
+    """Returns the first non-empty string value for metadata `key`, if any."""
+    for sample in samples:
+        raw = (sample.get("metadata") or {}).get(key)
+        if raw:
+            return str(raw)
+    return None
+
+
+def _median_unless_cached(values: list[float], cached: bool) -> float | None:
+    """Returns `statistics.median(values)` when non-empty and not `cached`."""
+    if not values or cached:
+        return None
+    return statistics.median(values)
+
+
+def _empty_strategy_summary() -> dict[str, Any]:
+    """Returns the zeroed `strategy_summary` dictionary for an empty log."""
+    return {
+        "total_samples": 0,
+        "algorithmic_pass_rate": 0.0,
+        "judge_pass_rate": 0.0,
+        "combined_pass_rate": 0.0,
+        "median_input_tokens": None,
+        "median_output_tokens": None,
+        "median_duration_seconds": None,
+        "median_decision_latency_ms": None,
+        "round_trips_per_surface": None,
+        "fallback_rate": 0.0,
+        "decision_backend": None,
+        "decision_backend_kind": None,
+        "decision_model_id": None,
+        "cached": False,
+    }
+
+
+def _count_fallbacks(samples: list[dict[str, Any]]) -> int:
+    """Counts samples whose metadata records a `decision_fallback_source`."""
+    count = 0
+    for sample in samples:
+        if (sample.get("metadata") or {}).get("decision_fallback_source"):
+            count += 1
+    return count
+
+
+def strategy_summary(log_data: dict[str, Any]) -> dict[str, Any]:
+    """Computes aggregate performance metrics for a strategy run."""
     samples = log_data.get("samples") or []
     total = len(samples)
     if not total:
-        return {
-            "total_samples": 0,
-            "algorithmic_pass_rate": 0.0,
-            "judge_pass_rate": 0.0,
-            "combined_pass_rate": 0.0,
-            "median_input_tokens": None,
-            "median_output_tokens": None,
-            "median_duration_seconds": None,
-            "median_decision_latency_ms": None,
-            "fallback_rate": 0.0,
-            "reask_rate": 0.0,
-            "decision_backend": None,
-            "cached": False,
-        }
+        return _empty_strategy_summary()
 
     a2ui_pass_cnt = sum(1 for s in samples if a2ui_scorer_passed(s))
     judge_pass_cnt = sum(1 for s in samples if judge_grade(s) == "C")
     both_pass_cnt = sum(1 for s in samples if sample_passed(s))
 
-    inputs: list[float] = []
-    outputs: list[float] = []
-    durations: list[float] = []
-    decision_lats: list[float] = []
-    fallbacks = 0
-    reasks = 0
-    backend: str | None = None
-
-    for s in samples:
-        meta = s.get("metadata", {}) or {}
-        if backend is None and meta.get("decision_backend"):
-            backend = meta.get("decision_backend")
-        in_tok = meta.get("inference_input_tokens")
-        if in_tok is not None:
-            inputs.append(float(in_tok))
-        out_tok = meta.get("inference_output_tokens")
-        if out_tok is not None:
-            outputs.append(float(out_tok))
-        dur = meta.get("inference_duration_seconds")
-        if dur is not None:
-            durations.append(float(dur))
-        dec_lat = meta.get("decision_latency_ms")
-        if dec_lat is not None:
-            decision_lats.append(float(dec_lat))
-        if meta.get("decision_fallback_source"):
-            fallbacks += 1
-        if meta.get("decision_reasked"):
-            reasks += 1
-
+    inputs = _numeric_metadata_values(samples, "inference_input_tokens")
+    outputs = _numeric_metadata_values(samples, "inference_output_tokens")
+    durations = _numeric_metadata_values(samples, "inference_duration_seconds")
+    decision_lats = _numeric_metadata_values(samples, "decision_latency_ms")
+    decision_calls = _numeric_metadata_values(samples, "decision_calls")
+    backend = _first_string_metadata(samples, "decision_backend")
+    backend_kind = _first_string_metadata(samples, "decision_backend_kind") or backend
+    model_id = _first_string_metadata(samples, "decision_model_id")
     cached = bool(inputs and all(tok == 0.0 for tok in inputs))
 
     return {
@@ -281,21 +287,19 @@ def strategy_summary(log_data: dict[str, Any]) -> dict[str, Any]:
         "algorithmic_pass_rate": a2ui_pass_cnt / total,
         "judge_pass_rate": judge_pass_cnt / total,
         "combined_pass_rate": both_pass_cnt / total,
-        "median_input_tokens": (
-            statistics.median(inputs) if inputs and not cached else None
-        ),
-        "median_output_tokens": (
-            statistics.median(outputs) if outputs and not cached else None
-        ),
-        "median_duration_seconds": (
-            statistics.median(durations) if durations and not cached else None
-        ),
+        "median_input_tokens": _median_unless_cached(inputs, cached),
+        "median_output_tokens": _median_unless_cached(outputs, cached),
+        "median_duration_seconds": _median_unless_cached(durations, cached),
         "median_decision_latency_ms": (
             statistics.median(decision_lats) if decision_lats else None
         ),
-        "fallback_rate": fallbacks / total,
-        "reask_rate": reasks / total,
+        "round_trips_per_surface": (
+            statistics.mean(decision_calls) if decision_calls else None
+        ),
+        "fallback_rate": _count_fallbacks(samples) / total,
         "decision_backend": backend,
+        "decision_backend_kind": backend_kind,
+        "decision_model_id": model_id,
         "cached": cached,
     }
 

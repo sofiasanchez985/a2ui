@@ -72,6 +72,8 @@ def summarize_log_groups(
             "version": version,
             "strategy": strategy,
             "decision_backend": backend,
+            "decision_backend_kind": summary["decision_backend_kind"],
+            "decision_model_id": summary["decision_model_id"],
             "total_samples": summary["total_samples"],
             "algorithmic_pass_rate": summary["algorithmic_pass_rate"],
             "judge_pass_rate": summary["judge_pass_rate"],
@@ -80,8 +82,8 @@ def summarize_log_groups(
             "median_output_tokens": summary["median_output_tokens"],
             "median_duration_seconds": summary["median_duration_seconds"],
             "median_decision_latency_ms": summary["median_decision_latency_ms"],
+            "round_trips_per_surface": summary["round_trips_per_surface"],
             "fallback_rate": summary["fallback_rate"],
-            "reask_rate": summary["reask_rate"],
             "cached": summary["cached"],
         })
     return rows

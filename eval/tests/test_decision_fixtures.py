@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
 
 import pytest
@@ -26,7 +27,10 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from a2ui.inference_formats.decision import (
     DecisionBlock,
     DeterministicMockBackend,
+    FallbackSource,
     JevHttpBackend,
+    LayoutPlan,
+    PlannedBlock,
     SynthesisOutput,
     SynthesisStage,
 )
@@ -35,6 +39,7 @@ from a2ui_eval.decision_common import (
     DECISION_METADATA_KEYS,
     build_decision_backend,
     decision_metadata,
+    is_transcrypt_ciphertext,
 )
 from decision_fixtures import (
     HOST_ANSWERS,
@@ -55,9 +60,21 @@ def test_build_decision_backend_known_names(
 ) -> None:
     """Verifies build_decision_backend returns the expected backend instance."""
     monkeypatch.setenv("JEV_API_KEY", "test-jev-key")
-    assert DECISION_BACKEND_NAMES == ("mock", "jev", "step0")
-    assert isinstance(build_decision_backend("mock"), DeterministicMockBackend)
+    assert DECISION_BACKEND_NAMES == ("mock", "jev", "systemone", "step0")
+    mock_backend = build_decision_backend("mock", model="mock-v1")
+    assert isinstance(mock_backend, DeterministicMockBackend)
+    assert mock_backend.backend_kind == "mock"
+    assert mock_backend.model_id == "mock-v1"
     assert isinstance(build_decision_backend("jev"), JevHttpBackend)
+
+
+def test_build_decision_backend_requires_explicit_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies build_decision_backend refuses implicit mock fallback when unset."""
+    monkeypatch.delenv("A2UI_DECISION_BACKEND", raising=False)
+    with pytest.raises(ValueError, match="A2UI_DECISION_BACKEND"):
+        build_decision_backend(None)
 
 
 def test_build_decision_backend_unknown_name() -> None:
@@ -66,36 +83,70 @@ def test_build_decision_backend_unknown_name() -> None:
         build_decision_backend("invalid")
 
 
+def test_is_transcrypt_ciphertext(tmp_path: Path) -> None:
+    """Verifies ciphertext detection distinguishes YAML from Transcrypt headers."""
+    plain = tmp_path / "plain.yaml"
+    plain.write_text("- name: host_health\n", encoding="utf-8")
+    assert is_transcrypt_ciphertext(plain) is False
+
+    salted_b64 = tmp_path / "enc_b64.yaml"
+    salted_b64.write_bytes(b"U2FsdGVkX1+abcdef123456\n")
+    assert is_transcrypt_ciphertext(salted_b64) is True
+
+    salted_raw = tmp_path / "enc_raw.yaml"
+    salted_raw.write_bytes(b"Salted__\x00\xff\xfe\xfd1234")
+    assert is_transcrypt_ciphertext(salted_raw) is True
+
+
 def test_decision_metadata_aggregation() -> None:
-    """Verifies decision_metadata aggregates metrics correctly."""
+    """Verifies decision_metadata aggregates metrics and fallback fields cleanly."""
+    plan1 = LayoutPlan(
+        family="monitor",
+        archetype="dashboard",
+        blocks=(
+            PlannedBlock(block_id="headline", pattern="headline"),
+            PlannedBlock(block_id="facts", pattern="facts"),
+        ),
+    )
     out1 = SynthesisOutput(
         stage=SynthesisStage.ARCHETYPE,
         messages=[],
         confidence=0.85,
         entropy=0.15,
-        component_tree_spec={"archetype": "dashboard"},
+        layout_plan=plan1,
         decision_latency_ms=12.5,
         decision_calls=1,
+        backend_kind="mock",
+        model_id="mock-test",
     )
     out2 = SynthesisOutput(
-        stage=SynthesisStage.ARCHETYPE,
+        stage=SynthesisStage.ABSTAIN_FALLBACK,
         messages=[],
         confidence=0.92,
         entropy=0.08,
-        component_tree_spec={"archetype": "form"},
         decision_latency_ms=25.0,
         decision_calls=2,
+        fallback_source=FallbackSource.FACTS,
+        fallback_reason="family_confidence_below_threshold",
+        backend_kind="mock",
+        model_id="mock-test",
     )
-    meta = decision_metadata([out1, out2], backend_name="mock")
+    meta = decision_metadata(
+        [out1, out2], backend_name="mock", block=HOST_DECISION_BLOCK
+    )
     assert meta["decision_backend"] == "mock"
+    assert meta["decision_backend_kind"] == "mock"
+    assert meta["decision_model_id"] == "mock-test"
     assert meta["decision_latency_ms"] == 37.5
     assert meta["decision_calls"] == 3
     assert meta["decision_confidence"] == 0.85
     assert meta["decision_archetype"] == "dashboard"
+    assert meta["decision_blocks"] == ["headline", "facts"]
     assert meta["decision_answers"] == 0
-    assert meta["decision_fallback_source"] is None
-    for key in DECISION_METADATA_KEYS:
-        assert key in meta
+    assert meta["decision_fallback_source"] == "fallback_facts"
+    assert meta["decision_fallback_reason"] == "family_confidence_below_threshold"
+    assert meta["decision_block"]["intent"] == HOST_DECISION_BLOCK.intent
+    assert set(meta) == set(DECISION_METADATA_KEYS)
 
 
 def test_decision_fixtures_integrity() -> None:
@@ -103,6 +154,9 @@ def test_decision_fixtures_integrity() -> None:
     assert isinstance(HOST_DECISION_BLOCK, DecisionBlock)
     assert isinstance(TRANSFER_DECISION_BLOCK, DecisionBlock)
     assert isinstance(SETTINGS_DECISION_BLOCK, DecisionBlock)
+
+    assert [a.id for a in TRANSFER_DECISION_BLOCK.actions] == ["send", "cancel"]
+    assert "actions" not in TRANSFER_DECISION_BLOCK.payload
 
     assert "intent" in HOST_BLOCK
     assert "intent" in TRANSFER_BLOCK

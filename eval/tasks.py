@@ -147,7 +147,8 @@ def build_task(
         no_judge: Skip the LLM judge and grade on Stage 1 and 2 only.
         max_validation_retries: Validation self-retries per sample (Pass@K).
         subagent_format: Inference format of the `subagent_tool` specialist.
-        decision_backend: Short name of the decision backend ('mock', 'local', 'jev').
+        decision_backend: Short name of the decision backend
+            ('mock', 'jev', 'systemone', 'step0').
         cache_generations: Whether to cache LLM generations across runs.
     """
     _check_task_inputs(active_version, dataset)
@@ -224,7 +225,8 @@ def a2ui_v0_9_1_eval(
         no_judge: Skip the LLM judge and grade on Stage 1 and 2 only.
         max_validation_retries: Validation self-retries per sample (Pass@K).
         subagent_format: Inference format of the `subagent_tool` specialist.
-        decision_backend: Short name of the decision backend ('mock', 'local', 'jev').
+        decision_backend: Short name of the decision backend
+            ('mock', 'jev', 'systemone', 'step0').
         cache_generations: Whether to cache LLM generations across runs.
 
     Returns:
@@ -271,7 +273,8 @@ def a2ui_v1_0_eval(
         no_judge: Skip the LLM judge and grade on Stage 1 and 2 only.
         max_validation_retries: Validation self-retries per sample (Pass@K).
         subagent_format: Inference format of the `subagent_tool` specialist.
-        decision_backend: Short name of the decision backend ('mock', 'local', 'jev').
+        decision_backend: Short name of the decision backend
+            ('mock', 'jev', 'systemone', 'step0').
         cache_generations: Whether to cache LLM generations across runs.
 
     Returns:
