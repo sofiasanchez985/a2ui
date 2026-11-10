@@ -39,7 +39,7 @@ from .backends import DecisionBackend, create_decision_backend
 from .bindings import is_v10 as _is_v10
 from .catalog_graph import CatalogDecisionGraph
 from .layout_lint import lint_components
-from .layout_planner import LayoutPlanner, PlannerState
+from .layout_planner import LayoutPlanner, PlannerState, is_secret_pointer
 from .models import (
     ActionSpec,
     AuthoredCopy,
@@ -55,6 +55,7 @@ from .models import (
     PlanOutcome,
     QuestionKind,
     SlotBinding,
+    SlotKind,
     SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
@@ -216,6 +217,21 @@ def _record_trace_reason(trace: list[DecisionRecord], reason: str, prompt: str) 
             ),
             outcome=reason,
         )
+    )
+
+
+_CHILD_SLOT_KINDS = frozenset(
+    {SlotKind.CHILD, SlotKind.CHILD_LIST, SlotKind.NAMED_CHILD_ARRAY}
+)
+
+
+def _child_slot_keys(graph: CatalogDecisionGraph) -> frozenset[str]:
+    """Property names the catalogs declare as child component slots."""
+    return frozenset(
+        slot.name
+        for spec in graph.root_candidates()
+        for slot in spec.slots
+        if slot.kind in _CHILD_SLOT_KINDS
     )
 
 
@@ -402,6 +418,7 @@ class DecisionSynthesizer:
             self.patterns, self.graph, grammar=self.archetypes
         )
         self._fallback_fn = fallback_fn
+        self._child_slot_keys = _child_slot_keys(self.graph)
         self._eligibility_cache: collections.OrderedDict[
             tuple[Any, ...], tuple[LayoutArchetype, ...]
         ] = collections.OrderedDict()
@@ -748,8 +765,9 @@ class DecisionSynthesizer:
         resolved = resolve_fallback_pattern(spec, self.patterns)
         if resolved is None:
             return None
+        visible = [p for p in pointers if not is_secret_pointer(p)]
         bindings = self.planner.bind_slots(
-            spec, pointers, set(), payload=data, intent=intent
+            spec, visible, set(), payload=data, intent=intent
         )
         if not bindings.pointers():
             return None
@@ -916,7 +934,9 @@ class DecisionSynthesizer:
         """Runs `lint_components`, returning the trace with findings and whether any is an error."""
         trace = list(state.trace)
         has_error = False
-        for finding in lint_components(components, plan):
+        for finding in lint_components(
+            components, plan, child_slot_keys=self._child_slot_keys
+        ):
             trace.append(
                 DecisionRecord(
                     question=DecisionQuestion(
@@ -991,6 +1011,14 @@ class DecisionSynthesizer:
             self._eligibility_cache.popitem(last=False)
         return result
 
+    def _has_templates_for(self, pointers: Sequence[PointerSummary]) -> bool:
+        """Whether any registered template matches the payload's pointers.
+
+        A matching template keeps the batch worth asking even when no
+        archetype is eligible (for example, a catalog with no patterns).
+        """
+        return bool(self.registry.matching_templates([p.path for p in pointers]))
+
     def _action_gate_output(
         self, state: PlannerState, trace: list[DecisionRecord]
     ) -> SynthesisOutput:
@@ -1014,7 +1042,9 @@ class DecisionSynthesizer:
     ) -> tuple[SynthesisOutput | None, tuple[DecisionRecord, ...]]:
         """Attempts archetype-planned synthesis, returning `(output, trace)`."""
         trace: list[DecisionRecord] = []
-        if not self._eligible_archetypes(pointers):
+        if not self._eligible_archetypes(pointers) and not self._has_templates_for(
+            pointers
+        ):
             _record_trace_reason(
                 trace,
                 "no eligible archetype",

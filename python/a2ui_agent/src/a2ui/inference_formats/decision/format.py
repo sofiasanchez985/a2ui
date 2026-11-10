@@ -101,7 +101,8 @@ class DecisionFormat(InferenceFormat):
             backend: Decision backend. Required; build one with
                 `create_decision_backend()` to read the environment.
             config: Synthesis thresholds and limits.
-            registry: Surface templates offered in the prompt and tried first.
+            registry: Surface templates the model may choose for matching
+                payloads.
             archetypes: Layout archetype grammar; defaults to
                 `ArchetypeGrammar.default()`.
             patterns: Catalog pattern library; defaults to
@@ -156,7 +157,7 @@ class DecisionFormat(InferenceFormat):
         if self._prompt_generator is None:
             self._prompt_generator = DecisionPromptGenerator(
                 self._catalogs,
-                registry=self._registry,
+                block_examples=self._block_examples,
                 archetypes=self._synthesizer.archetypes,
             )
         return self._prompt_generator

@@ -33,7 +33,6 @@ from .archetypes import ArchetypeGrammar
 from .catalog_graph import CatalogDecisionGraph
 from .decision_block import DecisionBlock
 from .models import MAX_BRIEF_SECTIONS
-from .template_registry import TemplateRegistry
 
 DECISION_RULES_TEMPLATE = f"""# A2UI Decision Block Output Contract
 
@@ -164,7 +163,6 @@ class DecisionPromptGenerator(PromptGenerator):
         catalogs: Sequence[CatalogApi],
         block_examples: Sequence[DecisionBlock] | None = None,
         *,
-        registry: TemplateRegistry | None = None,
         archetypes: ArchetypeGrammar | None = None,
     ) -> None:
         """Creates a prompt generator.
@@ -173,13 +171,11 @@ class DecisionPromptGenerator(PromptGenerator):
             catalogs: The active catalogs.
             block_examples: Few-shot example decision blocks rendered verbatim
                 in the prompt.
-            registry: Optional template registry.
             archetypes: Grammar whose brief roles the `layout` field rule
                 lists; defaults to `ArchetypeGrammar.default()`.
         """
         self._catalogs = list(check_mixed_catalogs(catalogs))
         self._block_examples = _validate_example_blocks(block_examples)
-        self._registry = registry if registry is not None else TemplateRegistry()
         self._archetypes = archetypes
         self._graph: CatalogDecisionGraph | None = None
 
@@ -192,11 +188,6 @@ class DecisionPromptGenerator(PromptGenerator):
     def block_examples(self) -> list[DecisionBlock] | None:
         """A copy of the configured few-shot decision block examples, if any."""
         return list(self._block_examples) if self._block_examples is not None else None
-
-    @property
-    def registry(self) -> TemplateRegistry:
-        """The template registry configured on this prompt generator."""
-        return self._registry
 
     @property
     def archetypes(self) -> ArchetypeGrammar:

@@ -1533,6 +1533,11 @@ def _try_recover_orphan_collection(
 _SECRET_FACT_AVOID_KEYS = ("ssn", "api_key", "token", "iban", "password", "secret")
 
 
+def is_secret_pointer(ptr: PointerSummary) -> bool:
+    """Whether `ptr` names a credential or identity number that facts must not show."""
+    return _is_avoided_key(ptr, _SECRET_FACT_AVOID_KEYS)
+
+
 def _uncovered_scalar_fact_pointers(
     state: PlannerState,
     claimed: set[str],
@@ -1547,7 +1552,7 @@ def _uncovered_scalar_fact_pointers(
         if not p.parent
         and p.value_type in {"string", "number", "boolean"}
         and not _is_nested_mutable_setting(p, state.pointers)
-        and not _is_avoided_key(p, _SECRET_FACT_AVOID_KEYS)
+        and not is_secret_pointer(p)
         and not _is_pointer_covered(p.path, claimed)
         and (
             p.semantic_type not in _NON_FACT_SEMANTIC_TYPES

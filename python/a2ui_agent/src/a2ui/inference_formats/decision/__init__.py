@@ -77,9 +77,10 @@ from .models import (
     SynthesisStage,
     coerce_decision_payload,
 )
-from .parser import DecisionParser
+from .parser import DecisionParser, surface_operation_for
 from .patterns import (
     CatalogPattern,
+    Expansion,
     MergedPatternLibrary,
     PatternError,
     PatternExpander,
@@ -96,7 +97,11 @@ from .payload_inspector import (
 )
 from .prompt_generator import DecisionPromptGenerator, decision_rules
 from .semantic_types import classify_scalar, humanize_key
-from .synthesizer import DecisionSynthesizer, FallbackCallback
+from .synthesizer import (
+    DecisionSynthesizer,
+    FallbackCallback,
+    resolve_surface_operation,
+)
 from .template_registry import SurfaceTemplate, TemplateRegistry
 from .tool import DecisionRenderTool
 
@@ -147,6 +152,7 @@ __all__ = [
     "DecisionTask",
     "DecisionWireFormat",
     "DeterministicMockBackend",
+    "Expansion",
     "FallbackCallback",
     "FallbackSource",
     "GrammarError",
@@ -194,5 +200,7 @@ __all__ = [
     "inspect_payload_pointers",
     "lint_components",
     "resolve_fallback_pattern",
+    "resolve_surface_operation",
     "shape_signature",
+    "surface_operation_for",
 ]

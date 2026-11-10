@@ -74,6 +74,11 @@ git_describe_command = [
 packages = ["src/a2ui"]
 core-metadata-version = "2.4"
 
+[tool.hatch.build.targets.wheel.hooks.custom]
+# hatch_build.py adds the decision grammar and pattern assets from the repo's
+# catalogs/ when building from a checkout; a wheel built from the sdist gets
+# them from the sdist's force-include below.
+
 [tool.hatch.build.targets.sdist]
 core-metadata-version = "2.4"
 

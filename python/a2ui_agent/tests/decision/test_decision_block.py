@@ -30,8 +30,6 @@ from a2ui.inference_formats.decision import (
     DecisionBlock,
     DecisionPromptGenerator,
     LayoutBrief,
-    SurfaceTemplate,
-    TemplateRegistry,
     decision_block_from_messages,
     decision_rules,
 )
@@ -457,26 +455,7 @@ def test_decision_block_from_messages_reconstructs_surface_and_payload() -> None
 
 def test_prompt_generator_contains_new_surface_id_rules_and_no_template() -> None:
     catalog = _make_catalog()
-    registry = TemplateRegistry()
-    registry.register(
-        SurfaceTemplate(
-            template_id="badge_tpl",
-            description="Pre-approved telemetry badge",
-            surface_id="default_surface",
-            catalog_id=CATALOG_ID,
-            protocol_version="v1.0",
-            components=(
-                {
-                    "id": "root",
-                    "component": "TelemetryBadge",
-                    "serviceName": {"@path": "/serviceName"},
-                    "latencyMs": {"@path": "/latencyMs"},
-                },
-            ),
-            required_pointers=("/serviceName", "/latencyMs"),
-        )
-    )
-    gen = DecisionPromptGenerator([catalog], registry=registry)
+    gen = DecisionPromptGenerator([catalog])
     prompt = gen.generate()
 
     assert isinstance(DECISION_RULES, str)

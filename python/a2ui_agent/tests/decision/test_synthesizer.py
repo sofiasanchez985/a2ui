@@ -31,10 +31,12 @@ from a2ui.inference_formats.decision import (
     DecisionSynthesizer,
     DeterministicMockBackend,
     FallbackSource,
+    LintCode,
     SurfaceOperation,
     SurfaceTemplate,
     SynthesisStage,
     TemplateRegistry,
+    lint_components,
 )
 from a2ui.parser import A2uiCompilationError
 from a2ui.parser.messages import to_message_dicts
@@ -476,3 +478,11 @@ async def test_empty_fallback_fn_result_passes_to_the_facts_link() -> None:
         HOST.intent, HOST.payload
     )
     assert out.fallback_source is FallbackSource.FACTS
+
+
+def test_lint_uses_catalog_child_slots_so_empty_containers_are_caught() -> None:
+    synth = _synth(HOST_SCRIPTED)
+    assert {"children", "child"} <= synth._child_slot_keys
+    empty = [{"id": "root", "component": "Column", "children": []}]
+    findings = lint_components(empty, child_slot_keys=synth._child_slot_keys)
+    assert any(f.code == LintCode.EMPTY_CONTAINER for f in findings)
