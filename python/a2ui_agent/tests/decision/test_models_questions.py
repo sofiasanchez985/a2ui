@@ -30,12 +30,15 @@ from a2ui.inference_formats.decision import (
     DeterministicMockBackend,
     FallbackSource,
     JevHttpBackend,
+    PlanCacheKey,
+    PlanReason,
     StepZeroLogprobBackend,
     SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
     SynthesisStage,
     answer_from_distribution,
+    plan_shape_signature,
 )
 from a2ui.inference_formats.decision.bindings import (
     is_v10,
@@ -451,6 +454,89 @@ def test_layout_plan_and_outcome() -> None:
         PlanOutcome(plan=None, reason="planned")
     with pytest.raises(ValueError):
         PlanOutcome(plan=plan, reason="no_family")
+
+
+def test_no_fit_outcome_carries_fit_score_without_plan() -> None:
+    outcome = PlanOutcome(plan=None, reason="no_fit", fit_score=0.2)
+    assert outcome.reason is PlanReason.NO_FIT
+    assert outcome.fit_score == 0.2
+    with pytest.raises(ValueError):
+        PlanOutcome(plan=None, reason="no_fit", fit_score=1.5)
+
+
+def test_layout_plan_fit_score_defaults_to_none_and_is_validated() -> None:
+    assert LayoutPlan(archetype="a", family="browse", blocks=()).fit_score is None
+    plan = LayoutPlan(archetype="a", family="browse", blocks=(), fit_score=0.7)
+    assert plan.fit_score == 0.7
+    with pytest.raises(ValueError):
+        LayoutPlan(archetype="a", family="browse", blocks=(), fit_score=-0.1)
+
+
+def test_synthesis_output_cache_hit_defaults_false() -> None:
+    output = SynthesisOutput(
+        stage=SynthesisStage.ARCHETYPE, messages=[], confidence=1.0, entropy=0.0
+    )
+    assert output.cache_hit is False
+
+
+def test_plan_cache_key_is_hashable_value() -> None:
+    key = PlanCacheKey("main", "basic", "1", "abc")
+    assert key == PlanCacheKey("main", "basic", "1", "abc")
+    assert len({key, PlanCacheKey("main", "basic", "1", "abc")}) == 1
+    assert key != PlanCacheKey("other", "basic", "1", "abc")
+
+
+_SHAPE_PAYLOAD = {"name": "Ada", "items": [{"id": 1, "title": "x"}], "count": 3}
+
+
+def _signature(payload: dict | None = None, **inputs: object) -> str:
+    pointers = inspect_payload_pointers(payload or _SHAPE_PAYLOAD)
+    inputs.setdefault("intent", "Show the list")
+    return plan_shape_signature(pointers, **inputs)  # type: ignore[arg-type]
+
+
+def test_shape_signature_ignores_values_and_pointer_order() -> None:
+    changed = {"count": 9, "items": [{"id": 2, "title": "y"}] * 5, "name": "Bo"}
+    assert _signature() == _signature(changed)
+    reordered = list(reversed(inspect_payload_pointers(_SHAPE_PAYLOAD)))
+    assert plan_shape_signature(reordered, intent="Show the list") == _signature()
+
+
+def test_shape_signature_ignores_set_input_order() -> None:
+    assert _signature(exclude=["/a", "/b"]) == _signature(exclude=["/b", "/a"])
+    assert _signature(template_ids=["t2", "t1"]) == _signature(
+        template_ids=["t1", "t2"]
+    )
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"intent": "Show something else"},
+        {"actions": [ActionSpec(id="buy", label="Buy")]},
+        {"exclude": ["/name"]},
+        {"mutable_paths": ["/name"]},
+        {"labels": {"/name": "Full name"}},
+        {"layout": ["hero:/name"]},
+        {"title": "Title"},
+        {"summary": "Summary"},
+        {"template_ids": ["t1"]},
+        {"conservativeness": 0.9},
+        {"model_id": "jev-v1"},
+    ],
+)
+def test_shape_signature_changes_with_each_planning_input(
+    inputs: dict[str, object],
+) -> None:
+    assert _signature(**inputs) != _signature()
+
+
+def test_shape_signature_changes_with_action_options_and_shape() -> None:
+    plain = _signature(actions=[ActionSpec(id="buy", label="Buy")])
+    scoped = _signature(actions=[ActionSpec(id="buy", label="Buy", scope="/items")])
+    assert plain != scoped
+    assert _signature({**_SHAPE_PAYLOAD, "extra": True}) != _signature()
+    assert _signature({**_SHAPE_PAYLOAD, "count": "3"}) != _signature()
 
 
 def test_pattern_capabilities_protocol_is_structural() -> None:

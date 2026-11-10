@@ -10,7 +10,8 @@
     "template": 0.75,
     "templateMutable": 0.85,
     "actionGateFloor": 0.7,
-    "actionGateCap": 0.95
+    "actionGateCap": 0.95,
+    "noFit": 0.5
   },
   "job": {
     "family": {
@@ -22,7 +23,8 @@
         "inspect": "Understand one thing in depth: a product, a place, a person, an order, an event, an article.",
         "act": "Commit to or confirm one action, or review something just before or just after it happens.",
         "input": "Provide or change information: fill in details, adjust settings, answer questions.",
-        "follow": "Do something step by step: a how-to, a recipe, a checklist, troubleshooting."
+        "follow": "Do something step by step: a how-to, a recipe, a checklist, troubleshooting.",
+        "none": "None of these layouts fits: free-form content, a game, a canvas, or several unrelated things"
       }
     },
     "stakes": {
