@@ -90,6 +90,7 @@ def _minimal_grammar() -> dict[str, Any]:
             "templateMutable": 0.85,
             "actionGateFloor": 0.7,
             "actionGateCap": 0.95,
+            "noFit": 0.5,
         },
         "job": {
             "family": {
@@ -166,7 +167,9 @@ def test_default_grammar_round_trips_the_bundled_asset() -> None:
         "act",
         "input",
         "follow",
+        "none",
     )
+    # `none` is the no-fit option and has no archetypes.
     assert len({a.family for a in grammar.archetypes}) == 6
     assert grammar.thresholds["actionGateFloor"] == pytest.approx(0.70)
     assert grammar.thresholds["actionGateCap"] == pytest.approx(0.95)
@@ -284,8 +287,8 @@ def test_job_questions_and_brief_roles() -> None:
     assert len(grammar.job["stakes"].levels) == 4
     assert len(grammar.job["urgency"].levels) == 3
     roles = grammar.brief_roles()
-    assert roles[:6] == grammar.families()
-    assert set(roles[6:]) == set(_EXPECTED_BLOCKS)
+    assert roles[:7] == grammar.families()
+    assert set(roles[7:]) == set(_EXPECTED_BLOCKS)
     assert grammar.archetypes_in("act") == tuple(
         grammar.archetype(i) for i in ("result", "confirm", "checkout")
     )
