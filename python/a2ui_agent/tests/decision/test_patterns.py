@@ -1298,3 +1298,123 @@ def test_is_self_author_resolves_item_qualified_instance_keys() -> None:
         c["id"] == "conversation_msg_0" and c.get("justify") == "end"
         for c in exp.components
     )
+
+
+def test_region_expand_block_preserves_stable_component_ids_single_and_multi_catalog() -> (
+    None
+):
+    """Standalone `expand_block` for a region update emits the exact same component IDs as full expansion."""
+    import asyncio
+    from .layout_fixtures import ScriptedAnswers
+
+    catalog = BasicCatalog("v1.0")
+    lib = MergedPatternLibrary.for_catalogs([catalog])
+    graph = CatalogDecisionGraph([catalog])
+    expander = PatternExpander(lib, graph)
+    planner = LayoutPlanner(capabilities=lib)
+
+    ptrs = inspect_payload_pointers(HOST.payload)
+    batch, state = planner.build_batch(HOST.intent, ptrs, payload=HOST.payload)
+    answers = asyncio.run(
+        ScriptedAnswers({
+            "family": ("monitor", 0.90),
+            "archetype:monitor": ("dashboard", 0.85),
+            "gate:banner": 0.85,
+            "gate:headline": 0.90,
+            "gate:facts": 0.80,
+            "salience:/cpu": 2.9,
+            "salience:/status": 2.1,
+            "salience:/uptimeHours": 1.4,
+            "salience:/host": 0.5,
+            "instance:banner.tone:/status": ("warning", 0.90),
+            "instance:headline.news:/cpu": ("bad", 0.85),
+        })
+        .backend()
+        .answer(batch)
+    )
+    outcome = planner.read(state, answers)
+    assert outcome.plan is not None
+    plan = outcome.plan
+
+    # Full expansion (same sequence used by `DecisionSynthesizer._expand_plan`)
+    full_by_block: dict[str, list[str]] = {}
+    block_roots: list[str] = []
+    block_exps = []
+    for blk in plan.blocks:
+        exp = expander.expand_block(
+            blk.block_id,
+            blk.pattern,
+            blk.bindings,
+            knobs=blk.variant_knobs,
+            instances=blk.instances,
+            id_prefix=blk.block_id,
+        )
+        full_by_block[blk.block_id] = [c["id"] for c in exp.components]
+        block_roots.append(exp.components[0]["id"])
+        block_exps.append(exp)
+    page_exp = expander.expand_page(
+        plan.page, block_roots=block_roots, blocks=block_exps
+    )
+    assert page_exp.components[0]["id"] == "root"
+
+    # Standalone region `expand_block` with default `id_prefix=""`, `block_id`, or `<block_id>_root`
+    for blk in plan.blocks:
+        for prefix_arg in ("", blk.block_id, f"{blk.block_id}_root"):
+            region_exp = expander.expand_block(
+                blk.block_id,
+                blk.pattern,
+                blk.bindings,
+                knobs=blk.variant_knobs,
+                instances=blk.instances,
+                id_prefix=prefix_arg,
+            )
+            assert [c["id"] for c in region_exp.components] == full_by_block[
+                blk.block_id
+            ]
+            assert region_exp.components[0]["id"] == f"{blk.block_id}_root"
+            validate_payload([catalog], _wrap_surface(region_exp.components))
+
+    # Multi-catalog surface (`graph.surface_catalog_id is None`): default prefix includes catalog slug
+    domain_cat = _two_component_domain_catalog()
+    domain_lib = PatternLibrary.from_json({
+        "grammarVersion": "1",
+        "catalogId": domain_cat.catalog_id,
+        "patterns": {
+            "banner": {
+                "slots": ["title"],
+                "root": "alert_root",
+                "components": [
+                    {
+                        "id": "alert_root",
+                        "component": "AlertFrame",
+                        "child": "alert_badge",
+                    },
+                    {
+                        "id": "alert_badge",
+                        "component": "TelemetryBadge",
+                        "metric": {"$slot": "title", "$default": "ok"},
+                    },
+                ],
+            }
+        },
+    })
+    basic_lib = PatternLibrary.from_json(
+        copy.deepcopy(load_asset("patterns/basic_v1_0.json"))
+    )
+    multi_lib = MergedPatternLibrary([domain_lib, basic_lib])
+    multi_graph = CatalogDecisionGraph([domain_cat, catalog])
+    assert multi_graph.surface_catalog_id is None
+    multi_expander = PatternExpander(multi_lib, multi_graph)
+
+    multi_banner = multi_expander.expand_block(
+        "banner",
+        "banner",
+        BlockBindings(slots={"title": SlotBinding(pointer="/status")}),
+    )
+    assert [c["id"] for c in multi_banner.components] == [
+        "telemetry_banner_root",
+        "telemetry_banner_alert_badge",
+    ]
+    assert all(
+        c.get("catalogId") == domain_cat.catalog_id for c in multi_banner.components
+    )

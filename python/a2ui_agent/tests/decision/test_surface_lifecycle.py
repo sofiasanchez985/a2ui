@@ -24,7 +24,7 @@ import pytest
 
 from a2ui.core.basic_catalog import BasicCatalog
 from a2ui.inference_formats.decision import DecisionFormat, DecisionFormatFactory
-from a2ui.parser import A2uiPart
+from a2ui.parser import A2uiCompilationValidationError, A2uiPart
 from a2ui.parser.messages import to_message_dicts
 from a2ui.processor import A2uiRequestProcessor
 from a2ui.utils import RendererState
@@ -196,8 +196,68 @@ def test_update_needing_send_data_model_escalates_to_replace(
     ]
     assert second[1]["createSurface"]["sendDataModel"] is True
 
-    third = turn(with_save)
+    third = turn({**with_save, "actions": {"save": "Save changes"}})
     assert _kinds(third) == ["updateComponents", "updateDataModel"]
+
+    fourth = turn({**with_save, "actions": {"save": "Save changes"}})
+    assert _kinds(fourth) == ["updateDataModel"]
+
+
+@TURN_FACTORIES
+def test_region_update_replaces_only_named_block(
+    make_turns: Callable[..., Turn],
+) -> None:
+    turn = make_turns(HOST_SCRIPTED)
+    client = _Client()
+    block = {"intent": HOST.intent, "payload": HOST.payload, "surfaceId": "ops"}
+
+    first = turn(block)
+    assert _kinds(first) == ["createSurface", "updateComponents", "updateDataModel"]
+    client.apply(first)
+    initial_reachable = client.reachable()
+    initial_headline_ids = {
+        cid for cid in initial_reachable if cid.startswith("headline_")
+    }
+    initial_other_ids = initial_reachable - initial_headline_ids
+    assert "headline_item_1" in initial_headline_ids
+
+    # Re-plan only `headline` with `/uptimeHours` excluded so the second headline
+    # tile is dropped while `banner`, `facts`, and `root` are untouched.
+    region_turn = turn({
+        **block,
+        "region": "headline",
+        "exclude": ["/uptimeHours"],
+    })
+    assert _kinds(region_turn) == ["updateComponents", "updateDataModel"]
+    emitted_ids = _ids(region_turn)
+    assert emitted_ids
+    assert all(cid.startswith("headline_") for cid in emitted_ids)
+    assert "headline_root" in emitted_ids
+    assert "headline_item_1" not in emitted_ids
+
+    client.apply(region_turn)
+    after_reachable = client.reachable()
+    after_headline_ids = {cid for cid in after_reachable if cid.startswith("headline_")}
+    after_other_ids = after_reachable - after_headline_ids
+
+    # Old child ids of the replaced block are no longer reachable from `root`,
+    # and every other block's ids are unchanged.
+    assert "headline_item_1" not in after_reachable
+    assert after_headline_ids == emitted_ids
+    assert after_other_ids == initial_other_ids
+
+
+def test_region_update_errors_without_cached_plan_or_when_block_is_absent() -> None:
+    fmt = DecisionFormat([CATALOG], backend=mock_backend(**HOST_SCRIPTED))
+    parser = fmt.create_parser(conversation_id="region-errors")
+    block = {"intent": HOST.intent, "payload": HOST.payload, "surfaceId": "ops"}
+
+    with pytest.raises(A2uiCompilationValidationError, match="no cached"):
+        parser.parse_response(_response({**block, "region": "headline"}))
+
+    parser.parse_response(_response(block))
+    with pytest.raises(A2uiCompilationValidationError, match="has no block"):
+        parser.parse_response(_response({**block, "region": "form"}))
 
 
 def test_separate_conversations_keep_separate_surfaces() -> None:

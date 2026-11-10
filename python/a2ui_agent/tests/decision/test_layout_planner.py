@@ -34,6 +34,7 @@ from a2ui.inference_formats.decision.layout_lint import (
 )
 from a2ui.inference_formats.decision.layout_planner import (
     LayoutPlanner,
+    MAX_ORPHAN_FACTS_ROWS,
     PlannerState,
     apply_actions_gate,
     apply_at_least,
@@ -46,6 +47,7 @@ from a2ui.inference_formats.decision.layout_planner import (
     apply_pointer_once_per_region,
     apply_required_block_wins,
     apply_urgency_terse,
+    compute_fit_score,
 )
 from a2ui.inference_formats.decision.models import (
     ActionSpec,
@@ -108,6 +110,8 @@ def _run_fixture(
     capabilities: PatternCapabilities | None = None,
     templates: Sequence[SurfaceTemplate] = (),
     actions: Sequence[ActionSpec] = (),
+    labels: Mapping[str, str] | None = None,
+    exclude: Sequence[str] = (),
 ) -> tuple[
     LayoutPlanner,
     PlannerState,
@@ -129,6 +133,8 @@ def _run_fixture(
         payload=fixture.payload,
         templates=templates,
         actions=actions,
+        labels=labels,
+        exclude=exclude,
     )
     sa = ScriptedAnswers(answers=scripted)
     answers = asyncio.run(sa.backend().answer(batch))
@@ -1231,3 +1237,432 @@ def test_two_stage_batching_reduces_pairs_and_matches_single_stage() -> None:
     assert two_stage_outcome.plan.archetype == single_outcome.plan.archetype
     assert two_stage_outcome.plan.block_ids() == single_outcome.plan.block_ids()
     assert state.batch.pair_count() < single_state.batch.pair_count()
+
+
+def test_family_none_wins_no_fit_and_falls_back_below_threshold() -> None:
+    """`family == 'none'` at `>= thresholds.noFit` returns `NO_FIT`; below `noFit` checks next family."""
+    planner = LayoutPlanner()
+    assert planner.threshold("noFit") == pytest.approx(0.50)
+
+    _, state_exact, _, exact_no_fit, sa = _run_fixture(HOST, {"family": ("none", 0.50)})
+    fam_q = next(q for q in state_exact.batch.questions if q.id == "family")
+    assert fam_q.candidates().count("none") == 1
+    assert "archetype:none" not in sa.asked
+    assert exact_no_fit.reason is PlanReason.NO_FIT
+    assert exact_no_fit.plan is None
+    assert exact_no_fit.fit_score is not None
+    assert 0.0 <= exact_no_fit.fit_score <= 1.0
+    assert any(
+        r.question.id == "family" and r.outcome == "no_fit" for r in state_exact.trace
+    )
+    assert any(r.question.id == "fit_score" for r in state_exact.trace)
+
+    # Below `noFit` (0.49 < 0.50), runner-up `monitor` >= 0.40 wins cleanly
+    _, _, _, runner_up, _ = _run_fixture(
+        HOST,
+        {
+            "family": {"none": 0.49, "monitor": 0.41, "browse": 0.10},
+            "archetype:monitor": ("dashboard", 0.85),
+            "gate:headline": 0.90,
+            "gate:facts": 0.80,
+        },
+    )
+    assert runner_up.reason is PlanReason.PLANNED
+    assert runner_up.plan is not None
+    assert runner_up.plan.family == "monitor"
+
+    # Below `noFit` AND runner-up below `family` threshold (0.40) -> `NO_FAMILY`
+    _, _, _, abstained, _ = _run_fixture(
+        HOST,
+        {"family": {"none": 0.49, "monitor": 0.30, "browse": 0.21}},
+    )
+    assert abstained.reason is PlanReason.NO_FAMILY
+    assert abstained.plan is None
+
+    # Two-stage batch short-circuits Stage 2 on `family == 'none'` >= `noFit`
+    ptrs = inspect_payload_pointers(HOST.payload, mutable_paths=HOST.mutable_paths)
+    s1_batch, s_state = planner.build_stage1_batch(
+        HOST.intent, ptrs, payload=HOST.payload
+    )
+    s1_ans = asyncio.run(
+        ScriptedAnswers({"family": ("none", 0.85)}).backend().answer(s1_batch)
+    )
+    s2_batch = planner.build_stage2_batch(s_state, s1_ans)
+    assert s2_batch.questions == ()
+    s_outcome = planner.read(s_state, s1_ans)
+    assert s_outcome.reason is PlanReason.NO_FIT
+
+
+def test_fit_score_monotonicity_across_all_four_inputs_and_trace() -> None:
+    """`fit_score` is monotonic in archetype prob, entropy, orphan share, and weak required slots."""
+    assert compute_fit_score(0.90, 0.20, 0.10, 0.10) > compute_fit_score(
+        0.60, 0.20, 0.10, 0.10
+    )
+    assert compute_fit_score(0.85, 0.10, 0.10, 0.10) > compute_fit_score(
+        0.85, 0.80, 0.10, 0.10
+    )
+    assert compute_fit_score(0.85, 0.20, 0.00, 0.10) > compute_fit_score(
+        0.85, 0.20, 0.50, 0.10
+    )
+    assert compute_fit_score(0.85, 0.20, 0.10, 0.00) > compute_fit_score(
+        0.85, 0.20, 0.10, 0.50
+    )
+    assert 0.0 <= compute_fit_score(1.5, -0.5, 2.0, 2.0) <= 1.0
+
+    # 1 & 2. End-to-end: higher archetype prob and lower Shannon entropy increase `fit_score`
+    base_resort: dict[str, ScriptedValue] = {
+        "family": ("inspect", 0.85),
+        "gate:picture": 0.90,
+        "gate:headline": 0.85,
+        "gate:prose": 0.90,
+        "gate:collection": 0.85,
+        "salience:/rating": 2.5,
+        "salience:/priceFrom": 2.6,
+    }
+    _, high_p_state, _, high_p_out, _ = _run_fixture(
+        RESORT,
+        {
+            **base_resort,
+            "archetype:inspect": {"detail": 0.90, "profile": 0.10, "none": 0.0},
+        },
+    )
+    _, low_h_state, _, low_h_out, _ = _run_fixture(
+        RESORT,
+        {
+            **base_resort,
+            "archetype:inspect": {"detail": 0.60, "profile": 0.40, "none": 0.0},
+        },
+    )
+    _, high_h_state, _, high_h_out, _ = _run_fixture(
+        RESORT,
+        {
+            **base_resort,
+            "archetype:inspect": {
+                "detail": 0.60,
+                "profile": 0.20,
+                "none": 0.20,
+            },
+        },
+    )
+    assert high_p_out.fit_score is not None
+    assert low_h_out.fit_score is not None
+    assert high_h_out.fit_score is not None
+    assert high_p_out.plan is not None
+    assert high_p_out.fit_score == pytest.approx(high_p_out.plan.fit_score)
+    assert high_p_out.fit_score > low_h_out.fit_score > high_h_out.fit_score
+    for st in (high_p_state, low_h_state, high_h_state):
+        assert any(r.question.id == "fit_score" for r in st.trace)
+
+    # 3. End-to-end: orphan-recovered pointers lower `fit_score`
+    clean_article = LayoutFixture(
+        name="clean_article",
+        intent="Show article",
+        payload={
+            "title": "Declarative UI",
+            "heroUrl": "https://example.com/hero.jpg",
+            "body": "Long prose body text here.",
+        },
+    )
+    orphan_article = LayoutFixture(
+        name="orphan_article",
+        intent="Show article",
+        payload={
+            "title": "Declarative UI",
+            "heroUrl": "https://example.com/hero.jpg",
+            "body": "Long prose body text here.",
+            "author": "Ada Lovelace",
+            "edition": "Third",
+        },
+    )
+    article_scripted: dict[str, ScriptedValue] = {
+        "family": ("inspect", 0.85),
+        "archetype:inspect": ("detail", 0.85),
+        "gate:picture": 0.90,
+        "gate:prose": 0.90,
+        "gate:facts": 0.20,
+    }
+    _, _, _, no_orphan_out, _ = _run_fixture(clean_article, article_scripted)
+    _, _, _, with_orphan_out, _ = _run_fixture(orphan_article, article_scripted)
+    assert no_orphan_out.fit_score is not None
+    assert with_orphan_out.fit_score is not None
+    assert no_orphan_out.fit_score > with_orphan_out.fit_score
+
+    # 4. End-to-end: required slot instance confidence below `thresholds.instance` lowers `fit_score`
+    base_host: dict[str, ScriptedValue] = {
+        "family": ("monitor", 0.90),
+        "archetype:monitor": ("dashboard", 0.85),
+        "gate:banner": 0.10,
+        "gate:headline": 0.90,
+        "gate:facts": 0.80,
+        "salience:/cpu": 2.8,
+        "salience:/status": 0.5,
+        "salience:/uptimeHours": 1.2,
+        "salience:/host": 0.4,
+    }
+    _, _, _, strong_inst, _ = _run_fixture(
+        HOST, {**base_host, "instance:headline.news:/cpu": ("bad", 0.90)}
+    )
+    _, _, _, weak_inst, _ = _run_fixture(
+        HOST,
+        {
+            **base_host,
+            "instance:headline.news:/cpu": {
+                "bad": 0.40,
+                "good": 0.35,
+                "neutral": 0.25,
+            },
+        },
+    )
+    assert strong_inst.fit_score is not None
+    assert weak_inst.fit_score is not None
+    assert strong_inst.fit_score > weak_inst.fit_score
+
+
+def test_no_orphaned_pointers_caps_at_eight_rows_and_omits_excluded_pointers() -> None:
+    """`no-orphaned-pointers` adds at most 8 `facts` rows and never recovers `exclude`d pointers."""
+    wide_payload: dict[str, Any] = {
+        "title": "Quarterly Audit",
+        "heroUrl": "https://example.com/audit.jpg",
+        "body": (
+            "Detailed narrative summary of quarterly operational performance and"
+            " reliability metrics across production clusters."
+        ),
+        **{f"metric_{idx:02d}": f"v{idx}" for idx in range(12)},
+        "internalNote": "do-not-render",
+        "debugEvents": [{"title": "trace-1", "detail": "internal"}],
+    }
+    wide_fixture = LayoutFixture(
+        name="wide_audit",
+        intent="Show quarterly audit summary",
+        payload=wide_payload,
+    )
+    _, _, _, outcome, sa = _run_fixture(
+        wide_fixture,
+        {
+            "family": ("inspect", 0.85),
+            "archetype:inspect": ("detail", 0.85),
+            "gate:picture": 0.90,
+            "gate:prose": 0.90,
+            "gate:facts": 0.10,
+            "gate:collection": 0.10,
+            "salience:/metric_11": 2.9,
+            "salience:/metric_10": 2.8,
+        },
+        exclude=("/internalNote", "debugEvents"),
+    )
+    assert "salience:/internalNote" not in sa.asked
+    assert outcome.plan is not None
+    assert "collection" not in outcome.plan.block_ids()
+    facts_block = next(b for b in outcome.plan.blocks if b.block_id == "facts")
+    rows_slot = facts_block.bindings.get("rows")
+    assert rows_slot is not None
+    assert len(rows_slot.items) == MAX_ORPHAN_FACTS_ROWS == 8
+    bound_ptrs = [it["value"].pointer for it in rows_slot.items]
+    assert "/internalNote" not in bound_ptrs
+    assert bound_ptrs[:2] == ["/metric_11", "/metric_10"]
+
+
+def test_agent_labels_override_humanized_keys_in_blocks_orphans_and_prompts() -> None:
+    """Agent `labels` replace humanized keys in `headline`, `facts`, `groups`, `form`, and prompts."""
+    host_labels = {
+        "/cpu": "Processor Load",
+        "uptimeHours": "Uptime (Hours)",
+        "/status": "Service Health",
+    }
+    _, host_state, _, host_out, _ = _run_fixture(
+        HOST,
+        {
+            "family": ("monitor", 0.90),
+            "archetype:monitor": ("dashboard", 0.85),
+            "gate:banner": 0.85,
+            "gate:headline": 0.90,
+            "gate:facts": 0.10,
+            "salience:/cpu": 2.9,
+            "salience:/status": 1.0,
+            "salience:/uptimeHours": 1.2,
+            "instance:banner.tone:/status": ("warning", 0.85),
+            "instance:headline.news:/cpu": ("bad", 0.85),
+        },
+        labels=host_labels,
+    )
+    host_prompts = {q.id: q.prompt for q in host_state.batch.questions}
+    assert "Processor Load" in host_prompts["salience:/cpu"]
+    assert "Processor Load" in host_prompts["instance:headline.news:/cpu"]
+    assert "Service Health" in host_prompts["instance:banner.tone:/status"]
+    assert host_out.plan is not None
+    by_id = {b.block_id: b for b in host_out.plan.blocks}
+    hl_items = by_id["headline"].bindings.get("items")
+    assert hl_items is not None
+    assert hl_items.items[0]["label"].literal == "Processor Load"
+    # `gate:facts = 0.10` forces `/uptimeHours` through `no-orphaned-pointers`
+    facts_rows = by_id["facts"].bindings.get("rows")
+    assert facts_rows is not None
+    row_labels = {it["value"].pointer: it["label"].literal for it in facts_rows.items}
+    assert row_labels["/uptimeHours"] == "Uptime (Hours)"
+
+    # `groups` headings and rows + prompts
+    _, settings_state, _, settings_out, _ = _run_fixture(
+        SETTINGS,
+        {
+            "family": ("input", 0.85),
+            "archetype:input": ("settings", 0.90),
+            "gate:groups": 0.90,
+            "instance:groups.row_kind:/playback/autoDownload": ("switch", 0.90),
+        },
+        labels={
+            "/playback": "Audio & Speed",
+            "/playback/autoDownload": "Auto-fetch Episodes",
+        },
+    )
+    settings_prompts = {q.id: q.prompt for q in settings_state.batch.questions}
+    assert (
+        "Auto-fetch Episodes"
+        in settings_prompts["instance:groups.row_kind:/playback/autoDownload"]
+    )
+    assert settings_out.plan is not None
+    groups_slot = settings_out.plan.blocks[0].bindings.get("groups")
+    assert groups_slot is not None
+    playback_grp = next(
+        g for g in groups_slot.items if g["heading"].literal == "Audio & Speed"
+    )
+    auto_row = next(
+        r
+        for r in playback_grp["rows"].items
+        if r["value"].pointer == "/playback/autoDownload"
+    )
+    assert auto_row["label"].literal == "Auto-fetch Episodes"
+
+    # `form` field labels
+    form_fixture = LayoutFixture(
+        name="signup_form",
+        intent="Collect contact email",
+        payload={"workEmail": ""},
+        mutable_paths=frozenset({"/workEmail"}),
+    )
+    _, _, _, form_out, _ = _run_fixture(
+        form_fixture,
+        {
+            "family": ("input", 0.90),
+            "archetype:input": ("form", 0.90),
+            "gate:form": 0.90,
+        },
+        labels={"/workEmail": "Corporate Email Address"},
+    )
+    assert form_out.plan is not None
+    fields_slot = form_out.plan.blocks[0].bindings.get("fields")
+    assert fields_slot is not None
+    assert fields_slot.items[0]["label"].literal == "Corporate Email Address"
+
+
+def test_build_block_batch_and_read_block_replan_single_region() -> None:
+    """`build_block_batch` asks only `block_id`'s questions and `read_block` updates that block."""
+    planner, full_state, _, outcome, _ = _run_fixture(
+        HOST,
+        {
+            "family": ("monitor", 0.90),
+            "stakes": 1.0,
+            "urgency": 1.2,
+            "archetype:monitor": ("dashboard", 0.85),
+            "gate:banner": 0.80,
+            "gate:headline": 0.90,
+            "gate:facts": 0.80,
+            "salience:/cpu": 2.8,
+            "salience:/status": 2.1,
+            "salience:/uptimeHours": 1.2,
+            "salience:/host": 0.4,
+            "instance:banner.tone:/status": ("warning", 0.90),
+            "instance:headline.news:/cpu": ("bad", 0.85),
+        },
+    )
+    assert outcome.plan is not None
+    plan = outcome.plan
+
+    updated_payload = {
+        **HOST.payload,
+        "cpu": 0.34,
+        "cpuDelta": -0.18,
+        "memoryPct": 0.88,
+    }
+    updated_ptrs = inspect_payload_pointers(updated_payload)
+    reg_batch, reg_state = planner.build_block_batch(
+        plan,
+        "headline",
+        updated_ptrs,
+        intent=HOST.intent,
+        labels={"/memoryPct": "RAM Usage", "/cpu": "CPU Load"},
+        payload=updated_payload,
+    )
+    assert reg_batch.shared_context["region"] == "headline"
+    asked_ids = [q.id for q in reg_batch.questions]
+    assert asked_ids
+    for q_id in asked_ids:
+        assert q_id.startswith(("anatomy:headline.", "salience:", "instance:headline."))
+    assert not any(
+        q_id in {"family", "stakes", "urgency"}
+        or q_id.startswith(("archetype:", "gate:", "instance:banner."))
+        for q_id in asked_ids
+    )
+
+    reg_sa = ScriptedAnswers({
+        "salience:/memoryPct": 2.9,
+        "salience:/cpu": 2.5,
+        "anatomy:headline.deltas": 0.90,
+        "anatomy:headline.gauge": 0.85,
+        "instance:headline.news:/memoryPct": ("bad", 0.90),
+        "instance:headline.news:/cpu": ("good", 0.85),
+    })
+    reg_answers = asyncio.run(reg_sa.backend().answer(reg_batch))
+    updated_block = planner.read_block(reg_state, reg_answers)
+    assert updated_block.block_id == "headline"
+    hl_items = updated_block.bindings.get("items")
+    assert hl_items is not None
+    assert [it["value"].pointer for it in hl_items.items] == [
+        "/memoryPct",
+        "/cpu",
+    ]
+    assert [it["label"].literal for it in hl_items.items] == [
+        "RAM Usage",
+        "CPU Load",
+    ]
+    assert updated_block.variant_knobs["deltas"] == "yes"
+    assert updated_block.instances["/cpu"]["news"] == "good"
+
+    # Region update on `actions` recovers bound `ActionSpec`s from the cached plan
+    _, _, _, transfer_out, _ = _run_fixture(
+        _TRANSFER_FIXTURE,
+        {
+            "family": ("act", 0.90),
+            "stakes": 2.1,
+            "urgency": 0.5,
+            "archetype:act": ("confirm", 0.90),
+            "gate:facts": 0.85,
+            "gate:actions": 0.90,
+            "instance:actions.primary:buttons": ("send", 0.90),
+            "instance:actions.destructive:send": 0.85,
+        },
+        actions=_TRANSFER_ACTIONS,
+    )
+    assert transfer_out.plan is not None
+    act_batch, act_state = planner.build_block_batch(
+        transfer_out.plan,
+        "actions",
+        inspect_payload_pointers(_TRANSFER_FIXTURE.payload),
+        intent=_TRANSFER_FIXTURE.intent,
+    )
+    act_ans = asyncio.run(
+        ScriptedAnswers({
+            "instance:actions.primary:buttons": ("send", 0.95),
+            "instance:actions.destructive:send": 0.10,
+        })
+        .backend()
+        .answer(act_batch)
+    )
+    updated_act = planner.read_block(act_state, act_ans)
+    assert updated_act.block_id == "actions"
+    assert updated_act.instances["send"]["primary"] == "true"
+
+    # Absent block and non-region state raise `A2uiValidationError`
+    with pytest.raises(A2uiValidationError, match="not present"):
+        planner.build_block_batch(plan, "timeline", updated_ptrs)
+    with pytest.raises(A2uiValidationError, match="build_block_batch"):
+        planner.read_block(full_state, ())

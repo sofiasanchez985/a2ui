@@ -160,8 +160,16 @@ def test_parser_updates_an_existing_surface_in_place_and_replaces_on_request() -
     first = _messages(parser.parse_response(_wrapped(BLOCK), state=state))
     assert _kinds(first) == ["createSurface", "updateComponents", "updateDataModel"]
 
-    second = _messages(parser.parse_response(_wrapped(BLOCK), state=state))
-    assert _kinds(second) == ["updateComponents", "updateDataModel"]
+    same_shape = _messages(parser.parse_response(_wrapped(BLOCK), state=state))
+    assert _kinds(same_shape) == ["updateDataModel"]
+
+    changed_shape = _messages(
+        parser.parse_response(
+            _wrapped({**BLOCK, "payload": {**HOST.payload, "about": "Primary host"}}),
+            state=state,
+        )
+    )
+    assert _kinds(changed_shape) == ["updateComponents", "updateDataModel"]
 
     replaced = _messages(
         parser.parse_response(_wrapped({**BLOCK, "replace": True}), state=state)
@@ -191,7 +199,7 @@ def test_format_keeps_one_state_per_conversation() -> None:
         fmt.create_parser(conversation_id="c2").parse_response(_wrapped(BLOCK))
     )
     assert _kinds(turn1)[0] == "createSurface"
-    assert _kinds(turn2) == ["updateComponents", "updateDataModel"]
+    assert _kinds(turn2) == ["updateDataModel"]
     assert _kinds(other)[0] == "createSurface"
 
 
