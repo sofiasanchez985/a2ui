@@ -155,6 +155,10 @@ class TurnMetrics:
     """The decision backend's pinned model id."""
     operation: str | None = None
     """The `SurfaceOperation` the decision render emitted."""
+    cache_hit: bool = False
+    """Whether a cached plan answered without a decision backend call."""
+    fit_score: float | None = None
+    """How well the chosen archetype fits the payload (`LayoutPlan.fit_score`)."""
 
     def path_summary(self) -> str | None:
         """Describes whether rendering used the decision model, a template, or a fallback."""
@@ -206,6 +210,10 @@ class TurnMetrics:
             parts.append(f"{self.prompt_tokens} in / {self.output_tokens} out tokens")
         if self.operation and self.operation != "create":
             parts.append(f"surface {self.operation}")
+        if self.cache_hit:
+            parts.append("cache hit")
+        if self.fit_score is not None:
+            parts.append(f"fit {self.fit_score:.2f}")
         path = self.path_summary()
         parts.extend([path] if path is not None else self._plan_parts())
         return " · ".join(parts)

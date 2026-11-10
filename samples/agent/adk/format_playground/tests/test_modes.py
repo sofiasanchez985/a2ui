@@ -174,3 +174,24 @@ def test_footer_shows_model_id_and_non_create_operations() -> None:
     assert metrics.footer() == (
         "**decision** · mock · 0 LLM calls · decision 1 ms · surface update_root"
     )
+
+    cached_with_fit = TurnMetrics(
+        mode=RenderMode.DECISION,
+        backend="jev",
+        model_id="jev-v0",
+        llm_calls=0,
+        latency_ms=0.5,
+        decision_latency_ms=0.0,
+        operation="update_root",
+        cache_hit=True,
+        fit_score=0.84,
+        stage="archetype",
+        archetype="dashboard",
+        confidence=0.88,
+        block_count=3,
+    )
+    assert cached_with_fit.footer() == (
+        "**decision** · jev (jev-v0) · 0 LLM calls · decision 0.00 ms"
+        " · surface update_root · cache hit · fit 0.84"
+        " · path: decision model · archetype dashboard (0.88) · 3 blocks"
+    )

@@ -480,6 +480,8 @@ class Renderers:
             decision_calls=output.decision_calls,
             template_id=output.selected_template_id,
             operation=str(output.operation),
+            cache_hit=output.cache_hit,
+            fit_score=plan.fit_score if plan is not None else None,
         )
 
     async def _call_and_parse(
