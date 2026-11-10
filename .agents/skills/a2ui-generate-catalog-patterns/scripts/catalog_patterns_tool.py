@@ -22,6 +22,7 @@ from collections.abc import Sequence
 import json
 from pathlib import Path
 import sys
+from typing import Literal
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -188,7 +189,7 @@ def _emit_report(
     out_path: Path | None,
 ) -> None:
     """Writes `report_dict` or `markdown_text` to `out_path` or `sys.stdout`."""
-    resolved_fmt = "json" if fmt == "json" else "markdown"
+    resolved_fmt: Literal["json", "markdown"] = "json" if fmt == "json" else "markdown"
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w", encoding="utf-8") as handle:

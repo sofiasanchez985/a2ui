@@ -41,6 +41,9 @@ def test_inspect_composable_design_system_catalog(tmp_path: Path) -> None:
     report = inspect_catalog.inspect_catalog(loaded)
 
     assert report.mode == "composable"
+    assert report.grammar_version == "1"
+    assert report.patterns_scaffold["catalogId"] == report.catalog_id
+    assert report.patterns_scaffold["grammarVersion"] == "1"
     assert report.page_candidates == ("Stack",)
     assert report.target_dir == str(ext_dir.resolve())
     assert report.recommended_files == (
@@ -114,8 +117,14 @@ def test_inspect_basic_catalog_and_markdown_roundtrip() -> None:
 
     md = inspect_catalog.report_to_markdown(report)
     assert "## Layout Grammar Block Candidates" in md
+    assert "## Patterns Scaffold (`patterns.json`)" in md
+    assert '"catalogId":' in md
+    assert '"grammarVersion": "1"' in md
     assert "None" not in md
 
     as_dict = inspect_catalog.report_to_dict(report)
+    assert as_dict["grammarVersion"] == "1"
+    assert as_dict["patternsScaffold"]["catalogId"] == report.catalog_id
+    assert as_dict["patternsScaffold"]["grammarVersion"] == "1"
     encoded = json.dumps(as_dict)
     assert json.loads(encoded)["mode"] == "composable"

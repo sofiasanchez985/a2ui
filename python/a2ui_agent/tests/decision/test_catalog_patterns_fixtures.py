@@ -73,7 +73,9 @@ def test_pattern_library_from_file_and_directory(tmp_path: Path) -> None:
     patterns_file = write_json(tmp_path, "patterns.json", DESIGN_SYSTEM_PATTERNS)
     lib_from_file = PatternLibrary.from_file(patterns_file)
     lib_from_dir = PatternLibrary.from_file(tmp_path)
+    assert lib_from_file.catalog_id == DESIGN_SYSTEM_CATALOG_ID
     assert lib_from_file.catalog_ids == (DESIGN_SYSTEM_CATALOG_ID,)
+    assert lib_from_file.grammar_version == "1"
     assert set(lib_from_file.patterns.keys()) == set(lib_from_dir.patterns.keys())
     assert lib_from_dir.has_pattern("collection", "rows")
 

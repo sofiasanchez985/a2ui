@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from a2ui.inference_formats.decision import (
+    ActionSpec,
     ArchetypeGrammar,
     CatalogDecisionGraph,
     PatternLibrary,
@@ -168,7 +169,7 @@ def test_hybrid_catalog_auto_discovers_both_sidecars(tmp_path: Path) -> None:
     hybrid_dir = tmp_path / "hybrid"
     cat_path = write_json(hybrid_dir, "catalog.json", hybrid_catalog_dict("1.0"))
     hybrid_patterns = copy.deepcopy(DESIGN_SYSTEM_PATTERNS)
-    hybrid_patterns["catalogIds"] = [HYBRID_CATALOG_ID]
+    hybrid_patterns["catalogId"] = HYBRID_CATALOG_ID
     write_json(hybrid_dir, "patterns.json", hybrid_patterns)
 
     hybrid_templates = {
@@ -207,16 +208,45 @@ def test_catalog_id_mismatch_and_synthetic_helpers(tmp_path: Path) -> None:
         tmp_path, "sample_payloads.json", DESIGN_SYSTEM_SAMPLE_PAYLOADS
     )
     loaded = _common.load_catalog(cat_path)
-    with pytest.raises(_common.ToolError, match="catalogIds"):
+    with pytest.raises(_common.ToolError, match="catalogId"):
         validate_patterns.validate_catalog_artifacts(
             loaded, payload_path=pay_path, patterns_path=pat_path
         )
 
+    bad_grammar_patterns = copy.deepcopy(DESIGN_SYSTEM_PATTERNS)
+    bad_grammar_patterns["grammarVersion"] = "99"
+    bad_grammar_path = write_json(
+        tmp_path, "bad_grammar_patterns.json", bad_grammar_patterns
+    )
+    design_cat_path = write_json(
+        tmp_path, "design_catalog.json", design_system_catalog_dict("1.0")
+    )
+    design_loaded = _common.load_catalog(design_cat_path)
+    with pytest.raises(_common.ToolError, match="grammarVersion"):
+        validate_patterns.validate_catalog_artifacts(
+            design_loaded,
+            payload_path=pay_path,
+            patterns_path=bad_grammar_path,
+        )
+
     grammar = ArchetypeGrammar.default()
+    action_specs = synthetic_bindings.synthetic_actions(grammar.blocks["actions"])
+    assert len(action_specs) == 2
+    assert all(isinstance(spec, ActionSpec) for spec in action_specs)
+    assert action_specs[0].id == "confirm"
+
+    item_action_specs = synthetic_bindings.synthetic_actions(
+        grammar.blocks["collection"]
+    )
+    assert len(item_action_specs) == 1
+    assert item_action_specs[0].scope == "/items"
+    assert item_action_specs[0].key == "id"
+
     coll_bindings = synthetic_bindings.synthetic_block_bindings(
         grammar.blocks["collection"]
     )
     assert "headline" in coll_bindings.slots["items"].fields
+    assert isinstance(coll_bindings.slots["items"].fields["action"].literal, ActionSpec)
 
     head_bindings = synthetic_bindings.synthetic_block_bindings(
         grammar.blocks["headline"]
@@ -260,3 +290,94 @@ def test_catalog_id_mismatch_and_synthetic_helpers(tmp_path: Path) -> None:
     assert validate_patterns._CRITERIA_PATTERN_RE.findall(
         "must match pattern:collection:grid2D"
     ) == [("collection", "grid2D")]
+
+
+def test_textfield_missing_value_produces_actionable_failure(
+    tmp_path: Path,
+) -> None:
+    basic_cat = REPO_ROOT / "catalogs" / "basic" / "v1" / "catalog.json"
+    basic_pat_path = REPO_ROOT / "catalogs" / "basic" / "v1" / "patterns.json"
+    basic_patterns = json.loads(basic_pat_path.read_text(encoding="utf-8"))
+
+    compose_comps = basic_patterns["patterns"]["compose"]["components"]
+    for comp in compose_comps:
+        if comp.get("id") == "compose_field":
+            del comp["value"]
+
+    broken_pat_file = write_json(tmp_path, "patterns.json", basic_patterns)
+    payload_file = write_json(
+        tmp_path, "sample_payloads.json", DESIGN_SYSTEM_SAMPLE_PAYLOADS
+    )
+
+    loaded = _common.load_catalog(basic_cat)
+    report = validate_patterns.validate_catalog_artifacts(
+        loaded,
+        payload_path=payload_file,
+        patterns_path=broken_pat_file,
+    )
+    assert report.ok is False
+    compose_failures = [f for f in report.failures if f.pattern == "compose"]
+    assert compose_failures
+    msg = compose_failures[0].message
+    assert "patterns.json" in msg
+    assert "pattern 'compose'" in msg
+    assert "compose_field" in msg
+    assert "TextField" in msg
+    assert "property 'value'" in msg
+    assert "'value' is a required property" in msg
+    assert "patterns_authoring_guide.md#component-schema-and-required-properties" in msg
+
+
+def test_event_and_action_context_directive_validation(tmp_path: Path) -> None:
+    cat_path = write_json(tmp_path, "catalog.json", design_system_catalog_dict("1.0"))
+    pay_path = write_json(
+        tmp_path, "sample_payloads.json", DESIGN_SYSTEM_SAMPLE_PAYLOADS
+    )
+    bad_patterns = copy.deepcopy(DESIGN_SYSTEM_PATTERNS)
+    bad_patterns["patterns"]["actions"]["components"][1]["onPress"] = {
+        "$event": "label",
+    }
+    bad_pat_path = write_json(tmp_path, "patterns.json", bad_patterns)
+
+    loaded = _common.load_catalog(cat_path)
+    report = validate_patterns.validate_catalog_artifacts(
+        loaded, payload_path=pay_path, patterns_path=bad_pat_path
+    )
+    assert report.ok is False
+    action_lint = [
+        f for f in report.failures if f.pattern == "actions" and f.stage == "lint"
+    ]
+    assert action_lint
+    msg = action_lint[0].message
+    assert "patterns.json" in msg
+    assert "pattern 'actions'" in msg
+    assert "action_trigger" in msg
+    assert "property 'onPress'" in msg
+    assert "$event must bind an action slot" in msg
+    assert "patterns_authoring_guide.md#action-events-and-action-context" in msg
+
+    legacy_item_patterns = copy.deepcopy(DESIGN_SYSTEM_PATTERNS)
+    legacy_item_patterns["patterns"]["actions"]["components"][1]["onPress"] = {
+        "$event": "action",
+        "context": {"id": "$item"},
+    }
+    legacy_item_path = write_json(
+        tmp_path, "legacy_item_patterns.json", legacy_item_patterns
+    )
+    legacy_report = validate_patterns.validate_catalog_artifacts(
+        loaded, payload_path=pay_path, patterns_path=legacy_item_path
+    )
+    assert legacy_report.ok is False
+    ctx_lint = [
+        f
+        for f in legacy_report.failures
+        if f.pattern == "actions" and f.stage == "lint"
+    ]
+    assert ctx_lint
+    ctx_msg = ctx_lint[0].message
+    assert "legacy_item_patterns.json" in ctx_msg
+    assert "pattern 'actions'" in ctx_msg
+    assert "action_trigger" in ctx_msg
+    assert "property 'onPress.context'" in ctx_msg
+    assert "$actionContext" in ctx_msg
+    assert "patterns_authoring_guide.md#action-events-and-action-context" in ctx_msg
