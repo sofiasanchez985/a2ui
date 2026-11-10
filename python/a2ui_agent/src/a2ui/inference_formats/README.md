@@ -8,38 +8,40 @@ An inference format defines how an agent emits UI definitions. A2UI supports bot
 
 ## The Decision Synthesis Route
 
-The `decision` route separates data generation from interface design. It supports two primary execution workflows: tool mode and chat mode.
+The `decision` route separates data from interface design: the agent supplies an intent and the data, and a decision model chooses a layout from the catalog's patterns. The format is experimental and supports protocol v1.0 only. It runs in tool mode or chat mode.
+
+Every entry point takes an explicit decision backend. `create_decision_backend()` builds one from the environment and raises `ValueError` when `A2UI_DECISION_BACKEND` is unset.
 
 ### 1. Tool Mode (Direct Synthesis)
 
-Tool mode is the most efficient way to render user interfaces in A2UI. In this flow, an agent calls standard domain tools (such as fetching server telemetry, retrieving catalog items, or getting a transfer quote). Instead of prompting a language model to author UI code from that tool output, the data passes directly to `DecisionRenderTool` or `DecisionSynthesizer.synthesize`.
+In tool mode, an agent calls its normal domain tools, and their output goes straight to `DecisionRenderTool` or `DecisionSynthesizer.synthesize`. The language model never writes UI.
 
 ```python
-from a2ui.inference_formats.decision import DecisionRenderTool
+from a2ui.inference_formats.decision import (
+    DecisionRenderTool,
+    create_decision_backend,
+)
 
-# Provide the tool to your agent framework (e.g. ADK):
-render_tool = DecisionRenderTool.create(catalogs)
+render_tool = DecisionRenderTool.create(catalogs, backend=create_decision_backend())
 
-# When an ADK tool produces data, render it directly:
 result = render_tool.run_sync({
     "intent": "Show host health status",
     "payload": {"host": "prod-01", "cpu": 0.94, "status": "critical"},
-    "mutablePaths": ["/status"],
+    "actions": {"restart_host": {"label": "Restart", "style": "destructive"}},
 })
 ```
 
-Key benefits of tool mode:
+### 2. Chat Mode (Decision Blocks)
 
-- **Zero UI model calls**: The language model only executes its normal function calling step.
-- **Fast execution**: Layout planning and expansion complete in 15 to 40 ms on local CPUs.
-- **Guaranteed schema validity**: Surfaces expand through validated catalog patterns without syntax errors or broken tags.
+In chat mode, the language model writes a decision block inside `<a2ui>` tags and `DecisionParser` renders it. A block has these fields:
 
-### 2. Chat Mode (Two-Stage Synthesis)
-
-In open-ended conversation where no domain tool exists, the agent operates in two stages:
-
-1. **Stage 1**: The language model converts the user's conversational request into a structured `DecisionBlock` containing `intent`, `payload`, and optional copy fields (`title`, `summary`) or layout hints (`layout: ["role:key,key", ...]`).
-2. **Stage 2**: The decision model scores layout families and archetypes, assigns payload pointers, and expands catalog components without making a second language model call.
+- `intent` and `payload` (required).
+- `surfaceId`: a new id creates a surface; reusing an id updates that surface in place.
+- `replace`: when `true`, the surface is deleted and created again.
+- `actions`: a map from action id to a label or an options object (`label`, `scope`, `key`, `context`, `style`). The id is the event name the agent receives.
+- `exclude`: payload pointers the surface must not show.
+- `mutablePaths`: payload pointers the user may edit. Forms and settings must list them.
+- `layout`, `title`, `summary`, and `fallbackDsl`.
 
 ```python
 from a2ui.inference_formats.decision import DecisionBlock, DecisionSynthesizer
@@ -48,29 +50,27 @@ block = DecisionBlock(
     intent="Show stock portfolio overview",
     payload={"portfolio": "Growth", "totalValue": 128450.0},
     title="Portfolio Summary",
-    summary="Daily portfolio valuation and holdings.",
 )
 output = await synthesizer.synthesize(
-    block.intent,
-    block.payload,
-    surface_id="turn-1",
-    title=block.title,
-    summary=block.summary,
+    block.intent, block.payload, **block.to_synthesis_kwargs(default_surface_id="turn-1")
 )
 ```
 
-### 3. Variety and Zero-Cost Remix
+### 3. How a Surface Is Planned
 
-The archetype grammar supports exploration and layout variation:
+Each surface takes one `answer()` call to the backend (two for backends that declare `capabilities.two_stage`). When a registered template matches the payload, the batch includes a template question, and a confident answer renders that template. Otherwise the planner picks a layout archetype and expands its blocks from the catalog's patterns.
 
-- **Variety Mode (`VarietyMode.NEAR_TOP`)**: Configured via `SynthesisConfig(variety=VarietyMode.NEAR_TOP, variety_margin=0.15)`. Options within the probability margin of the top candidate are sampled with a random seed rather than strictly choosing the argmax.
-- **Zero-Cost Remix**: Call `synthesizer.remix(intent, payload, answers, seed=42)` using the recorded `output.decision_answers`. This re-samples layout choices instantly with zero model calls and zero decision backend queries.
+When the model abstains, the synthesizer tries, in order, the block's `fallbackDsl`, the host's `fallback_fn`, and one `facts` pattern rendering of the payload. If none applies, it raises `A2uiCompilationError`. `SynthesisOutput.fallback_source` and `fallback_reason` record what happened. A backend timeout or transport failure raises `DecisionBackendError` and no fallback runs.
 
-### 4. Custom Catalogs (`patterns.json` and `templates.json`)
+### 4. Surfaces Across Turns
+
+`DecisionParser` reads the `RendererState` before synthesis. A block for a surface the client already shows replaces the surface root in place (`updateComponents` with stable per-block component ids, plus `updateDataModel`), and `replace: true` sends `deleteSurface` before creating it again. An update whose actions need `sendDataModel` on a surface created without it becomes a replace. Without a bound state, `DecisionFormat.create_parser(conversation_id=...)` keeps one state per conversation.
+
+### 5. Custom Catalogs (`patterns.json` and `templates.json`)
+
+Custom catalogs can ship `patterns.json` and `templates.json` alongside `catalog.json`. A `patterns.json` names one `catalogId` and the `grammarVersion` it was written for. A catalog with templates but no patterns can still render through the template question.
 
 To onboard any custom `catalog.json` (in this repository or an external repository) to the decision synthesis route, use the [a2ui-generate-catalog-patterns](../../../../../.agents/skills/a2ui-generate-catalog-patterns/SKILL.md) skill and its helper CLI (`catalog_patterns_tool.py`). Depending on whether the catalog provides composable containers, fixed domain surfaces, or both, the skill generates and validates `patterns.json`, `templates.json`, and `sample_payloads.json` alongside `catalog.json`.
-
-Load those sidecars directly from the catalog directory at runtime:
 
 ```python
 import json
@@ -86,41 +86,37 @@ from a2ui.inference_formats.decision import (
 
 catalog_dir = Path("/path/to/custom_catalog")
 catalog = Catalog.from_json(json.loads((catalog_dir / "catalog.json").read_text()))
-graph = CatalogDecisionGraph([catalog])
-
-pattern_lib = MergedPatternLibrary([PatternLibrary.from_file(catalog_dir)])
-template_registry = TemplateRegistry.from_file(catalog_dir)
 
 synthesizer = DecisionSynthesizer(
-    graph,
+    CatalogDecisionGraph([catalog]),
     backend,
-    registry=template_registry,
-    patterns=pattern_lib,
+    registry=TemplateRegistry.from_file(catalog_dir),
+    patterns=MergedPatternLibrary([PatternLibrary.from_file(catalog_dir)]),
 )
 ```
 
 ## Backend Configuration
 
-The decision model backend is selected through `A2UI_DECISION_BACKEND` or configured directly in code:
-
-| Backend     | Setup                                                               | Characteristics                                          |
-| :---------- | :------------------------------------------------------------------ | :------------------------------------------------------- |
-| `systemone` | Set `A2UI_DECISION_URL` and `JEV_API_KEY` (or `A2UI_DECISION_AUTH`) | Hosted or local `/v1/systemone` decision API over HTTP.  |
-| `jev`       | Set `A2UI_DECISION_URL` and `JEV_API_KEY` (or `A2UI_DECISION_AUTH`) | Remote TypeSafe Jev `/predict` or `/v1/systemone` HTTP.  |
-| `step0`     | Set `A2UI_DECISION_URL`                                             | Remote step-zero logprob scorer over HTTP (`gev` alias). |
-| `mock`      | Default offline fallback                                            | Deterministic keyword-based heuristic for tests.         |
+| Backend     | Setup                                                               | Characteristics                                         |
+| :---------- | :------------------------------------------------------------------ | :------------------------------------------------------ |
+| `systemone` | Set `A2UI_DECISION_URL` and `JEV_API_KEY` (or `A2UI_DECISION_AUTH`) | Hosted or local `/v1/systemone` decision API over HTTP. |
+| `jev`       | Set `JEV_API_KEY` or `TYPESAFE_API_KEY`, or `A2UI_DECISION_URL`     | TypeSafe Jev, pinned to `jev-v0` by default.            |
+| `step0`     | Set `A2UI_DECISION_URL`                                             | Step-zero logprob scorer; asks questions in two stages. |
+| `mock`      | Set `A2UI_DECISION_BACKEND=mock`                                    | Deterministic offline backend for tests.                |
 
 ### Environment Variables
 
-- `A2UI_DECISION_BACKEND`: `systemone`, `jev`, `step0`, or `mock`.
-- `A2UI_DECISION_TEMPERATURE`: Temperature scaling parameter applied to logits before computing softmax probabilities (defaults to 1.0).
+- `A2UI_DECISION_BACKEND`: `systemone`, `jev`, `step0`, or `mock`. Required unless a backend is passed in code.
 - `A2UI_DECISION_URL`: Endpoint URL for remote HTTP backends.
-- `A2UI_DECISION_AUTH` / `A2UI_DECISION_TOKEN` / `JEV_API_KEY` / `TYPESAFE_API_KEY`: Authentication token for remote backends.
+- `A2UI_DECISION_MODEL` / `JEV_MODEL`: Model id overrides.
+- `A2UI_DECISION_AUTH` / `A2UI_DECISION_TOKEN` / `JEV_API_KEY` / `TYPESAFE_API_KEY`: Authentication for remote backends.
+
+Each backend applies a per-model `Calibration` (temperature scaling) from a bundled profile, or from a file passed as `calibration=`. HTTP requests time out after 30 seconds unless `timeout_seconds` says otherwise.
 
 ### Operational Notes
 
-- **Payload Privacy**: When using remote HTTP backends (`systemone`, `jev`, `step0`), question prompts and shared context include pointer paths, humanized labels, and sample scalar values from the payload so the decision model can score instance questions (such as form control types and tone). Do not pass unredacted secrets in payload fields sent to third-party endpoints.
-- **Payload Size and Planning Scale**: The layout planner caps speculative batch size via `SynthesisConfig.max_pairs` (default 150) and unrolled array items via `max_children_per_container` (default 25). For payloads with hundreds of nested keys, filter or project the payload to surface-relevant fields before synthesis.
+- **Payload Privacy**: Remote backends receive pointer paths, labels, and sample scalar values from the payload. Use `exclude` or filter the payload before sending secrets to a third-party endpoint.
+- **Payload Size**: The planner caps a batch at `SynthesisConfig.max_pairs` (question and option pairs, default 400). For payloads with hundreds of keys, pass only the fields the surface needs.
 
 ## Catalog-Agnostic Prompt Generation Rules
 

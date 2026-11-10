@@ -12,44 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Post-expansion component lint for archetype-planned A2UI surfaces."""
+"""Post-expansion and plan-level lint for archetype-planned A2UI surfaces."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-import re
 from typing import Any
 
 from a2ui.core import A2uiValidationError
 
-from .models import LayoutPlan, _WireEnum
+from .models import LayoutPlan, PlannedBlock, SlotBinding, _WireEnum
 
-_HEADING_PREFIX_RE = re.compile(r"^(#{1,6})\s")
-_HEADING_VARIANT_LEVELS: dict[str, int] = {
-    "h1": 1,
-    "h2": 2,
-    "h3": 3,
-    "h4": 4,
-    "h5": 5,
-    "h6": 6,
-}
-_CONTAINER_TYPES: frozenset[str] = frozenset(
-    {"Row", "Column", "Card", "List", "Modal", "Tabs"}
-)
 _LABEL_PROPERTIES: frozenset[str] = frozenset(
     {"label", "accessibility", "checks", "action", "description"}
 )
+_META_PROPERTIES: frozenset[str] = frozenset({
+    "id",
+    "component",
+    "catalogId",
+    "variant",
+    "checks",
+    "accessibility",
+    "metadata",
+    "action",
+})
 
 
 class LintCode(_WireEnum):
-    """Structural rule a `LintFinding` reports against."""
+    """Rule a `LintFinding` reports against."""
 
     EMPTY_CONTAINER = "empty_container"
     MISSING_COMPONENT = "missing_component"
     MULTIPLE_PRIMARY_BUTTONS = "multiple_primary_buttons"
     DUPLICATE_POINTER_BINDING = "duplicate_pointer_binding"
-    HEADING_AFTER_BODY = "heading_after_body"
+    EMPTY_AUTHORED_TEXT = "empty_authored_text"
     MULTIPLE_REELS = "multiple_reels"
 
 
@@ -74,96 +71,104 @@ class LintFinding:
         object.__setattr__(self, "severity", LintSeverity(self.severity))
 
 
-def _unpack_component(
-    comp: Mapping[str, Any],
-) -> tuple[str, str, Mapping[str, Any]]:
-    """Extracts ``(id, component_type, properties)`` from v0.9 or v1.0 component dicts."""
-    comp_id = str(comp.get("id", ""))
-    raw_type = comp.get("component")
-    if isinstance(raw_type, str):
-        return comp_id, raw_type, comp
-    if isinstance(raw_type, Mapping) and len(raw_type) == 1:
-        comp_type, props = next(iter(raw_type.items()))
-        if isinstance(props, Mapping):
-            return comp_id, str(comp_type), props
-    return comp_id, "", comp
+def _mapping_has_known_id(mapping: Mapping[str, Any], known_ids: set[str]) -> bool:
+    """Returns whether any string value in `mapping` names an ID in `known_ids`."""
+    return any(isinstance(v, str) and v in known_ids for v in mapping.values())
 
 
-def _non_empty_strings(items: Any) -> list[str]:
-    """Returns non-empty string elements from a sequence, or an empty list."""
-    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
-        return []
-    return [item for item in items if isinstance(item, str) and item]
+def _value_looks_like_child_slot(val: Any, known_ids: set[str]) -> bool:
+    """Returns whether `val` carries a component ID reference or template child list."""
+    if isinstance(val, str):
+        return val in known_ids
+    if isinstance(val, Mapping):
+        return "componentId" in val
+    if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
+        return any(
+            (isinstance(el, str) and el in known_ids)
+            or (isinstance(el, Mapping) and _mapping_has_known_id(el, known_ids))
+            for el in val
+        )
+    return False
 
 
-def _template_target_id(mapping: Mapping[str, Any]) -> str:
-    """Extracts a template `componentId` or `component` from a `children` mapping."""
-    template = mapping.get("template")
-    source = template if isinstance(template, Mapping) else mapping
-    target = source.get("componentId") or source.get("component")
-    return str(target) if isinstance(target, str) else ""
+def _infer_child_slot_keys(
+    components: Sequence[Mapping[str, Any]], known_ids: set[str]
+) -> frozenset[str]:
+    """Infers child-slot property names by scanning component ID references."""
+    return frozenset(
+        k
+        for comp in components
+        for k, val in comp.items()
+        if k not in _META_PROPERTIES and _value_looks_like_child_slot(val, known_ids)
+    )
 
 
-def _extract_child_list_ids(children: Any) -> tuple[list[str], bool]:
-    """Returns ``(referenced_ids, has_any_child_slot)`` from a ``children`` value."""
-    direct = _non_empty_strings(children)
-    if direct:
-        return direct, True
-    if not isinstance(children, Mapping):
-        return [], False
-    if "explicitList" in children:
-        explicit = _non_empty_strings(children.get("explicitList"))
-        return explicit, bool(explicit)
-    target = _template_target_id(children)
-    return ([target] if target else []), bool(target)
-
-
-def _tab_child_ids(tab_items: Any) -> list[str]:
-    """Extracts child IDs from a `Tabs.tabItems` sequence."""
-    if not isinstance(tab_items, Sequence) or isinstance(tab_items, (str, bytes)):
-        return []
-    return [
-        str(tab["child"])
-        for tab in tab_items
-        if isinstance(tab, Mapping)
-        and isinstance(tab.get("child"), str)
-        and tab["child"]
-    ]
-
-
-def _referenced_child_ids(
-    comp_type: str, props: Mapping[str, Any]
+def _sequence_slot_refs(
+    items: Sequence[Any], known_ids: set[str]
 ) -> tuple[list[str], bool]:
-    """Returns ``(referenced_ids, is_non_empty)`` for a component's child slots."""
-    refs = [
-        str(props[key])
-        for key in ("child", "entryPointChild", "contentChild")
-        if isinstance(props.get(key), str) and props.get(key)
-    ]
-    refs.extend(_tab_child_ids(props.get("tabItems")))
-    list_ids, has_children = _extract_child_list_ids(props.get("children"))
-    refs.extend(list_ids)
-    if comp_type in {"Row", "Column", "List"}:
-        return refs, has_children
-    if comp_type in {"Card", "Tabs", "Modal"}:
-        return refs, bool(refs)
-    return refs, True
+    """Extracts child IDs and emptiness from a sequence child slot."""
+    if not items:
+        return [], True
+    refs: list[str] = []
+    for el in items:
+        if isinstance(el, str) and el:
+            refs.append(el)
+        elif isinstance(el, Mapping):
+            refs.extend(v for v in el.values() if isinstance(v, str) and v in known_ids)
+    return refs, not refs
+
+
+def _slot_value_refs(val: Any, known_ids: set[str]) -> tuple[list[str], bool]:
+    """Returns ``(referenced_ids, is_empty)`` for one child-slot value."""
+    if isinstance(val, str):
+        return ([val], False) if val else ([], True)
+    if isinstance(val, Mapping):
+        target = val.get("componentId")
+        if isinstance(target, str) and target:
+            return [target], False
+        return [], True
+    if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
+        return _sequence_slot_refs(val, known_ids)
+    return [], False
+
+
+def _component_child_refs(
+    comp: Mapping[str, Any],
+    slot_keys: frozenset[str],
+    known_ids: set[str],
+) -> tuple[list[str], bool]:
+    """Returns ``(referenced_ids, has_empty_slot)`` across `slot_keys` on `comp`."""
+    refs: list[str] = []
+    empty = False
+    for key in slot_keys:
+        if key not in comp:
+            continue
+        sub_refs, sub_empty = _slot_value_refs(comp[key], known_ids)
+        refs.extend(sub_refs)
+        empty = empty or sub_empty
+    return refs, empty
 
 
 def _check_containers_and_references(
     components: Sequence[Mapping[str, Any]],
+    child_slot_keys: Collection[str] | None = None,
 ) -> list[LintFinding]:
-    """Checks that no container is empty and every referenced child ID exists."""
+    """Checks that no child-bearing slot is empty and every referenced ID exists."""
     known_ids = {str(c.get("id", "")) for c in components if c.get("id")}
+    slot_keys = (
+        frozenset(child_slot_keys)
+        if child_slot_keys is not None
+        else _infer_child_slot_keys(components, known_ids)
+    )
     findings: list[LintFinding] = []
     for comp in components:
-        comp_id, comp_type, props = _unpack_component(comp)
-        refs, non_empty = _referenced_child_ids(comp_type, props)
-        if comp_type in _CONTAINER_TYPES and not non_empty:
+        comp_id = str(comp.get("id", ""))
+        refs, is_empty = _component_child_refs(comp, slot_keys, known_ids)
+        if is_empty:
             findings.append(
                 LintFinding(
                     code=LintCode.EMPTY_CONTAINER,
-                    message=f"Container {comp_id!r} ({comp_type}) has zero children.",
+                    message=f"Container {comp_id!r} has zero children.",
                     component_id=comp_id or None,
                 )
             )
@@ -181,37 +186,71 @@ def _check_containers_and_references(
     return findings
 
 
-def _check_primary_buttons(
-    components: Sequence[Mapping[str, Any]],
-) -> list[LintFinding]:
-    """Checks that at most one Button has ``variant: primary``."""
+def _plan_primary_actions_in_block(block: PlannedBlock) -> list[str]:
+    """Returns primary action identifiers configured on `block`."""
+    buttons = block.bindings.get("buttons")
+    if buttons is None or not buttons.items:
+        return []
     primaries: list[str] = []
-    for comp in components:
-        comp_id, comp_type, props = _unpack_component(comp)
-        if comp_type == "Button" and props.get("variant") == "primary":
-            primaries.append(comp_id)
+    for idx, item in enumerate(buttons.items):
+        act_slot = item.get("action")
+        lbl_slot = item.get("label")
+        act_id = (
+            str(act_slot.literal)
+            if act_slot is not None and act_slot.literal is not None
+            else ""
+        )
+        lbl = (
+            str(lbl_slot.literal)
+            if lbl_slot is not None and lbl_slot.literal is not None
+            else ""
+        )
+        inst = (
+            block.instances.get(str(idx))
+            or block.instances.get(act_id)
+            or block.instances.get(lbl)
+            or {}
+        )
+        if inst.get("primary") == "true":
+            primaries.append(act_id or lbl or f"{block.block_id}_{idx}")
+    return primaries
+
+
+def _check_primary_actions(
+    components: Sequence[Mapping[str, Any]],
+    plan: LayoutPlan | None,
+) -> list[LintFinding]:
+    """Checks that at most one primary action exists on the surface."""
+    primaries: list[str] = []
+    if plan is not None:
+        for block in plan.blocks:
+            primaries.extend(_plan_primary_actions_in_block(block))
+    if not primaries:
+        primaries = [
+            str(c.get("id", ""))
+            for c in components
+            if "action" in c and c.get("variant") == "primary"
+        ]
     if len(primaries) <= 1:
         return []
     return [
         LintFinding(
             code=LintCode.MULTIPLE_PRIMARY_BUTTONS,
             message=(
-                f"Button {comp_id!r} is an extra primary button; at most one"
-                f" primary button is allowed (found {primaries})."
+                f"Action {target!r} is an extra primary action; at most one"
+                f" primary action is allowed on a surface (found {primaries})."
             ),
-            component_id=comp_id or None,
+            component_id=target or None,
         )
-        for comp_id in primaries[1:]
+        for target in primaries[1:]
     ]
 
 
-def _extract_direct_pointer(
-    node: Mapping[str, Any],
-) -> tuple[bool, str | None]:
-    """Checks for a function call or direct ``path``/``@path`` binding on `node`."""
-    if "call" in node or "@call" in node:
+def _extract_direct_pointer(node: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Checks for a function call or direct ``@path`` binding on `node`."""
+    if "@call" in node:
         return True, None
-    path = node.get("path") or node.get("@path")
+    path = node.get("@path")
     if isinstance(path, str) and path.startswith("/"):
         return True, path
     return False, None
@@ -235,10 +274,10 @@ def _collect_value_pointers(node: Any) -> list[str]:
     return []
 
 
-def _component_value_pointers(props: Mapping[str, Any]) -> list[str]:
+def _component_value_pointers(comp: Mapping[str, Any]) -> list[str]:
     """Returns non-label data-binding pointers bound on a single component."""
     pointers: list[str] = []
-    for key, val in props.items():
+    for key, val in comp.items():
         if key in {"id", "component", "children"} or key in _LABEL_PROPERTIES:
             continue
         pointers.extend(_collect_value_pointers(val))
@@ -252,8 +291,8 @@ def _check_duplicate_pointers(
     seen: dict[str, str] = {}
     findings: list[LintFinding] = []
     for comp in components:
-        comp_id, _, props = _unpack_component(comp)
-        for pointer in _component_value_pointers(props):
+        comp_id = str(comp.get("id", ""))
+        for pointer in _component_value_pointers(comp):
             first_id = seen.get(pointer)
             if first_id is not None and first_id != comp_id:
                 findings.append(
@@ -271,104 +310,46 @@ def _check_duplicate_pointers(
     return findings
 
 
-def _text_heading_level(props: Mapping[str, Any]) -> int | None:
-    """Returns the heading level (1..6) of a Text component, or None for body text."""
-    variant = str(props.get("variant", ""))
-    if variant in _HEADING_VARIANT_LEVELS:
-        return _HEADING_VARIANT_LEVELS[variant]
-    text_val = props.get("text")
-    raw_str = ""
-    if isinstance(text_val, str):
-        raw_str = text_val
-    elif isinstance(text_val, Mapping):
-        literal = text_val.get("literalString") or text_val.get("$text")
-        if isinstance(literal, str):
-            raw_str = literal
-        else:
-            args = text_val.get("args")
-            if isinstance(args, Mapping) and isinstance(args.get("value"), str):
-                raw_str = args["value"]
-    match = _HEADING_PREFIX_RE.match(raw_str.lstrip())
-    if match is not None:
-        return len(match.group(1))
-    return None
+def _iter_slot_bindings(
+    owner: str, slots: Mapping[str, SlotBinding]
+) -> Iterator[tuple[str, SlotBinding]]:
+    """Yields ``(location, binding)`` across `slots` and repeated `items`."""
+    for slot_name, binding in slots.items():
+        yield f"{owner}.{slot_name}", binding
+        for idx, item in enumerate(binding.items):
+            yield from _iter_slot_bindings(f"{owner}.{slot_name}[{idx}]", item)
 
 
-def _match_block_suffix(comp_id: str, block_id: str) -> str | None:
-    """Returns the suffix after `block_id_` in `comp_id`, or `None`."""
-    prefix = f"{block_id}_"
-    if comp_id.startswith(prefix):
-        return comp_id[len(prefix) :]
-    if f"_{prefix}" in comp_id:
-        return comp_id.split(f"_{prefix}", 1)[1]
-    return None
+def _check_authored_text(plan: LayoutPlan | None) -> list[LintFinding]:
+    """Checks that authored literal text bindings on `plan` are non-empty."""
+    if plan is None:
+        return []
+    pairs: list[tuple[str, SlotBinding]] = [
+        ("page.title", plan.page.title),
+        ("page.subtitle", plan.page.subtitle),
+    ]
+    for block in plan.blocks:
+        pairs.extend(_iter_slot_bindings(block.block_id, block.bindings.slots))
+    return [
+        LintFinding(
+            code=LintCode.EMPTY_AUTHORED_TEXT,
+            message=f"Authored text at {loc!r} must not be empty or whitespace.",
+            component_id=loc.split(".", 1)[0],
+        )
+        for loc, binding in pairs
+        if isinstance(binding.literal, str) and not binding.literal.strip()
+    ]
 
 
-def _block_group_for_id(comp_id: str, block_ids: Sequence[str]) -> str:
-    """Maps a component id to its owning block (or unrolled item) group."""
-    for block_id in block_ids:
-        if comp_id == block_id:
-            return block_id
-        rest = _match_block_suffix(comp_id, block_id)
-        if rest is not None:
-            head = rest.split("_", 1)[0]
-            return f"{block_id}_{head}" if head.isdigit() else block_id
-    return "_surface"
-
-
-def _check_heading_order(
-    components: Sequence[Mapping[str, Any]],
-    plan: LayoutPlan | None,
-) -> list[LintFinding]:
-    """Checks that headings precede body copy and do not invert levels within a block."""
-    block_ids = plan.block_ids() if plan is not None else ()
-    seen_body: dict[str, bool] = {}
-    deepest_heading: dict[str, int] = {}
-    findings: list[LintFinding] = []
-    for comp in components:
-        comp_id, comp_type, props = _unpack_component(comp)
-        if comp_type != "Text":
-            continue
-        group = _block_group_for_id(comp_id, block_ids)
-        level = _text_heading_level(props)
-        if level is None:
-            if props.get("variant") != "caption":
-                seen_body[group] = True
-            continue
-        prev_level = deepest_heading.get(group)
-        if seen_body.get(group, False) or (
-            prev_level is not None and level < prev_level
-        ):
-            findings.append(
-                LintFinding(
-                    code=LintCode.HEADING_AFTER_BODY,
-                    message=(
-                        f"Heading {comp_id!r} (h{level}) appears after body copy"
-                        f" or a deeper heading in block {group!r}."
-                    ),
-                    component_id=comp_id or None,
-                )
-            )
-        deepest_heading[group] = max(prev_level or level, level)
-    return findings
-
-
-def _check_single_reel(
-    components: Sequence[Mapping[str, Any]],
-    plan: LayoutPlan | None,
-) -> list[LintFinding]:
-    """Checks that at most one horizontal reel exists on the surface."""
-    reel_ids: list[str] = []
-    for comp in components:
-        comp_id, comp_type, props = _unpack_component(comp)
-        if comp_type == "List" and props.get("direction") == "horizontal":
-            reel_ids.append(comp_id)
-    if not reel_ids and plan is not None:
-        reel_ids = [
-            b.block_id
-            for b in plan.blocks
-            if b.variant_knobs.get("layout") == "reel" or b.pattern == "reel"
-        ]
+def _check_single_reel(plan: LayoutPlan | None) -> list[LintFinding]:
+    """Checks that at most one horizontal reel block exists in `plan`."""
+    if plan is None:
+        return []
+    reel_ids = [
+        b.block_id
+        for b in plan.blocks
+        if b.variant_knobs.get("layout") == "reel" or b.pattern == "reel"
+    ]
     if len(reel_ids) <= 1:
         return []
     return [
@@ -378,9 +359,9 @@ def _check_single_reel(
                 f"Surface has multiple horizontal reels ({reel_ids}); at most"
                 " one reel is allowed."
             ),
-            component_id=comp_id or None,
+            component_id=block_id,
         )
-        for comp_id in reel_ids[1:]
+        for block_id in reel_ids[1:]
     ]
 
 
@@ -389,14 +370,18 @@ def lint_components(
     plan: LayoutPlan | None = None,
     *,
     raise_on_error: bool = False,
+    child_slot_keys: Collection[str] | None = None,
 ) -> tuple[LintFinding, ...]:
-    """Runs post-expansion layout lint checks over `components`.
+    """Runs structural and plan-level layout lint checks.
 
     Args:
-        components: Expanded A2UI component dicts (v0.9 or v1.0 wire shape).
-        plan: Optional `LayoutPlan` providing block grouping and knob context.
+        components: Expanded A2UI v1.0 component dicts.
+        plan: Optional `LayoutPlan` providing block bindings, instances, and knobs.
         raise_on_error: When True, raises `A2uiValidationError` if any finding
             has `LintSeverity.ERROR`.
+        child_slot_keys: Optional collection of child-slot property names from
+            `CatalogDecisionGraph`. When None, child slots are inferred by
+            scanning component ID references and template child-list mappings.
 
     Returns:
         A tuple of `LintFinding` objects (empty when clean).
@@ -406,11 +391,11 @@ def lint_components(
             `LintSeverity.ERROR`.
     """
     findings: list[LintFinding] = []
-    findings.extend(_check_containers_and_references(components))
-    findings.extend(_check_primary_buttons(components))
+    findings.extend(_check_containers_and_references(components, child_slot_keys))
+    findings.extend(_check_primary_actions(components, plan))
     findings.extend(_check_duplicate_pointers(components))
-    findings.extend(_check_heading_order(components, plan))
-    findings.extend(_check_single_reel(components, plan))
+    findings.extend(_check_authored_text(plan))
+    findings.extend(_check_single_reel(plan))
     if raise_on_error:
         errors = [f for f in findings if f.severity is LintSeverity.ERROR]
         if errors:

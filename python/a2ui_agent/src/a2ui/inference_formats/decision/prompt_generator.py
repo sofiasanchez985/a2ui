@@ -26,15 +26,13 @@ from typing import Any
 
 from a2ui.constants import A2UI_INFERENCE_CLOSE_TAG, A2UI_INFERENCE_OPEN_TAG
 from a2ui.core import CatalogApi
-from a2ui.core.schema import AgentToRendererMessage
 from a2ui.inference_formats._shared import check_mixed_catalogs
 from a2ui.prompt import PromptGenerator
 
 from .archetypes import ArchetypeGrammar
 from .catalog_graph import CatalogDecisionGraph
-from .decision_block import DecisionBlock, decision_block_from_messages
+from .decision_block import DecisionBlock
 from .models import MAX_BRIEF_SECTIONS
-from .template_registry import TemplateRegistry
 
 DECISION_RULES_TEMPLATE = f"""# A2UI Decision Block Output Contract
 
@@ -57,40 +55,54 @@ one JSON object (or a JSON array of such objects, one per surface).
    JSON primitives, objects, and arrays. Store actual field values under each
    key (for example `"email": "alex@example.com", "password": "", "rememberMe": false`),
    not `*Label` or `*Placeholder` keys; field labels are humanized from the key
-   names, and action buttons come from an `actions` array of button labels
-   (for example `"actions": ["Sign In"]`). If you pass an array, it is stored
-   under the `items` key, so bindings read `/items/0/...`.
+   names. Do not put action buttons in `payload`; declare them in the block's
+   `actions` field. If you pass an array, it is stored under the `items` key,
+   so bindings read `/items/0/...`.
 
-3. `surfaceId` (optional, string): The surface to create or update. Reuse an
-   id to replace an earlier surface.
+3. `surfaceId` (optional, string): The surface to render into. A new id creates a surface. Reusing an id updates that surface in place: the new layout replaces the old one, and parts that did not change keep their state. To start the surface over, also set `"replace": true`; the old surface is deleted and a new one is created.
 
-4. `template` (optional, string): The id of a registered surface template to
-   render directly, when one listed below matches.
+4. `replace` (optional, boolean): When `true` on an existing `surfaceId`,
+   deletes the old surface and creates a new one instead of updating it in
+   place. Defaults to `false`.
 
-5. `fallbackDsl` (optional, string): A2UI Express source rendered if the
-   decision model is not confident enough to choose components.
+5. `actions` (optional, object): A map from action id (in display order) to a
+   button label string or an options object; the action id is the event name
+   sent back when the user triggers the action. Example:
+   `{{{{"sign_in": "Sign In", "create_account": "Create account"}}}}`. When an
+   action needs extra options, map its id to an object with required `"label"`
+   and optional `"scope"` (JSON pointer of the collection the action repeats
+   over, such as `"/orders"`), `"key"` (item identity field within `scope`,
+   defaulting to `"id"`), `"context"` (object mapping context names to JSON
+   pointers), and `"style"` (`"primary"`, `"secondary"`, or `"destructive"`).
+   Example: `{{{{"cancel_order": {{{{"label": "Cancel", "scope": "/orders", "style": "destructive"}}}}}}}}`.
 
-6. `layout` (optional, array of up to {MAX_BRIEF_SECTIONS} strings): An ordered
+6. `exclude` (optional, array of strings): JSON pointers starting with `"/"`
+   (for example `["/internalId", "/auth/token"]`) in `payload` that the surface
+   must not display.
+
+7. `mutablePaths` (optional, array of strings): JSON pointers (for example `["/email", "/password", "/rememberMe"]`) for fields in `payload` that the user edits. Required for any form or settings surface: forms and settings must list their editable pointers here, or those fields render as read-only display.
+
+8. `layout` (optional, array of up to {MAX_BRIEF_SECTIONS} strings): An ordered
    layout brief grouping payload keys by role, each formatted as
    `"<role>:<key>,<key>"` (keys may be bare top-level names or `/`-prefixed
    JSON pointers; no nested sections). Valid roles are {{brief_roles}}.
    Example: `["picture:name,logoUrl", "collection:/photos", "facts:address,phone"]`.
 
-7. `mutablePaths` (optional, array of strings): JSON pointers (for example
-   `["/email", "/password", "/rememberMe"]`) for fields in `payload` that the
-   user edits in a form or settings screen.
+9. `fallbackDsl` (optional, string): A2UI Express source rendered if the
+   decision model is not confident enough to choose components.
 
-8. `title` (optional, string): An optional title for the surface. When supplied,
-   the grammar places it into the page heading or banner without rewriting.
+10. `title` (optional, string): An optional title for the surface. When supplied,
+    the grammar places it into the page heading or banner without rewriting.
 
-9. `summary` (optional, string): An optional one-line summary or caption for the
-   surface. When supplied, the grammar places it into supporting prose without rewriting.
+11. `summary` (optional, string): An optional one-line summary or caption for the
+    surface. When supplied, the grammar places it into supporting prose without rewriting.
 
 ## Example
 
 {A2UI_INFERENCE_OPEN_TAG}
 {{{{"intent": "Show the service health with latency and a refresh button",
  "payload": {{{{"serviceName": "checkout", "latencyMs": 42, "status": "healthy"}}}},
+ "actions": {{{{"refresh": "Refresh"}}}},
  "layout": ["headline:serviceName,latencyMs,status"],
  "surfaceId": "main"}}}}
 {A2UI_INFERENCE_CLOSE_TAG}"""
@@ -115,35 +127,55 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _validate_example_blocks(
+    examples: Sequence[DecisionBlock] | None,
+) -> list[DecisionBlock] | None:
+    """Validates an optional sequence of native `DecisionBlock` examples."""
+    if examples is None:
+        return None
+    if not isinstance(examples, Sequence) or isinstance(
+        examples, (str, bytes, bytearray)
+    ):
+        raise TypeError(
+            "DecisionPromptGenerator examples must be a sequence of"
+            " DecisionBlock instances."
+        )
+    blocks: list[DecisionBlock] = []
+    for item in examples:
+        if not isinstance(item, DecisionBlock):
+            raise TypeError(
+                "DecisionPromptGenerator examples must be DecisionBlock"
+                f" instances, got {type(item).__name__}."
+            )
+        blocks.append(item)
+    return blocks
+
+
 class DecisionPromptGenerator(PromptGenerator):
     """Builds the system prompt for the decision inference format.
 
     The catalog section lists component names (not full signatures, which
-    the model does not need) and the registered template ids, derived from
-    the catalogs and registry at generation time.
+    the model does not need), derived from the catalogs at generation time.
     """
 
     def __init__(
         self,
         catalogs: Sequence[CatalogApi],
-        examples: Sequence[Sequence[AgentToRendererMessage]] | None = None,
+        block_examples: Sequence[DecisionBlock] | None = None,
         *,
-        registry: TemplateRegistry | None = None,
         archetypes: ArchetypeGrammar | None = None,
     ) -> None:
         """Creates a prompt generator.
 
         Args:
             catalogs: The active catalogs.
-            examples: Few-shot example turns as A2UI messages; each is
-                decompiled into a decision block for the prompt.
-            registry: Templates whose ids are offered for the `template` field.
+            block_examples: Few-shot example decision blocks rendered verbatim
+                in the prompt.
             archetypes: Grammar whose brief roles the `layout` field rule
                 lists; defaults to `ArchetypeGrammar.default()`.
         """
         self._catalogs = list(check_mixed_catalogs(catalogs))
-        self._examples = [list(t) for t in examples] if examples is not None else None
-        self._registry = registry if registry is not None else TemplateRegistry()
+        self._block_examples = _validate_example_blocks(block_examples)
         self._archetypes = archetypes
         self._graph: CatalogDecisionGraph | None = None
 
@@ -153,9 +185,9 @@ class DecisionPromptGenerator(PromptGenerator):
         return list(self._catalogs)
 
     @property
-    def registry(self) -> TemplateRegistry:
-        """The template registry whose ids the prompt offers."""
-        return self._registry
+    def block_examples(self) -> list[DecisionBlock] | None:
+        """A copy of the configured few-shot decision block examples, if any."""
+        return list(self._block_examples) if self._block_examples is not None else None
 
     @property
     def archetypes(self) -> ArchetypeGrammar:
@@ -190,24 +222,12 @@ class DecisionPromptGenerator(PromptGenerator):
             *(f"- {spec.name}" for spec in specs),
         ]
 
-    def _template_lines(self) -> list[str]:
-        """Lists the registered template ids, or nothing when there are none."""
-        templates = self._registry.list_templates()
-        if not templates:
-            return []
-        lines = ["", "## Registered Templates", ""]
-        lines.append("Set `template` to one of these ids when it fits:")
-        for template in templates:
-            desc = f": {template.description}" if template.description else ""
-            lines.append(f"- `{template.template_id}`{desc}")
-        return lines
-
     def generate_catalog_instructions(
         self,
         include_schema: bool = True,
         catalog: CatalogApi | None = None,
     ) -> str:
-        """Lists the components the decision model may choose and the templates.
+        """Lists the components the decision model may choose from.
 
         Args:
             include_schema: When False, returns an empty string.
@@ -215,40 +235,23 @@ class DecisionPromptGenerator(PromptGenerator):
         """
         if not include_schema:
             return ""
-        return "\n".join([*self._component_lines(catalog), *self._template_lines()])
+        return "\n".join(self._component_lines(catalog))
 
     def generate_examples(
         self,
         catalog: CatalogApi | None = None,
         validate: bool = True,
     ) -> str:
-        """Formats the configured example turns as decision blocks.
+        """Formats the configured native `DecisionBlock` examples.
 
         Args:
             catalog: Unused; kept for the base-class signature.
-            validate: When True, example messages are validated against the
-                catalogs before decompilation.
+            validate: Unused; kept for the base-class signature.
         """
-        del catalog
-        if not self._examples:
+        del catalog, validate
+        if not self._block_examples:
             return ""
-        if validate:
-            from a2ui.inference_formats._shared import to_message_dicts
-            from a2ui.utils import validate_payload
-
-            for turn in self._examples:
-                validate_payload(self._catalogs, to_message_dicts(turn))
-        return "\n\n".join(self.decompile(turn) for turn in self._examples)
-
-    def decompile(self, a2ui_payload: Sequence[AgentToRendererMessage]) -> str:
-        """Renders messages as a wrapped decision block.
-
-        Format-specific (not part of `PromptGenerator`): only the data model
-        and surface id survive, with a synthetic `Render <surface>` intent.
-        See `decision_block_from_messages`.
-        """
-        block = decision_block_from_messages(a2ui_payload)
-        return self.wrap_block(block)
+        return "\n\n".join(self.wrap_block(block) for block in self._block_examples)
 
     @staticmethod
     def wrap_block(block: DecisionBlock) -> str:

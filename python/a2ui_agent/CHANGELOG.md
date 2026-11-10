@@ -237,65 +237,67 @@
   (`DirectJsonFormat`).
 - Add the decision inference format, `a2ui.inference_formats.decision`, in
   which the model emits an intent and data and a decision model picks and binds
-  the components.
+  the components. The format is experimental and supports protocol v1.0 only;
+  a catalog with another protocol version raises `ValueError` at construction.
   - `DecisionFormat` and `DecisionFormatFactory` implement `InferenceFormat`
-    and `InferenceFormatFactory`, so
-    `A2uiRequestProcessor(catalogs, format_factory=DecisionFormatFactory())`
+    and `InferenceFormatFactory`, so `A2uiRequestProcessor(catalogs,
+    format_factory=DecisionFormatFactory(backend=create_decision_backend()))`
     works like the Express and Direct JSON factories. `DecisionPromptGenerator`
-    asks for `<a2ui>` decision blocks and `DecisionParser` renders them through
+    asks for `<a2ui>` decision blocks, few-shot examples are `DecisionBlock`
+    instances passed as `block_examples` (A2UI message examples are ignored
+    with a warning), and `DecisionParser` renders blocks through
     `DecisionSynthesizer`.
-  - `DecisionRenderTool` supplies a JSON Schema tool declaration and
-    `run_async` / `run_sync` runners for MCP, ADK, and function-calling agents;
-    build one with `DecisionRenderTool.create(catalogs, ...)`.
-  - `DecisionSynthesizer` takes an optional `backend` (defaulting to
-    `create_decision_backend()`) or a prebuilt `CatalogDecisionGraph`, accepts
-    JSON-string and array payloads, renders a named `template_id` directly,
-    adds `synthesize_sync()`, and fills abstentions from `fallback_dsl`,
-    `fallback_fn`, or a deterministic `fallback_card`;
-    `SynthesisOutput.fallback_source` (a `FallbackSource` enum) names which
-    one applied. `DecisionFormatFactory` shares one backend across every
-    format it creates.
-  - `DecisionTask`, `DecisionWireFormat` (including `AUTO`), and
-    `DecisionBackendType` string enums replace raw string literals;
-    `coerce_decision_payload` decodes stringified payloads.
-  - Concrete backends, the `DecisionBackend` protocol, and
-    `DecisionFormatFactory` support `async with` and `aclose()`; the HTTP
-    backends own one client per active event loop and `JevHttpBackend` caches
-    ADC tokens per instance.
-  - `TemplateRegistry.promote_synthesized` reads v0.9 and v1.0 `createSurface`
-    and `updateComponents` envelopes (including v1.0 embedded components) and
-    normalizes v0.8 `surfaceUpdate` promotions to v0.9 wire envelopes.
+  - A `DecisionBlock` carries `intent`, `payload`, `surfaceId`, `actions` (a
+    map from action id to a label or an options object, parsed into
+    `ActionSpec` with `ActionStyle`), `exclude`, `replace`, `mutablePaths`,
+    `layout`, `title`, `summary`, and `fallbackDsl`. The action id is the event
+    name the agent receives; labels are presentational only.
+  - Every constructor requires an explicit `DecisionBackend`;
+    `create_decision_backend()` reads `A2UI_DECISION_BACKEND` and raises
+    `ValueError` when it is unset (the mock backend is used only when asked
+    for). Backends answer a whole `DecisionBatch` in one `answer()` call and
+    declare `backend_kind`, a pinned `model_id` (TypeSafe defaults to
+    `jev-v0`), and `BackendCapabilities`; a per-model `Calibration` is loaded
+    from a bundled profile file. HTTP requests time out after 30 seconds by
+    default, and timeouts or transport failures raise `DecisionBackendError`,
+    which the parser reports as a compilation error with no fallback.
+  - `DecisionSynthesizer.synthesize` plans each surface with one `answer()`
+    call (two for backends that declare `two_stage`), renders a registered
+    template when the batch's template question picks one, and otherwise
+    expands the planned layout archetype. When the model abstains it runs
+    `fallback_dsl`, then `fallback_fn`, then one `facts` pattern rendering of
+    the payload, and raises `A2uiCompilationError` if none applies.
+    `SynthesisOutput` reports `fallback_source` (`FallbackSource`),
+    `fallback_reason`, `backend_kind`, `model_id`, and the `SurfaceOperation`
+    it emitted.
+  - Surfaces persist across turns: `DecisionParser` reads the
+    `RendererState`, so reusing a `surfaceId` replaces the surface's root in
+    place (`updateComponents` with stable per-block component ids and
+    `updateDataModel`), and `replace: true` sends `deleteSurface` and creates
+    the surface again. An update whose actions need `sendDataModel` on a
+    surface created without it becomes a replace. Without a bound state,
+    `DecisionFormat.create_parser(conversation_id=...)` keeps one
+    `RendererState` per conversation.
+  - `DecisionRenderTool` supplies a JSON Schema tool declaration (with
+    `actions`, `exclude`, and `replace`) and `run_async` / `run_sync` runners
+    for MCP, ADK, and function-calling agents; build one with
+    `DecisionRenderTool.create(catalogs, backend=...)`.
+  - `SynthesisConfig` holds `default_surface_id`, `max_pairs`, and
+    `conservativeness`, which scales the action confidence gate between the
+    grammar's `actionGateFloor` and `actionGateCap`; every other threshold
+    lives in the versioned grammar (`grammarVersion`).
   - `LayoutPlanner`, `ArchetypeGrammar`, `PatternLibrary`, `MergedPatternLibrary`,
-    and `PatternExpander` plan and expand multi-block layout archetypes (`feed`,
-    `compare`, `dashboard`, `detail`, `result`, `confirm`, `checkout`, `form`,
-    `settings`, `guide`, `article`, `timeline`, `location`, `chat`) across 19
-    semantic blocks in a single batched `DecisionBackend.answer(batch)` call
-    (`SynthesisStage.ARCHETYPE`, `SynthesisConfig`: `max_pairs`,
-    `threshold_overrides`).
-    The grammar's `thresholds` are the single source of truth for planner
-    thresholds; `SynthesisConfig.threshold_overrides` tunes them by key.
-  - `SemanticType` and `classify_scalar` classify payload pointers across 36
-    semantic types (`PointerSummary.semantic_type` and
-    `SlotBinding.semantic_type` are typed with the enum); `DecisionQuestion`,
-    `DecisionAnswer`, `DecisionBatch`, and `QuestionKind` (`choice`, `boolean`,
-    `score`) support batched multi-question scoring, `PredictOnlyBackend` and
-    `ensure_batch_backend` adapt single-query backends to `answer()`, and
-    `BatchingDecisionBackend` coalesces concurrent `predict()` and `answer()`
-    calls within a configurable time window.
-  - `DecisionBlock`, `DecisionPromptGenerator`, `DecisionFormatFactory`, and
-    `DecisionRenderTool` accept an optional `layout` brief
-    (`["role:key,key", ...]`), validated against the synthesizer's
-    `ArchetypeGrammar` (`decision_rules(grammar)` renders the prompt contract
-    for a grammar), and expose `SynthesisOutput.layout_plan` and
-    `SynthesisOutput.trace` (`include_trace=True`). `PlanReason`,
-    `Requirement`, `LintCode`, and `LintSeverity` are string enums;
-    `PatternRef` and `ResolvedPattern` replace `name:variant` string splitting.
-  - `DecisionBackend` supports temperature scaling on raw logits before computing
-    softmax probabilities (`A2UI_DECISION_TEMPERATURE` or `temperature` parameter).
-  - `DecisionBlock`, `DecisionSynthesizer`, and `ArchetypeGrammar` support authored
-    copy fields (`title`, `summary`), layout variety sampling (`VarietyMode.NEAR_TOP`,
-    `SynthesisConfig.variety`, `variety_margin`), and zero-backend-call re-sampling
-    (`DecisionSynthesizer.remix` / `remix_sync`).
+    and `PatternExpander` plan and expand multi-block layout archetypes
+    (`feed`, `compare`, `dashboard`, `detail`, `result`, `confirm`, `checkout`,
+    `form`, `settings`, `guide`, `article`, `timeline`, `location`, `chat`)
+    from a catalog's `patterns.json`. `PatternExpander` returns `Expansion`
+    objects; `lint_components` checks expanded layouts without catalog
+    component names.
+  - `SemanticType` and `classify_scalar` classify payload pointers;
+    `DecisionQuestion`, `DecisionAnswer`, `DecisionBatch`, and `QuestionKind`
+    (`choice`, `boolean`, `score`) describe batched questions;
+    `TemplateRegistry` holds reviewable surface templates, and
+    `promote_synthesized` turns an output into one.
 - Express variable and check identifiers now follow Unicode UAX 31 in the
   grammar and decompiler ([#3390](https://github.com/a2ui-project/a2ui/issues/3390)).
   From protocol v1.0 onward, `ExpressDecompiler` rejects component IDs that are

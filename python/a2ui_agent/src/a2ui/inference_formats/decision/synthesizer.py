@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-stage local decision-model A2UI surface synthesizer."""
+"""Local decision-model A2UI surface synthesizer: one planning path per surface."""
 
 from __future__ import annotations
 
@@ -21,70 +21,62 @@ import collections
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 import concurrent.futures
 import contextvars
-from dataclasses import replace
+import copy as copy_lib
+from dataclasses import dataclass, replace
 import inspect
 import re
 import time
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias
 
 from a2ui.core import A2uiValidationError, CatalogApi
 from a2ui.core.schema import AgentToRendererMessage
-from a2ui.inference_formats._shared import CatalogSchemaHelper
-from a2ui.parser.messages import to_message_models
+from a2ui.parser.errors import A2uiCompilationError
+from a2ui.parser.messages import to_message_dicts, to_message_models
 from a2ui.utils import validate_payload
 
 from .archetypes import ArchetypeGrammar, LayoutArchetype
-from .backends import (
-    DecisionBackend,
-    StepZeroLogprobBackend,
-    create_decision_backend,
-    ensure_batch_backend,
-)
+from .backends import DecisionBackend, create_decision_backend
 from .bindings import is_v10 as _is_v10
-from .bindings import make_data_binding as _make_data_binding
 from .catalog_graph import CatalogDecisionGraph
 from .layout_lint import lint_components
-from .layout_planner import LayoutPlanner, PlannerState
+from .layout_planner import LayoutPlanner, PlannerState, is_secret_pointer
 from .models import (
+    ActionSpec,
     AuthoredCopy,
-    ComponentNodeSpec,
-    ComponentSlot,
     DecisionAnswer,
     DecisionBatch,
-    DecisionDistribution,
-    DecisionQuery,
     DecisionQuestion,
     DecisionRecord,
-    DecisionTask,
     FallbackSource,
     LayoutBrief,
     LayoutPlan,
+    PageBindings,
+    PlannedBlock,
     PlanOutcome,
     QuestionKind,
+    SlotBinding,
     SlotKind,
+    SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
     SynthesisStage,
-    VarietyMode,
     coerce_decision_payload,
 )
 from .patterns import (
+    Expansion,
     MergedPatternLibrary,
     PatternError,
     PatternExpander,
     PatternLibrary,
     eligible_archetypes,
+    resolve_fallback_pattern,
     shape_signature,
 )
 from .payload_inspector import (
     PointerSummary,
-    PointerValueType,
     inspect_payload_pointers,
 )
 from .template_registry import TemplateRegistry
-
-_CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 # Key under which a top-level JSON array payload is stored in the data model.
 _ARRAY_PAYLOAD_KEY = "items"
@@ -110,9 +102,14 @@ instead, either directly or as an awaitable. Dicts are validated with
 """
 
 
-def _wire_version(protocol_version: str) -> str:
-    """Returns the canonical A2UI wire envelope version string."""
-    return "1.0" if _is_v10(protocol_version) else "v0.9"
+_WIRE_VERSION = "1.0"
+"""The only A2UI wire version the decision format emits."""
+
+_FACTS_BLOCK = "facts"
+_ABSTAIN_HELP = (
+    "Add a 'fallbackDsl' field, configure fallback_fn, or make sure the"
+    " catalog's patterns include a 'facts' pattern."
+)
 
 
 def _as_data_model(
@@ -136,422 +133,6 @@ def _populates_data_model(message: AgentToRendererMessage) -> bool:
         return True
     create = dumped.get("createSurface")
     return isinstance(create, Mapping) and "dataModel" in create
-
-
-def _passes_calibration_gate(
-    dist: DecisionDistribution, config: SynthesisConfig
-) -> bool:
-    """Returns whether `dist` satisfies the calibration and logit-margin gate."""
-    if dist.calibrated:
-        return True
-    return (dist.top_logit_margin or 0.0) >= config.uncalibrated_min_logit_margin
-
-
-def _tokenize_identifier(text: str) -> set[str]:
-    """Splits camelCase, PascalCase, and path segments into lowercase tokens."""
-    expanded = _CAMEL_RE.sub(r"\1 \2", text)
-    return set(_TOKEN_RE.findall(expanded.lower()))
-
-
-def _pointer_matches_slot_type(ptr: PointerSummary, slot_type: str | None) -> bool:
-    """Returns whether a pointer's value type is compatible with `slot_type`."""
-    if slot_type is None or slot_type == "any":
-        return True
-    return ptr.value_type == slot_type
-
-
-def _best_pointer_by_tokens(
-    candidates: Sequence[PointerSummary], slot_tokens: set[str]
-) -> PointerSummary:
-    """Returns the pointer in `candidates` with the highest token overlap."""
-    return max(
-        candidates,
-        key=lambda p: len(slot_tokens & _tokenize_identifier(p.path)),
-    )
-
-
-def _select_required_pointer(
-    slot: ComponentSlot,
-    compatible: Sequence[PointerSummary],
-    unused: Sequence[PointerSummary],
-    used_paths: set[str],
-    *,
-    relative: bool,
-) -> str:
-    """Selects a pointer path (or fallback path) for a required DATA_VALUE slot."""
-    pool = unused if unused else compatible
-    if not pool:
-        return slot.name if relative else f"/{slot.name}"
-    chosen = _best_pointer_by_tokens(pool, _tokenize_identifier(slot.name))
-    used_paths.add(chosen.path)
-    return chosen.path
-
-
-def _select_optional_pointer(
-    slot: ComponentSlot,
-    unused: Sequence[PointerSummary],
-    used_paths: set[str],
-) -> str | None:
-    """Selects an unused pointer path for an optional DATA_VALUE slot, or None."""
-    if not unused:
-        return None
-    slot_tokens = _tokenize_identifier(slot.name)
-    if slot.value_type == "any":
-        matched = [
-            p
-            for p in unused
-            if (slot_tokens & _tokenize_identifier(p.path)) or p.value_type == "object"
-        ]
-        if not matched:
-            return None
-        chosen = max(
-            matched,
-            key=lambda p: len(slot_tokens & _tokenize_identifier(p.path)),
-        )
-        used_paths.add(chosen.path)
-        return chosen.path
-    chosen = _best_pointer_by_tokens(unused, slot_tokens)
-    used_paths.add(chosen.path)
-    return chosen.path
-
-
-def _select_pointer_for_slot(
-    slot: ComponentSlot,
-    pointers: Sequence[PointerSummary],
-    used_paths: set[str],
-    *,
-    relative: bool,
-) -> str | None:
-    """Selects a JSON Pointer path for `slot` from `pointers`."""
-    compatible = [p for p in pointers if _pointer_matches_slot_type(p, slot.value_type)]
-    unused = [p for p in compatible if p.path not in used_paths]
-    if slot.required:
-        return _select_required_pointer(
-            slot, compatible, unused, used_paths, relative=relative
-        )
-    return _select_optional_pointer(slot, unused, used_paths)
-
-
-def _select_enum_value(slot: ComponentSlot, intent: str) -> str | None:
-    """Selects an enum literal matching `intent` or defaults to the first value."""
-    if not slot.enum_values:
-        return None
-    intent_lower = intent.lower()
-    for val in slot.enum_values:
-        if val.lower() in intent_lower:
-            return val
-    return slot.enum_values[0]
-
-
-def _is_binding_ref(ref: Any) -> bool:
-    """Returns whether `ref` is a JSON Schema `$ref` to a bindable type."""
-    return isinstance(ref, str) and ("DataBinding" in ref or "Dynamic" in ref)
-
-
-_SCHEMA_TYPE_CONSTRAINTS = frozenset(
-    {"type", "$ref", "enum", "const", "oneOf", "anyOf", "allOf"}
-)
-
-
-def _schema_allows_binding(schema: Mapping[str, Any]) -> bool:
-    """Returns whether `schema` accepts an A2UI `DataBinding` object."""
-    if _is_binding_ref(schema.get("$ref")):
-        return True
-    for key in ("oneOf", "anyOf", "allOf"):
-        sub_list = schema.get(key)
-        if isinstance(sub_list, list) and any(
-            isinstance(s, Mapping) and _schema_allows_binding(s) for s in sub_list
-        ):
-            return True
-    return not bool(_SCHEMA_TYPE_CONSTRAINTS & schema.keys())
-
-
-def _default_arg_value(
-    param_name: str,
-    param_schema: Mapping[str, Any],
-    pointers: Sequence[PointerSummary],
-    *,
-    is_v10: bool,
-    relative: bool,
-) -> Any:
-    """Builds a schema-valid argument value for a check function parameter."""
-    if _schema_allows_binding(param_schema):
-        if pointers:
-            chosen = _best_pointer_by_tokens(pointers, _tokenize_identifier(param_name))
-            path = chosen.path
-        else:
-            path = param_name if relative else f"/{param_name}"
-        return _make_data_binding(path, is_v10=is_v10)
-    prim_type = param_schema.get("type")
-    if prim_type in ("number", "integer"):
-        return 1
-    if prim_type == "boolean":
-        return True
-    if prim_type == "array":
-        return []
-    if prim_type == "object":
-        return {}
-    return "valid"
-
-
-def _find_function_helper(
-    helpers: Mapping[str, CatalogSchemaHelper],
-    fn_name: str,
-    preferred_catalog_id: str,
-) -> tuple[str | None, CatalogSchemaHelper | None]:
-    """Finds the catalog ID and schema helper defining `fn_name`."""
-    preferred = helpers.get(preferred_catalog_id)
-    if preferred is not None and fn_name in preferred.functions:
-        return preferred_catalog_id, preferred
-    for cat_id, helper in helpers.items():
-        if fn_name in helper.functions:
-            return cat_id, helper
-    return None, None
-
-
-def _build_checks(
-    graph: CatalogDecisionGraph,
-    comp_spec: ComponentNodeSpec,
-    pointers: Sequence[PointerSummary],
-    *,
-    is_v10: bool,
-    relative: bool,
-) -> list[dict[str, Any]]:
-    """Builds validation check rules for checkable components."""
-    check_fns = graph.checkable_functions()
-    if not comp_spec.supports_checks or not check_fns:
-        return []
-    helpers: Mapping[str, CatalogSchemaHelper] = graph.helpers()
-    chosen_fn = check_fns[0]
-    for fn_name in check_fns:
-        cat_id, _ = _find_function_helper(helpers, fn_name, comp_spec.catalog_id)
-        if cat_id == comp_spec.catalog_id:
-            chosen_fn = fn_name
-            break
-    fn_cat_id, helper = _find_function_helper(helpers, chosen_fn, comp_spec.catalog_id)
-    args: dict[str, Any] = {}
-    if helper is not None:
-        for param_name in helper.get_function_properties(chosen_fn):
-            p_schema = helper.get_function_property_schema(chosen_fn, param_name)
-            args[param_name] = _default_arg_value(
-                param_name,
-                p_schema or {},
-                pointers,
-                is_v10=is_v10,
-                relative=relative,
-            )
-    call_key = "@call" if is_v10 else "call"
-    condition: dict[str, Any] = {call_key: chosen_fn, "args": args}
-    if graph.surface_catalog_id is None and fn_cat_id is not None:
-        condition["catalogId"] = fn_cat_id
-    return [{
-        "condition": condition,
-        "message": (
-            f"{chosen_fn[0].upper() + chosen_fn[1:] if chosen_fn else ''} check failed"
-        ),
-    }]
-
-
-class _NoEligibleChildError(Exception):
-    """Raised internally when a container slot has no eligible leaf candidates."""
-
-
-def _bind_non_child_slots(
-    comp: dict[str, Any],
-    spec: ComponentNodeSpec,
-    intent: str,
-    pointers: Sequence[PointerSummary],
-    *,
-    is_v10: bool,
-    relative: bool,
-    allow_actions: bool = True,
-) -> None:
-    """Binds DATA_VALUE, STATIC_ENUM, and ACTION slots on `comp` in place."""
-    used_paths: set[str] = set()
-    selected_paths: dict[str, str | None] = {}
-    data_slots = [s for s in spec.slots if s.kind == SlotKind.DATA_VALUE]
-    for slot in sorted(data_slots, key=lambda s: not s.required):
-        selected_paths[slot.name] = _select_pointer_for_slot(
-            slot, pointers, used_paths, relative=relative
-        )
-    for slot in spec.slots:
-        if slot.kind == SlotKind.DATA_VALUE:
-            path = selected_paths.get(slot.name)
-            if path is not None:
-                comp[slot.name] = _make_data_binding(path, is_v10=is_v10)
-        elif slot.kind == SlotKind.STATIC_ENUM:
-            enum_val = _select_enum_value(slot, intent)
-            if enum_val is not None:
-                comp[slot.name] = enum_val
-        elif slot.kind == SlotKind.ACTION and allow_actions:
-            comp[slot.name] = {"event": {"name": slot.name}}
-
-
-def _relative_pointers_for_array(
-    array_ptr: PointerSummary | None,
-    fallback_pointers: Sequence[PointerSummary],
-) -> list[PointerSummary]:
-    """Builds relative `PointerSummary` entries for a repeating `ChildList`."""
-    if array_ptr is not None and array_ptr.element_keys:
-        return [
-            PointerSummary(
-                path=key,
-                value_type=cast(
-                    PointerValueType,
-                    array_ptr.sample_type_by_key.get(key, "string"),
-                ),
-                cardinality=1,
-                mutable_hint=array_ptr.mutable_hint,
-            )
-            for key in array_ptr.element_keys
-        ]
-    return [
-        PointerSummary(
-            path=p.path.rsplit("/", 1)[-1] or p.path.lstrip("/"),
-            value_type=p.value_type,
-            cardinality=1,
-            mutable_hint=p.mutable_hint,
-        )
-        for p in fallback_pointers
-        if p.value_type != "array"
-    ]
-
-
-def _can_bind_data_pointers(
-    spec: ComponentNodeSpec, ptr_types: Collection[str]
-) -> bool:
-    """Returns whether `spec` has a data slot and needs no array the pointers lack."""
-    data_slots = [s for s in spec.slots if s.kind == SlotKind.DATA_VALUE]
-    if not data_slots:
-        return False
-    return "array" in ptr_types or not any(
-        s.required and s.value_type == "array" for s in data_slots
-    )
-
-
-def _best_leaf_by_pointer_overlap(
-    candidates: Sequence[ComponentNodeSpec],
-    pointers: Sequence[PointerSummary],
-) -> ComponentNodeSpec:
-    """Selects the leaf component whose DATA_VALUE slots best match `pointers`."""
-    ptr_types = {p.value_type for p in pointers}
-    has_mutable = any(p.mutable_hint for p in pointers)
-    ptr_tokens = {tok for p in pointers for tok in _tokenize_identifier(p.path)}
-    cap = max(1, len(pointers))
-    return max(
-        candidates,
-        key=lambda c: (
-            c.supports_checks == has_mutable,
-            min(
-                cap,
-                sum(
-                    1
-                    for s in c.slots
-                    if s.kind == SlotKind.DATA_VALUE and s.value_type in ptr_types
-                ),
-            ),
-            sum(
-                len(_tokenize_identifier(s.name) & ptr_tokens)
-                for s in c.slots
-                if s.kind == SlotKind.DATA_VALUE
-            ),
-            any(s.name == "text" for s in c.slots if s.kind == SlotKind.DATA_VALUE),
-        ),
-    )
-
-
-def _named_child_entry(
-    slot: ComponentSlot,
-    child_spec: ComponentNodeSpec,
-    child_id: str,
-    view_ptrs: Sequence[PointerSummary],
-    idx: int,
-) -> dict[str, Any]:
-    """Builds a single `NAMED_CHILD_ARRAY` item dict with label and child id."""
-    entry: dict[str, Any] = {}
-    if slot.label_key is not None:
-        ptr_label = (
-            view_ptrs[0].path.rsplit("/", 1)[-1].replace("_", " ").title()
-            if view_ptrs and view_ptrs[0].path.strip("/")
-            else f"{child_spec.name}_{idx}"
-        )
-        entry[slot.label_key] = ptr_label
-    if slot.child_id_key is not None:
-        entry[slot.child_id_key] = child_id
-    return entry
-
-
-_MUTABLE_BRIEF_ROLES: frozenset[str] = frozenset({
-    "input",
-    "form",
-    "settings",
-    "groups",
-    "filters",
-    "compose",
-})
-_FRAMING_SCALAR_KEYS: frozenset[str] = frozenset({
-    "title",
-    "subtitle",
-    "heading",
-    "subheading",
-    "subject",
-    "description",
-    "summary",
-    "instructions",
-})
-_ACTION_KEYS: frozenset[str] = frozenset({"actions", "buttons", "cta"})
-
-
-def _pinned_mutable_paths(brief: LayoutBrief | None) -> set[str]:
-    """Returns pointer paths pinned under mutable roles in `brief`."""
-    if brief is None:
-        return set()
-    return {
-        p
-        for sec in brief.sections
-        if sec.role in _MUTABLE_BRIEF_ROLES
-        for p in sec.pointers
-    }
-
-
-def _matches_pinned_path(path: str, pinned_paths: set[str]) -> bool:
-    """Returns whether `path` is in `pinned_paths` or a descendant of one."""
-    return path in pinned_paths or any(path.startswith(f"{bp}/") for bp in pinned_paths)
-
-
-def _editable_pointer_paths(pointers: Sequence[PointerSummary]) -> set[str]:
-    """Selects default editable pointer paths when no brief pins mutable roles."""
-    editable = [
-        p
-        for p in pointers
-        if p.value_type in {"string", "number", "boolean", "object"}
-        and p.key.lower() not in _ACTION_KEYS
-    ]
-    non_framing = {
-        p.path
-        for p in editable
-        if p.parent or p.key.lower() not in _FRAMING_SCALAR_KEYS
-    }
-    return non_framing if non_framing else {p.path for p in editable}
-
-
-def _promote_mutable_pointers(
-    pointers: Sequence[PointerSummary],
-    brief: LayoutBrief | None = None,
-) -> tuple[PointerSummary, ...]:
-    """Marks editable pointers as `mutable_hint=True` when the caller omitted `mutable_paths`."""
-    pinned_paths = _pinned_mutable_paths(brief)
-    if pinned_paths:
-        return tuple(
-            replace(p, mutable_hint=True)
-            if _matches_pinned_path(p.path, pinned_paths)
-            else p
-            for p in pointers
-        )
-    target_paths = _editable_pointer_paths(pointers)
-    return tuple(
-        replace(p, mutable_hint=True) if p.path in target_paths else p for p in pointers
-    )
 
 
 def _coerce_layout_brief(
@@ -639,14 +220,137 @@ def _record_trace_reason(trace: list[DecisionRecord], reason: str, prompt: str) 
     )
 
 
+_CHILD_SLOT_KINDS = frozenset(
+    {SlotKind.CHILD, SlotKind.CHILD_LIST, SlotKind.NAMED_CHILD_ARRAY}
+)
+
+
+def _child_slot_keys(graph: CatalogDecisionGraph) -> frozenset[str]:
+    """Property names the catalogs declare as child component slots."""
+    return frozenset(
+        slot.name
+        for spec in graph.root_candidates()
+        for slot in spec.slots
+        if slot.kind in _CHILD_SLOT_KINDS
+    )
+
+
+def _require_v10(graph: CatalogDecisionGraph) -> None:
+    """Raises `ValueError` unless every catalog targets A2UI protocol v1.0."""
+    others = [
+        f"{c.catalog_id} ({c.protocol_version})"
+        for c in graph.catalogs
+        if not _is_v10(str(c.protocol_version))
+    ]
+    if others:
+        raise ValueError(
+            "The decision format supports A2UI protocol v1.0 only; these catalogs"
+            f" use another version: {', '.join(others)}."
+        )
+
+
+def _abstention_reason(abstained: SynthesisOutput) -> str:
+    """The last planning outcome recorded in the trace, as the fallback reason."""
+    for record in reversed(abstained.trace):
+        if record.outcome:
+            return record.outcome
+    return "no layout plan"
+
+
+def _creates_surface(
+    messages: Sequence[AgentToRendererMessage], surface_id: str
+) -> bool:
+    return any(
+        isinstance(d.get("createSurface"), Mapping)
+        and d["createSurface"].get("surfaceId") == surface_id
+        for d in to_message_dicts(messages)
+    )
+
+
+@dataclass(frozen=True)
+class _SurfaceRequest:
+    """Per-call settings that `synthesize` threads through planning and output."""
+
+    surface_id: str
+    brief: LayoutBrief | None = None
+    copy: AuthoredCopy | None = None
+    actions: tuple[ActionSpec, ...] = ()
+    operation: SurfaceOperation = SurfaceOperation.CREATE
+    surface_sends_data_model: bool = False
+
+
+def _without_excluded(
+    pointers: Sequence[PointerSummary], exclude: Collection[str]
+) -> tuple[PointerSummary, ...]:
+    """Drops pointers equal to, or nested under, any pointer in `exclude`."""
+    if not exclude:
+        return tuple(pointers)
+    return tuple(
+        p
+        for p in pointers
+        if not any(p.path == ex or p.path.startswith(f"{ex}/") for ex in exclude)
+    )
+
+
+def resolve_surface_operation(
+    requested: SurfaceOperation,
+    *,
+    send_data_model: bool,
+    surface_sends_data_model: bool,
+) -> SurfaceOperation:
+    """Applies the escalation rule to the operation the caller asked for.
+
+    `UPDATE_ROOT` keeps the existing surface, and `sendDataModel` can only be
+    set by `createSurface`. When the new root needs `sendDataModel` (some
+    submit action resolves to no context bindings) and the surface was
+    created without it, the update escalates to `REPLACE`, which deletes
+    and recreates the surface with the flag set. Every other case keeps the
+    requested operation.
+    """
+    if (
+        requested is SurfaceOperation.UPDATE_ROOT
+        and send_data_model
+        and not surface_sends_data_model
+    ):
+        return SurfaceOperation.REPLACE
+    return requested
+
+
+def _as_fresh_surface(
+    messages: list[AgentToRendererMessage], request: _SurfaceRequest
+) -> tuple[list[AgentToRendererMessage], SurfaceOperation]:
+    """Prepends `deleteSurface` when fallback messages recreate an existing surface.
+
+    Fallback messages (Express DSL or a host callback) usually start with
+    `createSurface`. On a surface the client already shows, that would be
+    rejected, so the output becomes a `REPLACE`.
+    """
+    if request.operation is SurfaceOperation.CREATE or not _creates_surface(
+        messages, request.surface_id
+    ):
+        return messages, request.operation
+    delete = to_message_models(
+        [{"version": _WIRE_VERSION, "deleteSurface": {"surfaceId": request.surface_id}}]
+    )
+    return [*delete, *messages], SurfaceOperation.REPLACE
+
+
 class DecisionSynthesizer:
     """Catalog-agnostic local decision-model A2UI surface synthesizer.
 
+    Surface operations: `synthesize` takes the `SurfaceOperation` the caller
+    decided from its renderer state (`CREATE` for a new surface,
+    `UPDATE_ROOT` for one the client already shows, `REPLACE` when the block
+    asks for it). An `UPDATE_ROOT` whose new root needs `sendDataModel` on a
+    surface created without it escalates to `REPLACE`; see
+    `resolve_surface_operation`. `SynthesisOutput.operation` reports the
+    operation actually emitted.
+
     Attributes:
         graph: The catalog decision graph the synthesizer selects from.
-        backend: The decision backend that scores candidates.
-        registry: The surface template registry consulted first.
-        config: Default thresholds and structural limits.
+        backend: The decision backend that answers question batches.
+        registry: The surface templates offered to the template question.
+        config: Host-level synthesis settings.
         archetypes: The layout archetype grammar.
         patterns: The catalog pattern library for expanding planned blocks.
         planner: The speculative layout planner.
@@ -656,13 +360,12 @@ class DecisionSynthesizer:
     def __init__(
         self,
         catalogs: Sequence[CatalogApi] | CatalogDecisionGraph,
-        backend: DecisionBackend | None = None,
+        backend: DecisionBackend,
         *,
         registry: TemplateRegistry | None = None,
         config: SynthesisConfig | None = None,
         archetypes: ArchetypeGrammar | None = None,
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
-        fallback_card: bool = False,
         fallback_fn: FallbackCallback | None = None,
     ) -> None:
         """Creates a synthesizer.
@@ -670,31 +373,34 @@ class DecisionSynthesizer:
         Args:
             catalogs: The active catalogs, or a `CatalogDecisionGraph` already
                 built from them.
-            backend: The decision backend. Defaults to
-                `create_decision_backend()`, which reads the
-                `A2UI_DECISION_*` environment variables.
-            registry: Surface templates tried before catalog synthesis.
-            config: Default `SynthesisConfig`; `synthesize` may override it
-                per call.
+            backend: The decision backend. Required; use `from_env` to build
+                one from the `A2UI_DECISION_*` environment variables.
+            registry: Surface templates offered to the template question.
+            config: Host-level `SynthesisConfig`.
             archetypes: Layout archetype grammar. Defaults to
                 `ArchetypeGrammar.default()`.
             patterns: Catalog pattern library. Defaults to
                 `MergedPatternLibrary.for_catalogs(graph.catalogs)`.
-            fallback_card: When True and the model abstains with no other
-                fallback available, render a deterministic root container
-                bound to the payload instead of returning no messages.
             fallback_fn: Called with `(intent, payload, surface_id)` when the
                 model abstains and no `fallback_dsl` was given; its messages
                 are rendered instead.
+
+        Raises:
+            TypeError: If `backend` is None.
+            ValueError: If any catalog's protocol version is not v1.0.
         """
+        if backend is None:
+            raise TypeError(
+                "DecisionSynthesizer requires a decision backend; pass one or use"
+                " DecisionSynthesizer.from_env()."
+            )
         self.graph = (
             catalogs
             if isinstance(catalogs, CatalogDecisionGraph)
             else CatalogDecisionGraph(catalogs)
         )
-        self.backend: DecisionBackend = ensure_batch_backend(
-            backend if backend is not None else create_decision_backend()
-        )
+        _require_v10(self.graph)
+        self.backend: DecisionBackend = backend
         self.registry = registry if registry is not None else TemplateRegistry()
         self.config = config if config is not None else SynthesisConfig()
         self.archetypes = (
@@ -711,8 +417,8 @@ class DecisionSynthesizer:
         self.expander = PatternExpander(
             self.patterns, self.graph, grammar=self.archetypes
         )
-        self._fallback_card = fallback_card
         self._fallback_fn = fallback_fn
+        self._child_slot_keys = _child_slot_keys(self.graph)
         self._eligibility_cache: collections.OrderedDict[
             tuple[Any, ...], tuple[LayoutArchetype, ...]
         ] = collections.OrderedDict()
@@ -727,22 +433,20 @@ class DecisionSynthesizer:
         config: SynthesisConfig | None = None,
         archetypes: ArchetypeGrammar | None = None,
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
-        fallback_card: bool = False,
         fallback_fn: FallbackCallback | None = None,
     ) -> DecisionSynthesizer:
-        """Constructs a DecisionSynthesizer using the environment-configured decision backend.
+        """Constructs a synthesizer, building the backend from the environment.
 
-        Equivalent to calling the constructor; kept for callers that prefer the
-        explicit name.
+        When `backend` is None, `create_decision_backend()` builds it, which
+        raises `ValueError` unless `A2UI_DECISION_BACKEND` is set.
         """
         return cls(
             catalogs,
-            backend,
+            backend if backend is not None else create_decision_backend(),
             registry=registry,
             config=config,
             archetypes=archetypes,
             patterns=patterns,
-            fallback_card=fallback_card,
             fallback_fn=fallback_fn,
         )
 
@@ -752,92 +456,74 @@ class DecisionSynthesizer:
         payload: Mapping[str, Any] | Sequence[Any] | str,
         *,
         surface_id: str | None = None,
+        actions: Sequence[ActionSpec] = (),
+        exclude: Sequence[str] = (),
         mutable_paths: Collection[str] = (),
-        config: SynthesisConfig | None = None,
-        template_id: str | None = None,
-        fallback_dsl: str | None = None,
         layout: LayoutBrief | Sequence[str] | None = None,
         title: str | None = None,
         summary: str | None = None,
-        variety_seed: int | None = None,
+        fallback_dsl: str | None = None,
+        operation: SurfaceOperation = SurfaceOperation.CREATE,
+        surface_sends_data_model: bool = False,
     ) -> SynthesisOutput:
-        """Synthesizes validated A2UI messages without mutating the template registry.
+        """Synthesizes validated A2UI messages for one decision block.
 
         Args:
             intent: Natural-language description of the UI to render.
             payload: The data to bind. A mapping is used as the surface data
                 model; a JSON array is stored under the `items` key; a
                 JSON-encoded string of either is decoded first.
-            surface_id: Target surface. Defaults to `config.default_surface_id`.
-            mutable_paths: JSON Pointers the user may edit, which raises the
-                confidence bar.
-            config: Per-call override of the synthesizer's `SynthesisConfig`.
-            template_id: Render this registered template directly, skipping
-                model selection.
+            surface_id: Target surface. Defaults to
+                `config.default_surface_id`.
+            actions: The actions the block declared, in order.
+            exclude: JSON Pointers the surface must not show; they and their
+                descendants are dropped before planning.
+            mutable_paths: JSON Pointers the user may edit.
+            layout: Optional `LayoutBrief` (or `'role:key,key'` string
+                sequence) pinning roles to payload pointers.
+            title: Optional authored surface title.
+            summary: Optional authored surface summary or caption.
             fallback_dsl: A2UI Express rendered when the model abstains.
-            layout: Optional `LayoutBrief` (or `'role:key,key'` string sequence)
-                pinning roles to payload pointers.
-            title: Optional authored surface title string placed into headings.
-            summary: Optional authored surface summary or caption string.
-            variety_seed: Optional integer seed for reproducible near-top sampling.
+            operation: How the messages change the client's surface, decided
+                by the caller from its renderer state.
+            surface_sends_data_model: Whether the existing surface was created
+                with `sendDataModel`; read only for the `UPDATE_ROOT`
+                escalation rule.
 
         Returns:
-            The synthesis result. When the model abstains and a fallback
-            (`fallback_dsl`, `fallback_fn`, or `fallback_card`) applies, the
-            stage stays `ABSTAIN_FALLBACK`, `messages` holds the fallback
-            output, and `fallback_source` names which fallback produced it.
+            The synthesis result, stamped with the backend's kind and model
+            id and the operation emitted.
 
         Raises:
-            ValueError: If `template_id` names no registered template, a
-                string payload is not valid JSON, or `layout` fails brief
-                validation.
+            ValueError: If a string payload is not valid JSON or `layout`
+                fails brief validation.
             TypeError: If the payload is neither an object nor an array.
+            DecisionBackendError: If the backend times out or fails.
         """
-        active_config = config if config is not None else self.config
-        target_surface_id = (
-            surface_id if surface_id is not None else active_config.default_surface_id
+        request = _SurfaceRequest(
+            surface_id=(
+                surface_id if surface_id is not None else self.config.default_surface_id
+            ),
+            brief=_coerce_layout_brief(layout, self.archetypes),
+            copy=(
+                AuthoredCopy(title=title, summary=summary)
+                if (title is not None or summary is not None)
+                else None
+            ),
+            actions=tuple(actions),
+            operation=operation,
+            surface_sends_data_model=surface_sends_data_model,
         )
         data = _as_data_model(payload)
-        brief = _coerce_layout_brief(layout, self.archetypes)
-        copy = (
-            AuthoredCopy(title=title, summary=summary)
-            if (title is not None or summary is not None)
-            else None
+        pointers = _without_excluded(
+            inspect_payload_pointers(data, mutable_paths=mutable_paths or ()), exclude
         )
-
-        if template_id is not None:
-            return self._render_named_template(template_id, data, target_surface_id)
-
-        pointers = inspect_payload_pointers(data, mutable_paths=mutable_paths or ())
-        has_mutable = bool(mutable_paths) or any(p.mutable_hint for p in pointers)
 
         timings: list[float] = []
         token = _DECISION_CALL_TIMINGS.set(timings)
         try:
-            stage1_out = await self._try_template_stage(
-                intent,
-                data,
-                pointers,
-                target_surface_id=target_surface_id,
-                has_mutable=has_mutable,
-                config=active_config,
-            )
-            if stage1_out is not None:
-                return replace(
-                    stage1_out,
-                    decision_latency_ms=sum(timings),
-                    decision_calls=len(timings),
-                )
-
             output = await self._synthesize_from_catalog(
-                intent,
-                data,
-                pointers,
-                target_surface_id=target_surface_id,
-                config=active_config,
-                layout=brief,
-                copy=copy,
-                variety_seed=variety_seed,
+                intent, data, pointers, request
             )
         finally:
             _DECISION_CALL_TIMINGS.reset(token)
@@ -846,28 +532,14 @@ class DecisionSynthesizer:
             output,
             decision_latency_ms=sum(timings),
             decision_calls=len(timings),
+            backend_kind=self.backend.backend_kind,
+            model_id=self.backend.model_id,
         )
-        if output.stage is not SynthesisStage.ABSTAIN_FALLBACK or output.messages:
+        if output.messages:
             return output
-        return await self._resolve_abstention_fallback(
-            output,
-            intent,
-            data,
-            pointers,
-            surface_id=target_surface_id,
-            fallback_dsl=fallback_dsl,
-            config=active_config,
+        return await self._fallback(
+            output, intent, data, pointers, request, fallback_dsl
         )
-
-    async def _backend_predict(self, query: DecisionQuery) -> DecisionDistribution:
-        """Calls `self.backend.predict` and records elapsed decision latency."""
-        started = time.perf_counter()
-        dist = await self.backend.predict(query)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        timings = _DECISION_CALL_TIMINGS.get()
-        if timings is not None:
-            timings.append(elapsed_ms)
-        return dist
 
     async def _backend_answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
         """Calls `self.backend.answer` and records elapsed decision latency."""
@@ -919,119 +591,23 @@ class DecisionSynthesizer:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(run_in_new_loop).result()
 
-    async def remix(
+    def _render_template(
         self,
-        intent: str,
-        payload: Mapping[str, Any] | Sequence[Any] | str,
-        answers: Sequence[DecisionAnswer],
-        *,
-        surface_id: str | None = None,
-        mutable_paths: Collection[str] = (),
-        brief: LayoutBrief | Sequence[str] | None = None,
-        title: str | None = None,
-        summary: str | None = None,
-        seed: int | None = None,
+        plan: LayoutPlan,
+        state: PlannerState,
+        data: Mapping[str, Any],
+        request: _SurfaceRequest,
     ) -> SynthesisOutput:
-        """Re-plans a previously answered surface with variety sampling and 0 decision calls."""
-        return self.remix_sync(
-            intent,
-            payload,
-            answers,
-            surface_id=surface_id,
-            mutable_paths=mutable_paths,
-            brief=brief,
-            title=title,
-            summary=summary,
-            seed=seed,
-        )
+        """Renders the registered template the plan's template question chose.
 
-    def remix_sync(
-        self,
-        intent: str,
-        payload: Mapping[str, Any] | Sequence[Any] | str,
-        answers: Sequence[DecisionAnswer],
-        *,
-        surface_id: str | None = None,
-        mutable_paths: Collection[str] = (),
-        brief: LayoutBrief | Sequence[str] | None = None,
-        title: str | None = None,
-        summary: str | None = None,
-        seed: int | None = None,
-    ) -> SynthesisOutput:
-        """Synchronously re-plans a previously answered surface with 0 decision calls."""
-        if not answers:
-            raise ValueError("answers do not match this intent and payload")
+        The template's components go through the same message builder as an
+        expanded plan, so all three surface operations apply. Templates carry
+        no `sendDataModel` requirement, so they never escalate.
 
-        data = _as_data_model(payload)
-        brief_obj = _coerce_layout_brief(brief, self.archetypes)
-        copy = (
-            AuthoredCopy(title=title, summary=summary)
-            if (title is not None or summary is not None)
-            else None
-        )
-        pointers = self._prepare_archetype_pointers(
-            inspect_payload_pointers(data, mutable_paths=mutable_paths or ()),
-            brief_obj,
-        )
-        ans_q_ids = {a.question_id for a in answers}
-        if not any(p.mutable_hint for p in pointers) and any(
-            qid == "archetype:input" or qid.startswith("instance:form.")
-            for qid in ans_q_ids
-        ):
-            pointers = _promote_mutable_pointers(pointers, brief_obj)
-
-        config_with_variety = replace(self.config, variety=VarietyMode.NEAR_TOP)
-        planner = LayoutPlanner(
-            self.archetypes, config_with_variety, capabilities=self.patterns
-        )
-        batch, state = planner.build_batch(
-            intent, pointers, brief=brief_obj, payload=data, copy=copy
-        )
-
-        batch_q_ids = {q.id for q in batch.questions}
-        if batch_q_ids != ans_q_ids:
-            s1_batch, s1_state = planner.build_stage1_batch(
-                intent, pointers, brief=brief_obj, payload=data, copy=copy
-            )
-            s1_ids = {q.id for q in s1_batch.questions}
-            if s1_ids and s1_ids <= ans_q_ids:
-                s1_answers = [a for a in answers if a.question_id in s1_ids]
-                planner.build_stage2_batch(s1_state, s1_answers)
-                state = s1_state
-                batch_q_ids = {q.id for q in state.batch.questions}
-            if batch_q_ids != ans_q_ids:
-                raise ValueError("answers do not match this intent and payload")
-
-        outcome = planner.read(state, answers, seed=seed)
-        if outcome.plan is None:
-            return SynthesisOutput(
-                stage=SynthesisStage.ABSTAIN_FALLBACK,
-                messages=[],
-                confidence=0.0,
-                entropy=0.0,
-                decision_calls=0,
-                decision_latency_ms=0.0,
-                decision_answers=tuple(answers),
-            )
-
-        components = self._expand_plan(outcome.plan)
-        target_surface_id = (
-            surface_id if surface_id is not None else self.config.default_surface_id
-        )
-        output = self._finish_archetype_output(
-            outcome.plan, state, components, data, target_surface_id
-        )
-        return replace(
-            output,
-            decision_calls=0,
-            decision_latency_ms=0.0,
-            decision_answers=tuple(answers),
-        )
-
-    def _render_named_template(
-        self, template_id: str, data: Mapping[str, Any], surface_id: str
-    ) -> SynthesisOutput:
-        """Renders a registered template by id with full confidence."""
+        Raises:
+            ValueError: If `plan.template_id` names no registered template.
+        """
+        template_id = plan.template_id or ""
         template = self.registry.get(template_id)
         if template is None:
             known = ", ".join(t.template_id for t in self.registry.list_templates())
@@ -1039,68 +615,175 @@ class DecisionSynthesizer:
                 f"Unknown template '{template_id}'. Registered templates:"
                 f" {known or 'none'}."
             )
-        messages = template.render_messages(data, surface_id=surface_id)
-        validate_payload(self.graph.catalogs, messages)
-        tree_spec: dict[str, Any] = {"template_id": template.template_id}
-        root_comp_name = template.root_component()
-        if root_comp_name is not None:
-            tree_spec["root_component"] = root_comp_name
+        components = [copy_lib.deepcopy(dict(c)) for c in template.components]
+        self._stamp_multi_catalog_id(components, template.catalog_id)
+        messages = self._build_validated_messages(
+            request.surface_id, components, data, request.operation
+        )
+        _, entropy = _archetype_confidence_and_entropy(state, plan)
         return SynthesisOutput(
             stage=SynthesisStage.TEMPLATE_SELECT,
             messages=messages,
-            confidence=1.0,
-            entropy=0.0,
+            confidence=plan.confidence,
+            entropy=entropy,
             selected_template_id=template.template_id,
-            component_tree_spec=tree_spec,
+            layout_plan=plan,
+            trace=tuple(state.trace),
+            decision_answers=tuple(state.answers_by_id.values()),
+            operation=request.operation,
         )
 
-    async def _resolve_abstention_fallback(
+    async def _fallback(
         self,
         abstained: SynthesisOutput,
         intent: str,
         data: Mapping[str, Any],
         pointers: Sequence[PointerSummary],
-        *,
-        surface_id: str,
+        request: _SurfaceRequest,
         fallback_dsl: str | None,
-        config: SynthesisConfig,
     ) -> SynthesisOutput:
-        """Fills an abstained output from the first applicable fallback.
+        """Runs the fallback chain for an abstained output.
 
-        Order: `fallback_dsl`, then the configured `fallback_fn`, then the
-        deterministic card when `fallback_card` is on. With none applicable,
-        the abstained output is returned unchanged.
+        Order: the block's `fallback_dsl`, then the configured `fallback_fn`,
+        then one `facts` pattern rendering of the payload from the active
+        pattern library. A link that yields no messages passes to the next.
+        `fallback_source` names the link that produced the
+        messages and `fallback_reason` why the chain ran.
+
+        Raises:
+            A2uiCompilationError: If no link produced messages.
         """
-        messages: list[AgentToRendererMessage] | None = None
-        source: FallbackSource | None = None
+        reason = _abstention_reason(abstained)
         if fallback_dsl and fallback_dsl.strip():
-            messages = self._compile_fallback_dsl(fallback_dsl, data, surface_id)
-            source = FallbackSource.DSL
-        elif self._fallback_fn is not None:
-            produced = self._fallback_fn(intent, data, surface_id)
-            if inspect.isawaitable(produced):
-                produced = await produced
-            messages = to_message_models(list(produced))
-            validate_payload(self.graph.catalogs, messages)
-            source = FallbackSource.CALLBACK
-        elif self._fallback_card:
-            messages = self._synthesize_fallback_card(
-                intent, data, pointers, surface_id=surface_id, config=config
+            messages = self._compile_fallback_dsl(
+                fallback_dsl, data, request.surface_id
             )
-            source = FallbackSource.CARD if messages else None
-        if not messages:
-            return abstained
-        return SynthesisOutput(
-            stage=SynthesisStage.ABSTAIN_FALLBACK,
+            if messages:
+                return self._fallback_output(
+                    abstained, messages, FallbackSource.DSL, reason, request
+                )
+        if self._fallback_fn is not None:
+            messages = await self._run_fallback_fn(intent, data, request.surface_id)
+            if messages:
+                return self._fallback_output(
+                    abstained, messages, FallbackSource.CALLBACK, reason, request
+                )
+        facts = self._facts_fallback(intent, data, pointers, request)
+        if facts is not None:
+            messages, operation = facts
+            return replace(
+                abstained,
+                messages=messages,
+                operation=operation,
+                fallback_source=FallbackSource.FACTS,
+                fallback_reason=reason,
+            )
+        raise A2uiCompilationError(
+            message=(
+                f"The decision model abstained ({reason}) and no fallback produced"
+                " messages."
+            ),
+            raw_content=intent,
+            help_message=_ABSTAIN_HELP,
+        )
+
+    def _fallback_output(
+        self,
+        abstained: SynthesisOutput,
+        messages: list[AgentToRendererMessage],
+        source: FallbackSource,
+        reason: str,
+        request: _SurfaceRequest,
+    ) -> SynthesisOutput:
+        """Wraps fallback messages, recreating an existing surface when they create it."""
+        messages, operation = _as_fresh_surface(messages, request)
+        return replace(
+            abstained,
             messages=messages,
-            confidence=abstained.confidence,
-            entropy=abstained.entropy,
+            operation=operation,
             fallback_source=source,
-            layout_plan=abstained.layout_plan,
-            trace=abstained.trace,
-            decision_latency_ms=abstained.decision_latency_ms,
-            decision_calls=abstained.decision_calls,
-            decision_answers=abstained.decision_answers,
+            fallback_reason=reason,
+        )
+
+    async def _run_fallback_fn(
+        self, intent: str, data: Mapping[str, Any], surface_id: str
+    ) -> list[AgentToRendererMessage]:
+        """Calls the host fallback callback and validates its messages."""
+        assert self._fallback_fn is not None
+        produced = self._fallback_fn(intent, data, surface_id)
+        if inspect.isawaitable(produced):
+            produced = await produced
+        messages = to_message_models(list(produced))
+        validate_payload(self.graph.catalogs, messages)
+        return messages
+
+    def _facts_fallback(
+        self,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+    ) -> tuple[list[AgentToRendererMessage], SurfaceOperation] | None:
+        """Renders the payload as one `facts` block, or None when that is impossible.
+
+        Uses the grammar's `facts` block, its pattern fallback chain in the
+        active library, and the planner's deterministic slot binding; no
+        model call is made.
+        """
+        plan = self._facts_plan(intent, data, pointers, request)
+        if plan is None:
+            return None
+        try:
+            expansion = self._expand_plan(plan)
+            operation = resolve_surface_operation(
+                request.operation,
+                send_data_model=expansion.send_data_model,
+                surface_sends_data_model=request.surface_sends_data_model,
+            )
+            messages = self._build_validated_messages(
+                request.surface_id,
+                list(expansion.components),
+                data,
+                operation,
+                send_data_model=expansion.send_data_model,
+            )
+        except (PatternError, A2uiValidationError):
+            return None
+        return messages, operation
+
+    def _facts_plan(
+        self,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+    ) -> LayoutPlan | None:
+        """Builds a one-block `facts` plan bound to `pointers`, if the catalog can draw it."""
+        if _FACTS_BLOCK not in self.archetypes.blocks:
+            return None
+        spec = self.archetypes.block(_FACTS_BLOCK)
+        resolved = resolve_fallback_pattern(spec, self.patterns)
+        if resolved is None:
+            return None
+        visible = [p for p in pointers if not is_secret_pointer(p)]
+        bindings = self.planner.bind_slots(
+            spec, visible, set(), payload=data, intent=intent
+        )
+        if not bindings.pointers():
+            return None
+        title = request.copy.title if request.copy is not None else None
+        return LayoutPlan(
+            archetype=_FACTS_BLOCK,
+            family="",
+            blocks=(
+                PlannedBlock(
+                    block_id=_FACTS_BLOCK,
+                    pattern=resolved.pattern,
+                    variant_knobs=resolved.knobs,
+                    bindings=bindings,
+                ),
+            ),
+            page=PageBindings(title=SlotBinding(literal=title)),
         )
 
     def _compile_fallback_dsl(
@@ -1120,7 +803,7 @@ class DecisionSynthesizer:
         if data and not any(_populates_data_model(m) for m in messages):
             messages.extend(
                 to_message_models([{
-                    "version": _wire_version(self.graph.protocol_version),
+                    "version": _WIRE_VERSION,
                     "updateDataModel": {
                         "surfaceId": surface_id,
                         "path": "/",
@@ -1131,136 +814,30 @@ class DecisionSynthesizer:
         validate_payload(self.graph.catalogs, messages)
         return messages
 
-    def _synthesize_fallback_card(
-        self,
-        intent: str,
-        data: Mapping[str, Any],
-        pointers: Sequence[PointerSummary],
-        *,
-        surface_id: str,
-        config: SynthesisConfig,
-    ) -> list[AgentToRendererMessage]:
-        """Builds a deterministic root container bound to the payload pointers.
-
-        Uses the first action-free container the catalogs define (or the first
-        action-free root candidate) and deterministic pointer overlap for child
-        slots, so the result is the same for the same catalogs and payload.
-        Action slots are never bound because confidence was low.
-        """
-        candidates = [
-            c
-            for c in (
-                *self.graph.container_candidates(),
-                *self.graph.leaf_candidates(),
-            )
-            if not c.has_action_slot
-        ]
-        if not candidates:
-            return []
-        for candidate in candidates:
-            try:
-                components = self._build_component_subtree(
-                    candidate,
-                    "root",
-                    intent,
-                    pointers,
-                    depth=1,
-                    allow_actions=False,
-                    config=config,
-                )
-                return self._build_validated_messages(surface_id, components, data)
-            except (_NoEligibleChildError, A2uiValidationError):
-                continue
-        return []
-
-    async def _try_template_stage(
-        self,
-        intent: str,
-        payload: Mapping[str, Any],
-        pointers: Sequence[PointerSummary],
-        *,
-        target_surface_id: str,
-        has_mutable: bool,
-        config: SynthesisConfig,
-    ) -> SynthesisOutput | None:
-        """Executes Stage 1 template matching and risk-tiered confidence gating."""
-        pointer_paths = [p.path for p in pointers]
-        matching = self.registry.matching_templates(pointer_paths)
-        if not matching:
-            return None
-
-        matching_descriptions = {
-            t.template_id: t.description for t in matching if t.description
-        }
-        query_context: dict[str, Any] = {"pointers": pointer_paths}
-        if matching_descriptions:
-            query_context["candidate_descriptions"] = matching_descriptions
-
-        dist = await self._backend_predict(
-            DecisionQuery(
-                task=DecisionTask.TEMPLATE_SELECT,
-                prompt=intent,
-                candidates=tuple(t.template_id for t in matching),
-                context=query_context,
-            )
-        )
-        if not _passes_calibration_gate(dist, config):
-            return None
-
-        top_id, top_prob = dist.top_choice()
-        template = self.registry.get(top_id)
-        if template is None:
-            return None
-
-        threshold = (
-            config.mutable_confidence_threshold
-            if (has_mutable or template.is_mutable)
-            else config.template_confidence_threshold
-        )
-        if top_prob < threshold:
-            return None
-
-        messages = template.render_messages(payload, surface_id=target_surface_id)
-        validate_payload(self.graph.catalogs, messages)
-        tree_spec: dict[str, Any] = {"template_id": template.template_id}
-        root_comp_name = template.root_component()
-        if root_comp_name is not None:
-            tree_spec["root_component"] = root_comp_name
-        return SynthesisOutput(
-            stage=SynthesisStage.TEMPLATE_SELECT,
-            messages=messages,
-            confidence=top_prob,
-            entropy=dist.normalized_entropy(),
-            selected_template_id=template.template_id,
-            component_tree_spec=tree_spec,
-        )
-
     async def _plan_layout(
         self,
         intent: str,
         data: Mapping[str, Any],
         pointers: Sequence[PointerSummary],
-        *,
-        brief: LayoutBrief | None,
-        config: SynthesisConfig,
-        copy: AuthoredCopy | None = None,
-        variety_seed: int | None = None,
+        request: _SurfaceRequest,
     ) -> tuple[PlanOutcome, PlannerState]:
-        """Builds a speculative batch, calls `backend.answer` (with at most one re-ask), and reads the plan."""
-        planner = (
-            self.planner
-            if config == self.config
-            else LayoutPlanner(self.archetypes, config, capabilities=self.patterns)
-        )
-        inner_backend = getattr(self.backend, "inner", self.backend)
-        use_two_stage = (
-            config.two_stage_batching
-            if config.two_stage_batching is not None
-            else isinstance(inner_backend, StepZeroLogprobBackend)
-        )
-        if use_two_stage:
+        """Builds the batch, calls `backend.answer`, and reads the plan.
+
+        One `answer` call, or two when `backend.capabilities.two_stage` is
+        set (family and archetype first, then the winning archetype's
+        questions).
+        """
+        planner = self.planner
+        templates = self.registry.matching_templates([p.path for p in pointers])
+        if self.backend.capabilities.two_stage:
             stage1_batch, state = planner.build_stage1_batch(
-                intent, pointers, brief=brief, payload=data, copy=copy
+                intent,
+                pointers,
+                brief=request.brief,
+                payload=data,
+                copy=request.copy,
+                templates=templates,
+                actions=request.actions,
             )
             stage1_answers = await self._backend_answer(stage1_batch)
             stage2_batch = planner.build_stage2_batch(state, stage1_answers)
@@ -1269,41 +846,19 @@ class DecisionSynthesizer:
                 if stage2_batch.questions
                 else ()
             )
-            answers: tuple[DecisionAnswer, ...] = (
-                *stage1_answers,
-                *stage2_answers,
-            )
-            batch = state.batch
+            answers: tuple[DecisionAnswer, ...] = (*stage1_answers, *stage2_answers)
         else:
             batch, state = planner.build_batch(
-                intent, pointers, brief=brief, payload=data, copy=copy
+                intent,
+                pointers,
+                brief=request.brief,
+                payload=data,
+                copy=request.copy,
+                templates=templates,
+                actions=request.actions,
             )
             answers = await self._backend_answer(batch)
-        outcome = planner.read(state, answers, seed=variety_seed)
-        if outcome.plan is None:
-            return outcome, state
-        reask = planner.needs_reask(outcome.plan, state)
-        if not reask:
-            return outcome, state
-        reask_batch = DecisionBatch(
-            shared_context={**batch.shared_context, "reask": True},
-            questions=reask,
-        )
-        reask_answers = await self._backend_answer(reask_batch)
-        reask_by_id = {ans.question_id: ans for ans in reask_answers}
-        existing_ids = {a.question_id for a in answers}
-        merged = tuple(reask_by_id.get(a.question_id, a) for a in answers) + tuple(
-            ans for ans in reask_answers if ans.question_id not in existing_ids
-        )
-        existing_q_ids = {q.id for q in state.batch.questions}
-        extra_questions = tuple(q for q in reask if q.id not in existing_q_ids)
-        if extra_questions:
-            state.batch = DecisionBatch(
-                shared_context=dict(state.batch.shared_context),
-                questions=(*state.batch.questions, *extra_questions),
-            )
-        state.trace.clear()
-        return planner.read(state, merged, seed=variety_seed), state
+        return planner.read(state, answers), state
 
     def _block_prefix_and_owner(
         self, block_id: str, pattern: str
@@ -1337,10 +892,14 @@ class DecisionSynthesizer:
             comp.setdefault("catalogId", default_cat)
             _stamp_function_calls(comp, default_cat)
 
-    def _expand_plan(self, plan: LayoutPlan) -> list[dict[str, Any]]:
-        """Expands every `PlannedBlock` and the `page` frame through `self.expander`."""
+    def _expand_plan(self, plan: LayoutPlan) -> Expansion:
+        """Expands every `PlannedBlock` and the `page` frame through `self.expander`.
+
+        The result lists the page components first, then each block's, and
+        carries the page expansion's surface-wide `send_data_model`.
+        """
         block_roots: list[str] = []
-        block_components: list[dict[str, Any]] = []
+        block_expansions: list[Expansion] = []
         for block in plan.blocks:
             prefix, owner = self._block_prefix_and_owner(block.block_id, block.pattern)
             expanded = self.expander.expand_block(
@@ -1351,32 +910,33 @@ class DecisionSynthesizer:
                 block.instances,
                 prefix,
             )
-            if expanded:
-                self._stamp_multi_catalog_id(expanded, owner)
-                block_roots.append(str(expanded[0]["id"]))
-                block_components.extend(expanded)
+            if expanded.components:
+                self._stamp_multi_catalog_id(expanded.components, owner)
+                block_roots.append(str(expanded.components[0]["id"]))
+                block_expansions.append(expanded)
         page_owner = (
             self.patterns.owner_catalog_id("page")
             if isinstance(self.patterns, MergedPatternLibrary)
             else None
         )
-        page_components = self.expander.expand_page(plan.page, block_roots=block_roots)
-        self._stamp_multi_catalog_id(page_components, page_owner)
-        return [*page_components, *block_components]
+        page = self.expander.expand_page(
+            plan.page, block_roots=block_roots, blocks=block_expansions
+        )
+        self._stamp_multi_catalog_id(page.components, page_owner)
+        components = list(page.components)
+        for expansion in block_expansions:
+            components.extend(expansion.components)
+        return Expansion(components=components, send_data_model=page.send_data_model)
 
-    def _finish_archetype_output(
-        self,
-        plan: LayoutPlan,
-        state: PlannerState,
-        components: list[dict[str, Any]],
-        data: Mapping[str, Any],
-        target_surface_id: str,
-    ) -> SynthesisOutput:
-        """Runs `lint_components`, validates wire messages, and builds `SynthesisOutput`."""
+    def _lint_trace(
+        self, plan: LayoutPlan, state: PlannerState, components: list[dict[str, Any]]
+    ) -> tuple[list[DecisionRecord], bool]:
+        """Runs `lint_components`, returning the trace with findings and whether any is an error."""
         trace = list(state.trace)
-        findings = lint_components(components, plan)
         has_error = False
-        for finding in findings:
+        for finding in lint_components(
+            components, plan, child_slot_keys=self._child_slot_keys
+        ):
             trace.append(
                 DecisionRecord(
                     question=DecisionQuestion(
@@ -1388,8 +948,20 @@ class DecisionSynthesizer:
                     outcome=f"{finding.severity}:{finding.code}",
                 )
             )
-            if finding.severity == "error":
-                has_error = True
+            has_error = has_error or finding.severity == "error"
+        return trace, has_error
+
+    def _finish_archetype_output(
+        self,
+        plan: LayoutPlan,
+        state: PlannerState,
+        expansion: Expansion,
+        data: Mapping[str, Any],
+        request: _SurfaceRequest,
+    ) -> SynthesisOutput:
+        """Lints, validates the wire messages, and builds the `SynthesisOutput`."""
+        components = list(expansion.components)
+        trace, has_error = self._lint_trace(plan, state, components)
         conf, entropy = _archetype_confidence_and_entropy(state, plan)
         if has_error:
             return SynthesisOutput(
@@ -1401,40 +973,28 @@ class DecisionSynthesizer:
                 trace=tuple(trace),
                 decision_answers=tuple(state.answers_by_id.values()),
             )
-        messages = self._build_validated_messages(target_surface_id, components, data)
-        root_comp = (
-            str(components[0].get("component", "Column")) if components else "Column"
+        operation = resolve_surface_operation(
+            request.operation,
+            send_data_model=expansion.send_data_model,
+            surface_sends_data_model=request.surface_sends_data_model,
+        )
+        messages = self._build_validated_messages(
+            request.surface_id,
+            components,
+            data,
+            operation,
+            send_data_model=expansion.send_data_model,
         )
         return SynthesisOutput(
             stage=SynthesisStage.ARCHETYPE,
             messages=messages,
             confidence=conf,
             entropy=entropy,
-            component_tree_spec={
-                "root_component": root_comp,
-                "archetype": plan.archetype,
-                "blocks": list(plan.block_ids()),
-                "layoutPlan": {
-                    "archetype": plan.archetype,
-                    "blocks": list(plan.block_ids()),
-                },
-                "components": components,
-            },
             layout_plan=plan,
             trace=tuple(trace),
             decision_answers=tuple(state.answers_by_id.values()),
+            operation=operation,
         )
-
-    def _family_chose_input(self, state: PlannerState, config: SynthesisConfig) -> bool:
-        """Returns whether the `family` answer in `state` selected `input` above threshold."""
-        fam_ans = state.answers_by_id.get("family")
-        if fam_ans is None:
-            return False
-        chosen, prob = fam_ans.top()
-        thresh = config.threshold_overrides.get(
-            "family", self.archetypes.threshold("family")
-        )
-        return chosen == "input" and prob >= thresh
 
     def _eligible_archetypes(
         self, pointers: Sequence[PointerSummary]
@@ -1451,50 +1011,40 @@ class DecisionSynthesizer:
             self._eligibility_cache.popitem(last=False)
         return result
 
-    def _should_retry_with_mutable_promotion(
-        self,
-        outcome: PlanOutcome,
-        state: PlannerState,
-        active_pointers: Sequence[PointerSummary],
-        config: SynthesisConfig,
-    ) -> bool:
-        """Returns whether planning should retry after promoting mutable pointers."""
-        return (
-            outcome.reason == "no_family"
-            and not any(p.mutable_hint for p in active_pointers)
-            and self._family_chose_input(state, config)
-        )
+    def _has_templates_for(self, pointers: Sequence[PointerSummary]) -> bool:
+        """Whether any registered template matches the payload's pointers.
 
-    def _prepare_archetype_pointers(
-        self,
-        pointers: Sequence[PointerSummary],
-        brief: LayoutBrief | None,
-    ) -> Sequence[PointerSummary]:
-        """Promotes mutable pointers when `brief` pins mutable roles."""
-        if (
-            brief is not None
-            and not any(p.mutable_hint for p in pointers)
-            and any(r in _MUTABLE_BRIEF_ROLES for r in brief.roles())
-        ):
-            return _promote_mutable_pointers(pointers, brief)
-        return pointers
+        A matching template keeps the batch worth asking even when no
+        archetype is eligible (for example, a catalog with no patterns).
+        """
+        return bool(self.registry.matching_templates([p.path for p in pointers]))
+
+    def _action_gate_output(
+        self, state: PlannerState, trace: list[DecisionRecord]
+    ) -> SynthesisOutput:
+        _record_trace_reason(trace, "action_gate", "Action confidence gate")
+        conf, entropy = _archetype_confidence_and_entropy(state, None)
+        return SynthesisOutput(
+            stage=SynthesisStage.ABSTAIN_FALLBACK,
+            messages=[],
+            confidence=conf,
+            entropy=entropy,
+            trace=tuple(trace),
+            decision_answers=tuple(state.answers_by_id.values()),
+        )
 
     async def _synthesize_with_archetypes(
         self,
         intent: str,
         data: Mapping[str, Any],
         pointers: Sequence[PointerSummary],
-        *,
-        target_surface_id: str,
-        brief: LayoutBrief | None,
-        config: SynthesisConfig,
-        copy: AuthoredCopy | None = None,
-        variety_seed: int | None = None,
+        request: _SurfaceRequest,
     ) -> tuple[SynthesisOutput | None, tuple[DecisionRecord, ...]]:
         """Attempts archetype-planned synthesis, returning `(output, trace)`."""
-        active_pointers = self._prepare_archetype_pointers(pointers, brief)
-        if not self._eligible_archetypes(active_pointers):
-            trace: list[DecisionRecord] = []
+        trace: list[DecisionRecord] = []
+        if not self._eligible_archetypes(pointers) and not self._has_templates_for(
+            pointers
+        ):
             _record_trace_reason(
                 trace,
                 "no eligible archetype",
@@ -1502,63 +1052,25 @@ class DecisionSynthesizer:
                 " payload?",
             )
             return None, tuple(trace)
-        trace = []
         try:
-            outcome, state = await self._plan_layout(
-                intent,
-                data,
-                active_pointers,
-                brief=brief,
-                config=config,
-                copy=copy,
-                variety_seed=variety_seed,
-            )
-            if self._should_retry_with_mutable_promotion(
-                outcome, state, active_pointers, config
-            ):
-                promoted = _promote_mutable_pointers(active_pointers, brief)
-                if any(
-                    a.family == "input" for a in self._eligible_archetypes(promoted)
-                ):
-                    outcome, state = await self._plan_layout(
-                        intent,
-                        data,
-                        promoted,
-                        brief=brief,
-                        config=config,
-                        copy=copy,
-                        variety_seed=variety_seed,
-                    )
+            outcome, state = await self._plan_layout(intent, data, pointers, request)
             trace = list(state.trace)
             if outcome.reason == "action_gate":
-                _record_trace_reason(trace, "action_gate", "Action confidence gate")
-                conf, entropy = _archetype_confidence_and_entropy(state, None)
-                return (
-                    SynthesisOutput(
-                        stage=SynthesisStage.ABSTAIN_FALLBACK,
-                        messages=[],
-                        confidence=conf,
-                        entropy=entropy,
-                        trace=tuple(trace),
-                        decision_answers=tuple(state.answers_by_id.values()),
-                    ),
-                    tuple(trace),
-                )
+                gated = self._action_gate_output(state, trace)
+                return gated, gated.trace
             if outcome.reason != "planned" or outcome.plan is None:
                 _record_trace_reason(
                     trace, str(outcome.reason), "Archetype planning outcome"
                 )
                 return None, tuple(trace)
-            components = self._expand_plan(outcome.plan)
+            if outcome.plan.template_id is not None:
+                rendered = self._render_template(outcome.plan, state, data, request)
+                return rendered, rendered.trace
             finished = self._finish_archetype_output(
-                outcome.plan, state, components, data, target_surface_id
+                outcome.plan, state, self._expand_plan(outcome.plan), data, request
             )
             return finished, finished.trace
-        except (
-            _NoEligibleChildError,
-            PatternError,
-            A2uiValidationError,
-        ) as exc:
+        except (PatternError, A2uiValidationError) as exc:
             _record_trace_reason(
                 trace,
                 f"{type(exc).__name__}: {exc}",
@@ -1571,23 +1083,11 @@ class DecisionSynthesizer:
         intent: str,
         payload: Mapping[str, Any],
         pointers: Sequence[PointerSummary],
-        *,
-        target_surface_id: str,
-        config: SynthesisConfig,
-        layout: LayoutBrief | None = None,
-        copy: AuthoredCopy | None = None,
-        variety_seed: int | None = None,
+        request: _SurfaceRequest,
     ) -> SynthesisOutput:
-        """Executes Stage 2 archetype-planned synthesis or Stage 3 abstain fallback."""
+        """Runs archetype-planned synthesis, or returns an empty abstention."""
         arch_out, arch_trace = await self._synthesize_with_archetypes(
-            intent,
-            payload,
-            pointers,
-            target_surface_id=target_surface_id,
-            brief=layout,
-            config=config,
-            copy=copy,
-            variety_seed=variety_seed,
+            intent, payload, pointers, request
         )
         if arch_out is not None:
             return arch_out
@@ -1599,388 +1099,39 @@ class DecisionSynthesizer:
             trace=arch_trace,
         )
 
-    def _init_component_dict(
-        self, spec: ComponentNodeSpec, comp_id: str
-    ) -> dict[str, Any]:
-        """Creates a base component dictionary with `id`, `component`, and optional `catalogId`."""
-        comp: dict[str, Any] = {"id": comp_id, "component": spec.name}
-        if self.graph.surface_catalog_id is None:
-            comp["catalogId"] = spec.catalog_id
-        return comp
-
-    def _build_leaf_dict(
-        self,
-        spec: ComponentNodeSpec,
-        comp_id: str,
-        intent: str,
-        pointers: Sequence[PointerSummary],
-        *,
-        relative: bool,
-        allow_actions: bool = True,
-    ) -> dict[str, Any]:
-        """Builds a single leaf component dictionary bound to `pointers`."""
-        is_v10 = _is_v10(self.graph.protocol_version)
-        comp = self._init_component_dict(spec, comp_id)
-        _bind_non_child_slots(
-            comp,
-            spec,
-            intent,
-            pointers,
-            is_v10=is_v10,
-            relative=relative,
-            allow_actions=allow_actions,
-        )
-        checks = _build_checks(
-            self.graph, spec, pointers, is_v10=is_v10, relative=relative
-        )
-        if checks:
-            comp["checks"] = checks
-        return comp
-
-    def _coerce_to_leaf_if_depth_reached(
-        self,
-        spec: ComponentNodeSpec,
-        pointers: Sequence[PointerSummary],
-        *,
-        depth: int,
-        allow_actions: bool,
-        config: SynthesisConfig,
-    ) -> ComponentNodeSpec:
-        """Replaces a container `spec` with a leaf when `depth` hits `max_tree_depth`."""
-        if not spec.is_container or depth < config.max_tree_depth:
-            return spec
-        leaf_pool = [
-            c
-            for c in self.graph.leaf_candidates()
-            if allow_actions or not c.has_action_slot
-        ]
-        if not leaf_pool:
-            return spec
-        return _best_leaf_by_pointer_overlap(leaf_pool, pointers)
-
-    def _populate_child_list_slot(
-        self,
-        comp: dict[str, Any],
-        parent_name: str,
-        slot_name: str,
-        item_id: str,
-        intent: str,
-        pointers: Sequence[PointerSummary],
-        *,
-        allow_actions: bool,
-    ) -> dict[str, Any]:
-        """Populates `comp[slot_name]` for a `CHILD_LIST` slot and returns the child component."""
-        if any(p.value_type == "array" for p in pointers):
-            item_comp, array_path = self._build_child_list_item(
-                parent_name,
-                slot_name,
-                item_id,
-                intent,
-                pointers,
-                allow_actions=allow_actions,
-            )
-            comp[slot_name] = {"path": array_path, "componentId": item_id}
-            return item_comp
-        item_comp = self._build_single_child(
-            parent_name,
-            slot_name,
-            item_id,
-            intent,
-            pointers,
-            allow_actions=allow_actions,
-        )
-        comp[slot_name] = [item_id]
-        return item_comp
-
-    def _build_component_subtree(
-        self,
-        spec: ComponentNodeSpec,
-        comp_id: str,
-        intent: str,
-        pointers: Sequence[PointerSummary],
-        *,
-        depth: int = 1,
-        allow_actions: bool = True,
-        config: SynthesisConfig,
-    ) -> list[dict[str, Any]]:
-        """Builds a component and any child components required by its container slots."""
-        effective_spec = self._coerce_to_leaf_if_depth_reached(
-            spec,
-            pointers,
-            depth=depth,
-            allow_actions=allow_actions,
-            config=config,
-        )
-        if not effective_spec.is_container:
-            return [
-                self._build_leaf_dict(
-                    effective_spec,
-                    comp_id,
-                    intent,
-                    pointers,
-                    relative=False,
-                    allow_actions=allow_actions,
-                )
-            ]
-
-        is_v10 = _is_v10(self.graph.protocol_version)
-        comp = self._init_component_dict(effective_spec, comp_id)
-        _bind_non_child_slots(
-            comp,
-            effective_spec,
-            intent,
-            pointers,
-            is_v10=is_v10,
-            relative=False,
-            allow_actions=allow_actions,
-        )
-
-        children: list[dict[str, Any]] = []
-        prefix = "" if comp_id == "root" else f"{comp_id}_"
-        child_counter = 0
-
-        for slot in effective_spec.slots:
-            if not slot.required and len(children) >= config.max_children_per_container:
-                continue
-            if slot.kind == SlotKind.CHILD_LIST:
-                child_counter += 1
-                item_id = f"{prefix}item_{child_counter}"
-                children.append(
-                    self._populate_child_list_slot(
-                        comp,
-                        effective_spec.name,
-                        slot.name,
-                        item_id,
-                        intent,
-                        pointers,
-                        allow_actions=allow_actions,
-                    )
-                )
-            elif slot.kind == SlotKind.CHILD:
-                child_counter += 1
-                child_id = f"{prefix}child_{child_counter}"
-                child_comp = self._build_single_child(
-                    effective_spec.name,
-                    slot.name,
-                    child_id,
-                    intent,
-                    pointers,
-                    allow_actions=allow_actions,
-                )
-                comp[slot.name] = child_id
-                children.append(child_comp)
-            elif slot.kind == SlotKind.NAMED_CHILD_ARRAY:
-                remaining = max(1, config.max_children_per_container - len(children))
-                named_items, named_children = self._build_named_child_array(
-                    effective_spec.name,
-                    slot,
-                    prefix,
-                    intent,
-                    pointers,
-                    max_items=remaining,
-                    allow_actions=allow_actions,
-                )
-                comp[slot.name] = named_items
-                children.extend(named_children)
-
-        checks = _build_checks(
-            self.graph, effective_spec, pointers, is_v10=is_v10, relative=False
-        )
-        if checks:
-            comp["checks"] = checks
-
-        return [comp, *children]
-
-    def _build_child_list_item(
-        self,
-        parent_name: str,
-        slot_name: str,
-        item_id: str,
-        intent: str,
-        pointers: Sequence[PointerSummary],
-        *,
-        allow_actions: bool = True,
-    ) -> tuple[dict[str, Any], str]:
-        """Synthesizes a repeating leaf component for a `CHILD_LIST` slot."""
-        array_ptr = next((p for p in pointers if p.value_type == "array"), None)
-        array_path = array_ptr.path if array_ptr is not None else f"/{slot_name}"
-        rel_pointers = _relative_pointers_for_array(array_ptr, pointers)
-        item_spec = self._pick_deterministic_leaf(
-            slot_name,
-            parent_name,
-            rel_pointers,
-            allow_actions=allow_actions,
-        )
-        item_comp = self._build_leaf_dict(
-            item_spec,
-            item_id,
-            intent,
-            rel_pointers,
-            relative=True,
-            allow_actions=allow_actions,
-        )
-        return item_comp, array_path
-
-    def _build_single_child(
-        self,
-        parent_name: str,
-        slot_name: str,
-        child_id: str,
-        intent: str,
-        pointers: Sequence[PointerSummary],
-        *,
-        allow_actions: bool = True,
-    ) -> dict[str, Any]:
-        """Synthesizes a scalar-bound leaf component for a `CHILD` slot."""
-        scalar_ptrs = [p for p in pointers if p.value_type != "array"] or list(pointers)
-        child_spec = self._pick_deterministic_leaf(
-            slot_name,
-            parent_name,
-            scalar_ptrs,
-            allow_actions=allow_actions,
-        )
-        return self._build_leaf_dict(
-            child_spec,
-            child_id,
-            intent,
-            scalar_ptrs,
-            relative=False,
-            allow_actions=allow_actions,
-        )
-
-    def _select_named_child_specs(
-        self,
-        parent_name: str,
-        *,
-        max_items: int,
-        allow_actions: bool,
-    ) -> list[ComponentNodeSpec]:
-        """Selects up to `max_items` leaf specs for a `NAMED_CHILD_ARRAY` slot."""
-        del parent_name
-        raw_leaves = [
-            c
-            for c in self.graph.leaf_candidates()
-            if allow_actions or not c.has_action_slot
-        ]
-        if not raw_leaves:
-            return []
-        cap = min(2, max(1, max_items))
-        return raw_leaves[:cap] if len(raw_leaves) >= cap else (raw_leaves * cap)[:cap]
-
-    def _build_named_child_array(
-        self,
-        parent_name: str,
-        slot: ComponentSlot,
-        prefix: str,
-        intent: str,
-        pointers: Sequence[PointerSummary],
-        *,
-        max_items: int = 2,
-        allow_actions: bool = True,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Synthesizes child leaf views for a `NAMED_CHILD_ARRAY` slot."""
-        scalar_ptrs = [p for p in pointers if p.value_type != "array"] or list(pointers)
-        fallback_specs = self._select_named_child_specs(
-            parent_name, max_items=max_items, allow_actions=allow_actions
-        )
-        if not fallback_specs:
-            raise _NoEligibleChildError(
-                f"No eligible leaf candidates available for child slot '{slot.name}'"
-                f" on '{parent_name}'."
-            )
-        items: list[dict[str, Any]] = []
-        children: list[dict[str, Any]] = []
-        for idx, _ in enumerate(fallback_specs, start=1):
-            view_ptrs = (
-                [scalar_ptrs[idx - 1]] if idx <= len(scalar_ptrs) else scalar_ptrs
-            )
-            child_spec = self._pick_deterministic_leaf(
-                f"{slot.name}[{idx - 1}]",
-                parent_name,
-                view_ptrs,
-                allow_actions=allow_actions,
-            )
-            child_id = f"{prefix}view_{idx}"
-            children.append(
-                self._build_leaf_dict(
-                    child_spec,
-                    child_id,
-                    intent,
-                    view_ptrs,
-                    relative=False,
-                    allow_actions=allow_actions,
-                )
-            )
-            items.append(_named_child_entry(slot, child_spec, child_id, view_ptrs, idx))
-        return items, children
-
-    def _eligible_child_candidates(
-        self,
-        child_pointers: Sequence[PointerSummary],
-        *,
-        allow_actions: bool,
-    ) -> tuple[ComponentNodeSpec, ...]:
-        """Narrows leaf candidates to those that can bind `child_pointers`.
-
-        Drops action-bearing components when actions are not allowed, then
-        prefers components with a data slot whose required array slots the
-        pointers can satisfy.
-        """
-        raw_candidates = [
-            c
-            for c in self.graph.leaf_candidates()
-            if allow_actions or not c.has_action_slot
-        ]
-        if not raw_candidates:
-            return ()
-        filtered = list(raw_candidates)
-        ptr_types = {p.value_type for p in child_pointers}
-        data_capable = [c for c in filtered if _can_bind_data_pointers(c, ptr_types)]
-        if child_pointers and data_capable:
-            filtered = data_capable
-        return tuple(filtered)
-
-    def _pick_deterministic_leaf(
-        self,
-        slot_name: str,
-        parent_name: str,
-        child_pointers: Sequence[PointerSummary],
-        *,
-        allow_actions: bool = False,
-    ) -> ComponentNodeSpec:
-        """Selects a leaf component for a container slot by pointer overlap."""
-        candidates = self._eligible_child_candidates(
-            child_pointers, allow_actions=allow_actions
-        )
-        if not candidates:
-            raise _NoEligibleChildError(
-                f"No eligible leaf candidates available for child slot '{slot_name}'"
-                f" on '{parent_name}'."
-            )
-        return _best_leaf_by_pointer_overlap(candidates, child_pointers)
-
     def _build_validated_messages(
         self,
         surface_id: str,
         components: list[dict[str, Any]],
         payload: Mapping[str, Any],
+        operation: SurfaceOperation = SurfaceOperation.CREATE,
+        *,
+        send_data_model: bool = False,
     ) -> list[AgentToRendererMessage]:
-        """Builds and validates `createSurface`, `updateComponents`, and `updateDataModel`."""
-        wire_ver = _wire_version(self.graph.protocol_version)
-        create_body: dict[str, Any] = {"surfaceId": surface_id}
-        if self.graph.surface_catalog_id is not None:
-            create_body["catalogId"] = self.graph.surface_catalog_id
+        """Builds and validates the wire messages for `operation`.
 
-        raw_messages: list[dict[str, Any]] = [
-            {"version": wire_ver, "createSurface": create_body},
-            {
-                "version": wire_ver,
-                "updateComponents": {
-                    "surfaceId": surface_id,
-                    "components": components,
-                },
-            },
-        ]
+        `CREATE` emits `createSurface` (with `sendDataModel` when needed),
+        `updateComponents`, and `updateDataModel`. `UPDATE_ROOT` emits only
+        `updateComponents` and `updateDataModel`, relying on stable per-block
+        component ids. `REPLACE` emits `deleteSurface` and then `CREATE`.
+        """
+        wire_ver = _WIRE_VERSION
+        raw_messages: list[dict[str, Any]] = []
+        if operation is SurfaceOperation.REPLACE:
+            raw_messages.append(
+                {"version": wire_ver, "deleteSurface": {"surfaceId": surface_id}}
+            )
+        if operation is not SurfaceOperation.UPDATE_ROOT:
+            create_body: dict[str, Any] = {"surfaceId": surface_id}
+            if self.graph.surface_catalog_id is not None:
+                create_body["catalogId"] = self.graph.surface_catalog_id
+            if send_data_model:
+                create_body["sendDataModel"] = True
+            raw_messages.append({"version": wire_ver, "createSurface": create_body})
+        raw_messages.append({
+            "version": wire_ver,
+            "updateComponents": {"surfaceId": surface_id, "components": components},
+        })
         if payload:
             raw_messages.append({
                 "version": wire_ver,
