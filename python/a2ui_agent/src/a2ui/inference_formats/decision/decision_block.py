@@ -42,6 +42,8 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "actions": ("actions",),
     "exclude": ("exclude",),
     "replace": ("replace",),
+    "region": ("region",),
+    "labels": ("labels",),
 }
 
 
@@ -153,6 +155,59 @@ def _parse_replace(raw: Any) -> bool:
     return raw
 
 
+def _parse_region(raw: Any) -> str | None:
+    """Validates an optional ``region`` block role identifier."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise TypeError(
+            f"Decision block field 'region' must be a string, got {type(raw).__name__}."
+        )
+    stripped = raw.strip()
+    if not stripped:
+        raise ValueError("Decision block field 'region' must be a non-empty string.")
+    return stripped
+
+
+def _parse_one_label(raw_key: Any, raw_value: Any) -> tuple[str, str]:
+    """Validates one ``(pointer, label)`` entry of the ``labels`` map."""
+    if not isinstance(raw_key, str):
+        raise TypeError(
+            "Decision block field 'labels' requires string JSON Pointer keys,"
+            f" got {type(raw_key).__name__}."
+        )
+    pointer = raw_key.strip()
+    if not pointer.startswith("/") or pointer == "/":
+        raise ValueError(
+            "Decision block field 'labels' keys must be JSON Pointers"
+            f" starting with '/', got {raw_key!r}."
+        )
+    if not isinstance(raw_value, str):
+        raise TypeError(
+            f"Decision block field 'labels' value for {pointer!r} must be a"
+            f" string, got {type(raw_value).__name__}."
+        )
+    label = raw_value.strip()
+    if not label:
+        raise ValueError(
+            f"Decision block field 'labels' value for {pointer!r} must be a"
+            " non-empty string."
+        )
+    return pointer, label
+
+
+def _parse_labels(raw: Any) -> dict[str, str]:
+    """Validates an optional ``labels`` mapping from JSON Pointer to display label."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "Decision block field 'labels' must be an object mapping JSON"
+            " Pointers to label strings."
+        )
+    return dict(_parse_one_label(k, v) for k, v in raw.items())
+
+
 @dataclass(frozen=True)
 class DecisionBlock:
     """One decision request: what to show and the data to show it with.
@@ -175,10 +230,9 @@ class DecisionBlock:
         replace: When True, the surface is deleted and created again instead
             of updated in place.
         region: Id of one planned block to re-plan on an existing surface,
-            or None to update the whole surface. Not yet read by
-            `from_mapping`.
+            or None to update the whole surface.
         labels: Display labels keyed by JSON Pointer, overriding the
-            humanized keys. Not yet read by `from_mapping`.
+            humanized keys.
     """
 
     intent: str
@@ -195,18 +249,21 @@ class DecisionBlock:
     region: str | None = None
     labels: Mapping[str, str] = field(default_factory=dict, hash=False)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "labels", dict(self.labels))
+
     @classmethod
     def from_mapping(cls, source: Mapping[str, Any]) -> DecisionBlock:
         """Reads a block from a parsed JSON object.
 
         Accepts the camelCase wire names (`surfaceId`, `fallbackDsl`,
         `layout`, `mutablePaths`, `title`, `summary`, `actions`, `exclude`,
-        `replace`) and their snake_case spellings.
+        `replace`, `region`, `labels`) and their snake_case spellings.
 
         Raises:
             ValueError: If `intent` is missing or blank, `payload` is a
-                string that is not valid JSON, or an action or `exclude`
-                pointer is malformed.
+                string that is not valid JSON, or an action, `exclude`,
+                `region`, or `labels` entry is malformed.
             TypeError: If `payload` is missing or is neither an object nor an
                 array, or an optional field has the wrong type.
         """
@@ -251,6 +308,8 @@ class DecisionBlock:
             actions=_parse_actions(_first_present(source, _FIELD_ALIASES["actions"])),
             exclude=_parse_exclude(_first_present(source, _FIELD_ALIASES["exclude"])),
             replace=_parse_replace(_first_present(source, _FIELD_ALIASES["replace"])),
+            region=_parse_region(_first_present(source, _FIELD_ALIASES["region"])),
+            labels=_parse_labels(_first_present(source, _FIELD_ALIASES["labels"])),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -274,6 +333,10 @@ class DecisionBlock:
             out["exclude"] = list(self.exclude)
         if self.replace:
             out["replace"] = True
+        if self.region is not None:
+            out["region"] = self.region
+        if self.labels:
+            out["labels"] = dict(self.labels)
         return out
 
     def to_synthesis_kwargs(
@@ -282,9 +345,9 @@ class DecisionBlock:
         """Builds keyword arguments for `DecisionSynthesizer.synthesize`.
 
         Keys: `actions`, `exclude`, `mutable_paths`, `fallback_dsl`, `layout`,
-        `title`, `summary`, and `surface_id` when one is known. `replace` is
-        not a synthesis argument: the caller turns it into the
-        `SurfaceOperation` it passes as `operation`.
+        `title`, `summary`, `labels`, `region`, and `surface_id` when one is
+        known. `replace` is not a synthesis argument: the caller turns it into
+        the `SurfaceOperation` it passes as `operation`.
         """
         kwargs: dict[str, Any] = {
             "actions": self.actions,
@@ -294,6 +357,8 @@ class DecisionBlock:
             "layout": self.layout or None,
             "title": self.title,
             "summary": self.summary,
+            "labels": dict(self.labels) if self.labels else None,
+            "region": self.region,
         }
         surface_id = self.surface_id or default_surface_id
         if surface_id is not None:

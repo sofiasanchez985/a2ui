@@ -28,6 +28,7 @@ from a2ui.inference_formats.decision import (
     DecisionAnswer,
     DecisionBackendError,
     DecisionBatch,
+    DecisionRenderTool,
     DecisionSynthesizer,
     DeterministicMockBackend,
     FallbackSource,
@@ -73,7 +74,19 @@ HOST_DETAIL_SCRIPTED: dict[str, ScriptedValue] = {
     "gate:actions": 0.10,
 }
 
-ABSTAIN: dict[str, ScriptedValue] = {"family": {"none": 1.0}}
+ABSTAIN: dict[str, ScriptedValue] = {
+    "family": {
+        "browse": 0.20,
+        "monitor": 0.20,
+        "inspect": 0.20,
+        "act": 0.20,
+        "input": 0.10,
+        "follow": 0.10,
+        "none": 0.0,
+    }
+}
+
+NO_FIT_SCRIPTED: dict[str, ScriptedValue] = {"family": ("none", 0.90)}
 
 CATALOG = BasicCatalog("v1.0")
 
@@ -486,3 +499,98 @@ def test_lint_uses_catalog_child_slots_so_empty_containers_are_caught() -> None:
     empty = [{"id": "root", "component": "Column", "children": []}]
     findings = lint_components(empty, child_slot_keys=synth._child_slot_keys)
     assert any(f.code == LintCode.EMPTY_CONTAINER for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_no_fit_routes_through_fallback_chain_in_order() -> None:
+    calls: list[str] = []
+
+    async def fallback_fn(intent: str, payload: Any, surface_id: str) -> Any:
+        calls.append(surface_id)
+        return [{
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": surface_id,
+                "catalogId": CATALOG.catalog_id,
+                "components": [
+                    {"id": "root", "component": "Text", "text": "Callback UI"}
+                ],
+            },
+        }]
+
+    # 1. fallback_dsl wins first when supplied.
+    dsl_out = await _synth(NO_FIT_SCRIPTED, fallback_fn=fallback_fn).synthesize(
+        HOST.intent,
+        HOST.payload,
+        surface_id="s1",
+        fallback_dsl='root = Text("Free-form canvas")',
+    )
+    assert dsl_out.stage is SynthesisStage.ABSTAIN_FALLBACK
+    assert dsl_out.fallback_source is FallbackSource.DSL
+    assert dsl_out.fallback_reason == "no_fit"
+    assert calls == []
+
+    # 2. fallback_fn runs next when fallback_dsl is absent.
+    fn_out = await _synth(NO_FIT_SCRIPTED, fallback_fn=fallback_fn).synthesize(
+        HOST.intent, HOST.payload, surface_id="s2"
+    )
+    assert fn_out.stage is SynthesisStage.ABSTAIN_FALLBACK
+    assert fn_out.fallback_source is FallbackSource.CALLBACK
+    assert fn_out.fallback_reason == "no_fit"
+    assert calls == ["s2"]
+
+    # 3. facts fallback runs when neither fallback_dsl nor fallback_fn applies.
+    facts_out = await _synth(NO_FIT_SCRIPTED).synthesize(HOST.intent, HOST.payload)
+    assert facts_out.stage is SynthesisStage.ABSTAIN_FALLBACK
+    assert facts_out.fallback_source is FallbackSource.FACTS
+    assert facts_out.fallback_reason == "no_fit"
+
+    # 4. Raises A2uiCompilationError when no fallback produces messages
+    # (for example, a payload whose only scalar is a secret pointer that
+    # `_facts_plan` refuses to render).
+    with pytest.raises(A2uiCompilationError, match="no_fit"):
+        await _synth(NO_FIT_SCRIPTED).synthesize(
+            "Draw a game canvas", {"apiToken": "secret-token"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_labels_override_humanized_keys_in_rendered_components() -> None:
+    out = await _synth(HOST_SCRIPTED).synthesize(
+        HOST.intent,
+        HOST.payload,
+        labels={"/cpu": "Processor load", "/host": "Database node"},
+    )
+    texts = [str(c.get("text", "")) for c in _components(out.messages)]
+    assert any("Processor load" in t for t in texts)
+    assert any("Database node" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_cache_and_promote_exports_cached_plan() -> None:
+    backend = mock_backend(**HOST_SCRIPTED)
+    tool = DecisionRenderTool.create([CATALOG], backend=backend, surface_id="ops")
+
+    with pytest.raises(ValueError, match="No cached plan"):
+        tool.promote("host_tpl", "Host status template")
+
+    first = await tool.run_async({"intent": HOST.intent, "payload": dict(HOST.payload)})
+    assert first.cache_hit is False
+    assert first.decision_calls == 1
+    assert len(backend.batches) == 1
+
+    second = await tool.run_async(
+        {"intent": HOST.intent, "payload": {**HOST.payload, "cpu": 0.35}}
+    )
+    assert second.cache_hit is True
+    assert second.decision_calls == 0
+    assert len(backend.batches) == 1
+
+    template = tool.promote("host_tpl", "Host status template")
+    assert tool.synthesizer.registry.get("host_tpl") is template
+    assert template.surface_id == "ops"
+    assert template.catalog_id == CATALOG.catalog_id
+    assert "/cpu" in template.required_pointers
+    assert "/host" in template.required_pointers
+    rendered = template.render_messages(HOST.payload)
+    validate_payload([CATALOG], rendered)

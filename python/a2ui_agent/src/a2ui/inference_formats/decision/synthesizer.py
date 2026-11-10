@@ -22,11 +22,11 @@ from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 import concurrent.futures
 import contextvars
 import copy as copy_lib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import inspect
 import re
 import time
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from a2ui.core import A2uiValidationError, CatalogApi
 from a2ui.core.schema import AgentToRendererMessage
@@ -45,14 +45,17 @@ from .models import (
     AuthoredCopy,
     DecisionAnswer,
     DecisionBatch,
+    DecisionDistribution,
     DecisionQuestion,
     DecisionRecord,
     FallbackSource,
     LayoutBrief,
     LayoutPlan,
     PageBindings,
+    PlanCacheKey,
     PlannedBlock,
     PlanOutcome,
+    PlanReason,
     QuestionKind,
     SlotBinding,
     SlotKind,
@@ -61,6 +64,7 @@ from .models import (
     SynthesisOutput,
     SynthesisStage,
     coerce_decision_payload,
+    plan_shape_signature,
 )
 from .patterns import (
     Expansion,
@@ -76,7 +80,11 @@ from .payload_inspector import (
     PointerSummary,
     inspect_payload_pointers,
 )
+from .plan_cache import CachedPlan, PlanCache, replace_block_components
 from .template_registry import TemplateRegistry
+
+if TYPE_CHECKING:
+    from a2ui.utils import RendererState
 
 # Key under which a top-level JSON array payload is stored in the data model.
 _ARRAY_PAYLOAD_KEY = "items"
@@ -251,6 +259,8 @@ def _require_v10(graph: CatalogDecisionGraph) -> None:
 
 def _abstention_reason(abstained: SynthesisOutput) -> str:
     """The last planning outcome recorded in the trace, as the fallback reason."""
+    if abstained.fallback_reason:
+        return abstained.fallback_reason
     for record in reversed(abstained.trace):
         if record.outcome:
             return record.outcome
@@ -267,6 +277,31 @@ def _creates_surface(
     )
 
 
+def _extract_components_from_messages(
+    messages: Sequence[AgentToRendererMessage],
+) -> tuple[dict[str, Any], ...]:
+    """Extracts the component dicts emitted by `messages`."""
+    for d in to_message_dicts(messages):
+        upd = d.get("updateComponents")
+        if isinstance(upd, Mapping) and isinstance(upd.get("components"), list):
+            return tuple(copy_lib.deepcopy(dict(c)) for c in upd["components"])
+        create = d.get("createSurface")
+        if isinstance(create, Mapping) and isinstance(create.get("components"), list):
+            return tuple(copy_lib.deepcopy(dict(c)) for c in create["components"])
+    return ()
+
+
+def _creates_with_send_data_model(
+    messages: Sequence[AgentToRendererMessage],
+) -> bool:
+    """Whether `messages` set `sendDataModel: true` on `createSurface`."""
+    return any(
+        isinstance(d.get("createSurface"), Mapping)
+        and bool(d["createSurface"].get("sendDataModel"))
+        for d in to_message_dicts(messages)
+    )
+
+
 @dataclass(frozen=True)
 class _SurfaceRequest:
     """Per-call settings that `synthesize` threads through planning and output."""
@@ -277,6 +312,8 @@ class _SurfaceRequest:
     actions: tuple[ActionSpec, ...] = ()
     operation: SurfaceOperation = SurfaceOperation.CREATE
     surface_sends_data_model: bool = False
+    labels: Mapping[str, str] = field(default_factory=dict, hash=False)
+    region: str | None = None
 
 
 def _without_excluded(
@@ -289,6 +326,61 @@ def _without_excluded(
         p
         for p in pointers
         if not any(p.path == ex or p.path.startswith(f"{ex}/") for ex in exclude)
+    )
+
+
+def _find_block(plan: LayoutPlan | None, block_id: str) -> PlannedBlock | None:
+    if plan is None:
+        return None
+    for block in plan.blocks:
+        if block.block_id == block_id:
+            return block
+    return None
+
+
+def _claimed_by_other_blocks(plan: LayoutPlan, block_id: str) -> set[str]:
+    return {
+        ptr
+        for block in plan.blocks
+        if block.block_id != block_id
+        for ptr in block.bindings.pointers()
+    }
+
+
+def _with_labels(
+    pointers: Sequence[PointerSummary], labels: Mapping[str, str] | None
+) -> tuple[PointerSummary, ...]:
+    """Overrides `PointerSummary.label` for pointers named in `labels`."""
+    if not labels:
+        return tuple(pointers)
+    return tuple(
+        replace(p, label=labels[p.path]) if p.path in labels else p for p in pointers
+    )
+
+
+def _pinned_plan_answer(
+    question: DecisionQuestion, plan: LayoutPlan, block_id: str
+) -> DecisionAnswer:
+    """Builds a synthetic `DecisionAnswer` pinning `plan`'s non-target choices."""
+    cands = question.candidates()
+    probs = {c: 0.0 for c in cands}
+    active_ids = set(plan.block_ids()) | {block_id}
+    if question.id == "family" and plan.family in probs:
+        probs[plan.family] = 1.0
+    elif question.id == f"archetype:{plan.family}" and plan.archetype in probs:
+        probs[plan.archetype] = 1.0
+    elif question.id.startswith("gate:"):
+        gated_id = question.id.split(":", 1)[1]
+        winner = "yes" if gated_id in active_ids else "no"
+        probs[winner if winner in probs else cands[0]] = 1.0
+    else:
+        fallback = "none" if "none" in probs else cands[0]
+        probs[fallback] = 1.0
+    expected = 1.0 if question.kind is QuestionKind.SCORE else None
+    return DecisionAnswer(
+        question_id=question.id,
+        distribution=DecisionDistribution(probabilities=probs),
+        expected=expected,
     )
 
 
@@ -367,6 +459,7 @@ class DecisionSynthesizer:
         archetypes: ArchetypeGrammar | None = None,
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
         fallback_fn: FallbackCallback | None = None,
+        plan_cache: PlanCache | None = None,
     ) -> None:
         """Creates a synthesizer.
 
@@ -384,6 +477,7 @@ class DecisionSynthesizer:
             fallback_fn: Called with `(intent, payload, surface_id)` when the
                 model abstains and no `fallback_dsl` was given; its messages
                 are rendered instead.
+            plan_cache: Cache of layout plans scoped per `RendererState`.
 
         Raises:
             TypeError: If `backend` is None.
@@ -418,6 +512,10 @@ class DecisionSynthesizer:
             self.patterns, self.graph, grammar=self.archetypes
         )
         self._fallback_fn = fallback_fn
+        self.plan_cache: PlanCache = (
+            plan_cache if plan_cache is not None else PlanCache()
+        )
+        self._stateless_plans: dict[str, tuple[PlanCacheKey, CachedPlan]] = {}
         self._child_slot_keys = _child_slot_keys(self.graph)
         self._eligibility_cache: collections.OrderedDict[
             tuple[Any, ...], tuple[LayoutArchetype, ...]
@@ -434,6 +532,7 @@ class DecisionSynthesizer:
         archetypes: ArchetypeGrammar | None = None,
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
         fallback_fn: FallbackCallback | None = None,
+        plan_cache: PlanCache | None = None,
     ) -> DecisionSynthesizer:
         """Constructs a synthesizer, building the backend from the environment.
 
@@ -448,6 +547,55 @@ class DecisionSynthesizer:
             archetypes=archetypes,
             patterns=patterns,
             fallback_fn=fallback_fn,
+            plan_cache=plan_cache,
+        )
+
+    def cache_catalog_id(self) -> str:
+        """Returns the catalog identifier used in `PlanCacheKey.catalog_id`."""
+        if self.graph.surface_catalog_id is not None:
+            return self.graph.surface_catalog_id
+        return ",".join(c.catalog_id for c in self.graph.catalogs)
+
+    def make_cache_key(
+        self,
+        surface_id: str,
+        intent: str,
+        pointers: Sequence[PointerSummary],
+        *,
+        actions: Sequence[ActionSpec] = (),
+        exclude: Collection[str] = (),
+        mutable_paths: Collection[str] = (),
+        labels: Mapping[str, str] | None = None,
+        layout: LayoutBrief | Sequence[str] | None = None,
+        title: str | None = None,
+        summary: str | None = None,
+    ) -> PlanCacheKey:
+        """Builds the `PlanCacheKey` for a synthesis request."""
+        if isinstance(layout, LayoutBrief):
+            layout_items: Sequence[str] = layout.to_items()
+        elif layout is None:
+            layout_items = ()
+        else:
+            layout_items = tuple(layout)
+        sig = plan_shape_signature(
+            pointers,
+            intent=intent,
+            actions=actions,
+            exclude=exclude,
+            mutable_paths=mutable_paths,
+            labels=labels,
+            layout=layout_items,
+            title=title,
+            summary=summary,
+            template_ids=[t.template_id for t in self.registry.list_templates()],
+            conservativeness=self.config.conservativeness,
+            model_id=self.backend.model_id,
+        )
+        return PlanCacheKey(
+            surface_id=surface_id,
+            catalog_id=self.cache_catalog_id(),
+            grammar_version=self.archetypes.version,
+            shape_signature=sig,
         )
 
     async def synthesize(
@@ -467,6 +615,7 @@ class DecisionSynthesizer:
         surface_sends_data_model: bool = False,
         labels: Mapping[str, str] | None = None,
         region: str | None = None,
+        state: RendererState | None = None,
     ) -> SynthesisOutput:
         """Synthesizes validated A2UI messages for one decision block.
 
@@ -492,27 +641,30 @@ class DecisionSynthesizer:
                 with `sendDataModel`; read only for the `UPDATE_ROOT`
                 escalation rule.
             labels: Display labels keyed by JSON Pointer, overriding the
-                humanized keys. Accepted but not yet applied.
+                humanized keys.
             region: Id of one planned block to re-plan on an existing surface.
-                Not implemented yet; must be None.
+            state: Optional `RendererState` of the active conversation, used
+                to scope `self.plan_cache`.
 
         Returns:
             The synthesis result, stamped with the backend's kind and model
             id and the operation emitted.
 
         Raises:
-            ValueError: If a string payload is not valid JSON or `layout`
-                fails brief validation.
+            ValueError: If a string payload is not valid JSON, `layout`
+                fails brief validation, or `region` has no cached plan or is
+                absent from the cached plan.
             TypeError: If the payload is neither an object nor an array.
             DecisionBackendError: If the backend times out or fails.
-            NotImplementedError: If `region` is set.
         """
-        if region is not None:
-            raise NotImplementedError("Region updates are not implemented yet.")
+        target_surface_id = (
+            surface_id if surface_id is not None else self.config.default_surface_id
+        )
+        operation, surface_sends_data_model = self._infer_state_operation(
+            state, target_surface_id, operation, surface_sends_data_model
+        )
         request = _SurfaceRequest(
-            surface_id=(
-                surface_id if surface_id is not None else self.config.default_surface_id
-            ),
+            surface_id=target_surface_id,
             brief=_coerce_layout_brief(layout, self.archetypes),
             copy=(
                 AuthoredCopy(title=title, summary=summary)
@@ -522,12 +674,81 @@ class DecisionSynthesizer:
             actions=tuple(actions),
             operation=operation,
             surface_sends_data_model=surface_sends_data_model,
+            labels=dict(labels) if labels else {},
+            region=region,
         )
         data = _as_data_model(payload)
-        pointers = _without_excluded(
-            inspect_payload_pointers(data, mutable_paths=mutable_paths or ()), exclude
+        pointers = _with_labels(
+            _without_excluded(
+                inspect_payload_pointers(data, mutable_paths=mutable_paths or ()),
+                exclude,
+            ),
+            request.labels,
+        )
+        if operation is SurfaceOperation.REPLACE:
+            self._invalidate_surface_cache(state, target_surface_id)
+        if region is not None:
+            return await self._synthesize_region(
+                intent, data, pointers, request, state=state
+            )
+        cache_key = self.make_cache_key(
+            target_surface_id,
+            intent,
+            pointers,
+            actions=request.actions,
+            exclude=exclude,
+            mutable_paths=mutable_paths,
+            labels=request.labels,
+            layout=request.brief,
+            title=request.copy.title if request.copy is not None else None,
+            summary=request.copy.summary if request.copy is not None else None,
+        )
+        if operation is SurfaceOperation.UPDATE_ROOT and state is not None:
+            cached = self.plan_cache.get(state, cache_key)
+            if cached is not None:
+                return self._cached_data_only_output(cached, target_surface_id, data)
+        return await self._run_full_synthesis(
+            intent,
+            data,
+            pointers,
+            request,
+            fallback_dsl=fallback_dsl,
+            state=state,
+            cache_key=cache_key,
         )
 
+    def _infer_state_operation(
+        self,
+        state: RendererState | None,
+        surface_id: str,
+        operation: SurfaceOperation,
+        surface_sends_data_model: bool,
+    ) -> tuple[SurfaceOperation, bool]:
+        if state is None or operation is not SurfaceOperation.CREATE:
+            return operation, surface_sends_data_model
+        existing = state.get_surface(surface_id)
+        if existing is None:
+            return operation, surface_sends_data_model
+        return SurfaceOperation.UPDATE_ROOT, bool(existing.send_data_model)
+
+    def _invalidate_surface_cache(
+        self, state: RendererState | None, surface_id: str
+    ) -> None:
+        if state is not None:
+            self.plan_cache.invalidate(state, surface_id)
+        self._stateless_plans.pop(surface_id, None)
+
+    async def _run_full_synthesis(
+        self,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+        *,
+        fallback_dsl: str | None,
+        state: RendererState | None,
+        cache_key: PlanCacheKey,
+    ) -> SynthesisOutput:
         timings: list[float] = []
         token = _DECISION_CALL_TIMINGS.set(timings)
         try:
@@ -545,9 +766,323 @@ class DecisionSynthesizer:
             model_id=self.backend.model_id,
         )
         if output.messages:
+            self._store_cached_plan(state, cache_key, output)
             return output
+        self._invalidate_surface_cache(state, request.surface_id)
         return await self._fallback(
             output, intent, data, pointers, request, fallback_dsl
+        )
+
+    def _store_cached_plan(
+        self,
+        state: RendererState | None,
+        cache_key: PlanCacheKey,
+        output: SynthesisOutput,
+    ) -> CachedPlan | None:
+        if output.layout_plan is None or not output.messages:
+            return None
+        components = _extract_components_from_messages(output.messages)
+        if not components:
+            return None
+        existing_ids: frozenset[str] = frozenset()
+        if state is not None and output.operation is SurfaceOperation.UPDATE_ROOT:
+            surface = state.get_surface(cache_key.surface_id)
+            if surface is not None:
+                existing_ids = frozenset(surface.components_model.keys)
+        entry = CachedPlan(
+            plan=output.layout_plan,
+            components=components,
+            send_data_model=_creates_with_send_data_model(output.messages),
+            trace=output.trace,
+            decision_answers=output.decision_answers,
+            entropy=output.entropy,
+            all_surface_ids=existing_ids,
+        )
+        if state is not None:
+            self.plan_cache.put(state, cache_key, entry)
+        self._stateless_plans[cache_key.surface_id] = (cache_key, entry)
+        return entry
+
+    def _cached_data_only_output(
+        self,
+        cached: CachedPlan,
+        surface_id: str,
+        data: Mapping[str, Any],
+    ) -> SynthesisOutput:
+        """Emits only `updateDataModel` for an `UPDATE_ROOT` cache hit."""
+        raw_messages = [{
+            "version": _WIRE_VERSION,
+            "updateDataModel": {
+                "surfaceId": surface_id,
+                "path": "/",
+                "value": dict(data),
+            },
+        }]
+        messages = to_message_models(raw_messages)
+        validate_payload(self.graph.catalogs, messages)
+        stage = (
+            SynthesisStage.TEMPLATE_SELECT
+            if cached.plan.template_id is not None
+            else SynthesisStage.ARCHETYPE
+        )
+        return SynthesisOutput(
+            stage=stage,
+            messages=messages,
+            confidence=cached.plan.confidence,
+            entropy=cached.entropy,
+            selected_template_id=cached.plan.template_id,
+            layout_plan=cached.plan,
+            trace=cached.trace,
+            decision_answers=cached.decision_answers,
+            operation=SurfaceOperation.UPDATE_ROOT,
+            cache_hit=True,
+            backend_kind=self.backend.backend_kind,
+            model_id=self.backend.model_id,
+            decision_calls=0,
+            decision_latency_ms=0.0,
+        )
+
+    def render_cached_tool_plan(
+        self,
+        cached: CachedPlan,
+        surface_id: str,
+        data: Mapping[str, Any],
+        operation: SurfaceOperation = SurfaceOperation.CREATE,
+    ) -> SynthesisOutput:
+        """Renders a cached tool-mode plan with new `data` and zero backend calls."""
+        components = [copy_lib.deepcopy(dict(c)) for c in cached.components]
+        messages = self._build_validated_messages(
+            surface_id,
+            components,
+            data,
+            operation,
+            send_data_model=cached.send_data_model,
+        )
+        stage = (
+            SynthesisStage.TEMPLATE_SELECT
+            if cached.plan.template_id is not None
+            else SynthesisStage.ARCHETYPE
+        )
+        return SynthesisOutput(
+            stage=stage,
+            messages=messages,
+            confidence=cached.plan.confidence,
+            entropy=cached.entropy,
+            selected_template_id=cached.plan.template_id,
+            layout_plan=cached.plan,
+            trace=cached.trace,
+            decision_answers=cached.decision_answers,
+            operation=operation,
+            cache_hit=True,
+            backend_kind=self.backend.backend_kind,
+            model_id=self.backend.model_id,
+            decision_calls=0,
+            decision_latency_ms=0.0,
+        )
+
+    def _lookup_region_plan(
+        self, state: RendererState | None, surface_id: str
+    ) -> tuple[PlanCacheKey, CachedPlan]:
+        found = (
+            self.plan_cache.get_for_surface(
+                state,
+                surface_id,
+                catalog_id=self.cache_catalog_id(),
+                grammar_version=self.archetypes.version,
+            )
+            if state is not None
+            else self._stateless_plans.get(surface_id)
+        )
+        if found is None or found[1].plan.template_id is not None:
+            raise ValueError(
+                f"Cannot update region on surface {surface_id!r}: no cached"
+                " layout plan for this surface."
+            )
+        return found
+
+    async def _synthesize_region(
+        self,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+        *,
+        state: RendererState | None,
+    ) -> SynthesisOutput:
+        """Re-plans only `request.region` against the cached plan and updates its subtree."""
+        region = request.region or ""
+        existing_key, cached = self._lookup_region_plan(state, request.surface_id)
+        if region not in cached.plan.block_ids():
+            raise ValueError(
+                f"Surface {request.surface_id!r} plan ({cached.plan.archetype!r})"
+                f" has no block {region!r}; active blocks are"
+                f" {list(cached.plan.block_ids())}."
+            )
+        timings: list[float] = []
+        token = _DECISION_CALL_TIMINGS.set(timings)
+        try:
+            new_block, trace, answers = await self._plan_region_block(
+                cached.plan, region, intent, data, pointers, request
+            )
+        finally:
+            _DECISION_CALL_TIMINGS.reset(token)
+
+        prefix, owner = self._block_prefix_and_owner(
+            new_block.block_id, new_block.pattern
+        )
+        expanded = self.expander.expand_block(
+            new_block.block_id,
+            new_block.pattern,
+            new_block.bindings,
+            new_block.variant_knobs,
+            new_block.instances,
+            prefix,
+        )
+        if not expanded.components:
+            raise ValueError(
+                f"Region {region!r} expanded to no components on surface"
+                f" {request.surface_id!r}."
+            )
+        self._stamp_multi_catalog_id(expanded.components, owner)
+        messages = self._build_validated_messages(
+            request.surface_id,
+            list(expanded.components),
+            data,
+            SurfaceOperation.UPDATE_ROOT,
+        )
+        updated_plan = replace(
+            cached.plan,
+            blocks=tuple(
+                new_block if b.block_id == region else b for b in cached.plan.blocks
+            ),
+        )
+        updated_comps = replace_block_components(
+            cached.components, prefix, expanded.components
+        )
+        new_ids = frozenset(
+            str(c["id"]) for c in expanded.components if isinstance(c.get("id"), str)
+        )
+        updated_entry = replace(
+            cached,
+            plan=updated_plan,
+            components=updated_comps,
+            all_surface_ids=cached.all_surface_ids | new_ids,
+        )
+        if state is not None:
+            self.plan_cache.put(state, existing_key, updated_entry)
+        self._stateless_plans[request.surface_id] = (existing_key, updated_entry)
+        return SynthesisOutput(
+            stage=SynthesisStage.ARCHETYPE,
+            messages=messages,
+            confidence=cached.plan.confidence,
+            entropy=cached.entropy,
+            layout_plan=updated_plan,
+            trace=trace,
+            decision_answers=answers,
+            operation=SurfaceOperation.UPDATE_ROOT,
+            decision_latency_ms=sum(timings),
+            decision_calls=len(timings),
+            backend_kind=self.backend.backend_kind,
+            model_id=self.backend.model_id,
+        )
+
+    async def _plan_region_block(
+        self,
+        plan: LayoutPlan,
+        block_id: str,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+    ) -> tuple[PlannedBlock, tuple[DecisionRecord, ...], tuple[DecisionAnswer, ...]]:
+        """Plans a single block via `planner.build_block_batch` and `read_block`."""
+        try:
+            batch, p_state = self._invoke_build_block_batch(
+                plan, block_id, pointers, intent=intent, data=data, request=request
+            )
+            answers = await self._backend_answer(batch)
+            block = self.planner.read_block(p_state, answers)
+            return block, tuple(p_state.trace), tuple(p_state.answers_by_id.values())
+        except NotImplementedError:
+            return await self._fallback_plan_region_block(
+                plan, block_id, intent, data, pointers, request
+            )
+
+    def _invoke_build_block_batch(
+        self,
+        plan: LayoutPlan,
+        block_id: str,
+        pointers: Sequence[PointerSummary],
+        *,
+        intent: str,
+        data: Mapping[str, Any],
+        request: _SurfaceRequest,
+    ) -> tuple[DecisionBatch, PlannerState]:
+        params = inspect.signature(self.planner.build_block_batch).parameters
+        optional: dict[str, Any] = {
+            "intent": intent,
+            "labels": request.labels or None,
+            "payload": data,
+            "actions": request.actions,
+            "brief": request.brief,
+        }
+        accepted = {k: v for k, v in optional.items() if k in params}
+        return self.planner.build_block_batch(plan, block_id, pointers, **accepted)
+
+    async def _fallback_plan_region_block(
+        self,
+        plan: LayoutPlan,
+        block_id: str,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+    ) -> tuple[PlannedBlock, tuple[DecisionRecord, ...], tuple[DecisionAnswer, ...]]:
+        """Plans one block via `build_batch` and `read` when `build_block_batch` is a stub."""
+        arch = self.archetypes.archetype(plan.archetype)
+        full_batch, p_state = self.planner.build_batch(
+            intent,
+            pointers,
+            eligible=(arch,),
+            brief=request.brief,
+            payload=data,
+            copy=request.copy,
+            actions=request.actions,
+            labels=request.labels or None,
+        )
+        block_prefixes = (f"anatomy:{block_id}.", f"instance:{block_id}.", "salience:")
+        block_questions = tuple(
+            q
+            for q in full_batch.questions
+            if q.id == f"gate:{block_id}" or q.id.startswith(block_prefixes)
+        )
+        block_batch = DecisionBatch(
+            shared_context=full_batch.shared_context,
+            questions=block_questions,
+        )
+        block_answers = await self._backend_answer(block_batch)
+        by_id = {ans.question_id: ans for ans in block_answers}
+        full_answers = [
+            by_id[q.id] if q.id in by_id else _pinned_plan_answer(q, plan, block_id)
+            for q in full_batch.questions
+        ]
+        outcome = self.planner.read(p_state, full_answers)
+        found = _find_block(outcome.plan, block_id)
+        if found is not None:
+            return found, tuple(p_state.trace), block_answers
+        spec = self.archetypes.block(block_id)
+        bindings = self.planner.bind_slots(
+            spec,
+            pointers,
+            _claimed_by_other_blocks(plan, block_id),
+            payload=data,
+            intent=intent,
+            actions=request.actions,
+        )
+        return (
+            PlannedBlock(block_id=block_id, pattern=spec.pattern, bindings=bindings),
+            tuple(p_state.trace),
+            block_answers,
         )
 
     async def _backend_answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
@@ -865,9 +1400,32 @@ class DecisionSynthesizer:
                 copy=request.copy,
                 templates=templates,
                 actions=request.actions,
+                labels=request.labels or None,
             )
             answers = await self._backend_answer(batch)
-        return planner.read(state, answers), state
+        outcome = planner.read(state, answers)
+        return self._maybe_upgrade_no_fit(outcome, state), state
+
+    def _maybe_upgrade_no_fit(
+        self, outcome: PlanOutcome, state: PlannerState
+    ) -> PlanOutcome:
+        """Upgrades `NO_FAMILY` to `NO_FIT` when `none` won at or above `thresholds.noFit`."""
+        if outcome.reason is not PlanReason.NO_FAMILY:
+            return outcome
+        fam_ans = state.answers_by_id.get("family")
+        if fam_ans is None:
+            return outcome
+        chosen, prob = fam_ans.top()
+        no_fit_thresh = float(self.archetypes.thresholds.get("noFit", 0.5))
+        if chosen != "none" or prob < no_fit_thresh:
+            return outcome
+        if state.trace and state.trace[-1].question.id == "family":
+            state.trace[-1] = replace(
+                state.trace[-1], threshold=no_fit_thresh, outcome="no_fit"
+            )
+        return PlanOutcome(
+            plan=None, reason=PlanReason.NO_FIT, fit_score=outcome.fit_score
+        )
 
     def _block_prefix_and_owner(
         self, block_id: str, pattern: str
@@ -1068,10 +1626,19 @@ class DecisionSynthesizer:
                 gated = self._action_gate_output(state, trace)
                 return gated, gated.trace
             if outcome.reason != "planned" or outcome.plan is None:
-                _record_trace_reason(
-                    trace, str(outcome.reason), "Archetype planning outcome"
+                reason = str(outcome.reason)
+                _record_trace_reason(trace, reason, "Archetype planning outcome")
+                conf, entropy = _archetype_confidence_and_entropy(state, None)
+                abstained = SynthesisOutput(
+                    stage=SynthesisStage.ABSTAIN_FALLBACK,
+                    messages=[],
+                    confidence=conf,
+                    entropy=entropy,
+                    fallback_reason=reason,
+                    trace=tuple(trace),
+                    decision_answers=tuple(state.answers_by_id.values()),
                 )
-                return None, tuple(trace)
+                return abstained, abstained.trace
             if outcome.plan.template_id is not None:
                 rendered = self._render_template(outcome.plan, state, data, request)
                 return rendered, rendered.trace
