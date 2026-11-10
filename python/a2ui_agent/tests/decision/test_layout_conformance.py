@@ -28,14 +28,14 @@ from a2ui.inference_formats.decision import (
     BlockBindings,
     CatalogDecisionGraph,
     LayoutPlanner,
-    PatternExpander,
     MergedPatternLibrary,
-    PatternLibrary,
+    PatternExpander,
     SlotBinding,
     SynthesisConfig,
     eligible_archetypes,
     inspect_payload_pointers,
 )
+from a2ui.inference_formats.decision.models import ActionSpec
 import pytest
 import yaml
 
@@ -139,10 +139,15 @@ def _run_plan_case(case: Mapping[str, Any]) -> None:
     pointers = inspect_payload_pointers(
         case["input"], mutable_paths=args.get("mutable_paths", ())
     )
+    raw_actions = args.get("actions", {})
+    actions = tuple(
+        ActionSpec.from_block_value(str(k), v) for k, v in raw_actions.items()
+    )
     batch, state = planner.build_batch(
         intent=args["intent"],
         pointers=pointers,
         payload=case["input"],
+        actions=actions,
     )
     sa = ScriptedAnswers(answers=_coerce_scripted(args["scripted_answers"]))
     answers = asyncio.run(sa.backend().answer(batch))
@@ -173,13 +178,13 @@ def _run_expand_block_case(case: Mapping[str, Any]) -> None:
         slot_name: _slot_from_spec(slot_spec)
         for slot_name, slot_spec in args.get("slots", {}).items()
     }
-    components = expander.expand_block(
+    expansion = expander.expand_block(
         args["block_id"],
         args["pattern"],
         BlockBindings(slots=slots),
         knobs=args.get("knobs"),
     )
-    assert components == case["expect"]
+    assert list(expansion.components) == case["expect"]
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["name"])
