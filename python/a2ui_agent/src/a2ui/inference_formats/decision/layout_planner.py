@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import re
 from typing import Any
@@ -153,6 +153,99 @@ class PlannerState:
     """Registered templates whose required pointers the payload satisfies."""
     actions: tuple[ActionSpec, ...] = ()
     """The actions the decision block declared, in order."""
+    labels: dict[str, str] = field(default_factory=dict)
+    """Agent-supplied display labels keyed by normalized JSON Pointer."""
+    exclude: frozenset[str] = field(default_factory=frozenset)
+    """JSON Pointers excluded from rendering and orphan recovery."""
+    orphan_pointers: set[str] = field(default_factory=set)
+    """Pointers placed by `apply_no_orphaned_pointers` during `read`."""
+    region_plan: LayoutPlan | None = None
+    """Cached `LayoutPlan` when `PlannerState` was built for a region update."""
+    region_block_id: str | None = None
+    """Target block ID when `PlannerState` was built for a region update."""
+    region_used_pointers: set[str] = field(default_factory=set)
+    """Pointers already claimed outside `region_block_id` on `region_plan`."""
+
+
+MAX_ORPHAN_FACTS_ROWS = 8
+"""Maximum extra `facts` rows added by `no-orphaned-pointers`."""
+
+
+def compute_fit_score(
+    archetype_prob: float,
+    normalized_entropy: float,
+    orphan_pointer_share: float,
+    weak_required_slot_share: float,
+) -> float:
+    """Computes the surface fit score in ``[0.0, 1.0]``.
+
+    Formula:
+        ``fit_score = p * (1 - 0.35 * h) * (1 - 0.50 * o) * (1 - 0.40 * w)``
+
+    where all four inputs are clamped to ``[0.0, 1.0]``:
+    - ``p`` (`archetype_prob`): winning archetype probability; monotonic
+      increasing.
+    - ``h`` (`normalized_entropy`): normalized Shannon entropy of the winning
+      choice distribution; monotonic decreasing.
+    - ``o`` (`orphan_pointer_share`): share of bound pointers placed by
+      `no-orphaned-pointers`; monotonic decreasing.
+    - ``w`` (`weak_required_slot_share`): share of required slots whose
+      instance bindings scored below `thresholds.instance` (or fell back to a
+      default literal); monotonic decreasing.
+    """
+    p = min(max(archetype_prob, 0.0), 1.0)
+    h = min(max(normalized_entropy, 0.0), 1.0)
+    o = min(max(orphan_pointer_share, 0.0), 1.0)
+    w = min(max(weak_required_slot_share, 0.0), 1.0)
+    score = p * (1.0 - 0.35 * h) * (1.0 - 0.50 * o) * (1.0 - 0.40 * w)
+    return min(max(score, 0.0), 1.0)
+
+
+def _normalize_pointer_key(raw: str) -> str:
+    """Normalizes a bare key or JSON Pointer into a leading-slash pointer."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+    return cleaned if cleaned.startswith("/") else f"/{cleaned}"
+
+
+def _normalize_labels(labels: Mapping[str, str] | None) -> dict[str, str]:
+    """Normalizes an optional pointer-to-label map into leading-slash pointers."""
+    if not labels:
+        return {}
+    out: dict[str, str] = {}
+    for raw_ptr, raw_lbl in labels.items():
+        norm_ptr = _normalize_pointer_key(str(raw_ptr))
+        lbl_str = str(raw_lbl).strip()
+        if norm_ptr and lbl_str:
+            out[norm_ptr] = lbl_str
+    return out
+
+
+def _normalize_exclude(exclude: Collection[str] | None) -> frozenset[str]:
+    """Normalizes an optional collection of excluded JSON Pointers."""
+    if not exclude:
+        return frozenset()
+    return frozenset(
+        norm for raw in exclude if (norm := _normalize_pointer_key(str(raw)))
+    )
+
+
+def _is_excluded_pointer(path: str, exclude: Collection[str]) -> bool:
+    """Returns whether `path` equals or is nested under any pointer in `exclude`."""
+    if not exclude:
+        return False
+    return any(path == ex or path.startswith(f"{ex}/") for ex in exclude)
+
+
+def _apply_label_override(
+    ptr: PointerSummary, norm_labels: Mapping[str, str]
+) -> PointerSummary:
+    """Replaces `ptr.label` when `norm_labels` defines an agent label for `ptr.path`."""
+    override = norm_labels.get(ptr.path)
+    if override is not None and override != ptr.label:
+        return replace(ptr, label=override)
+    return ptr
 
 
 def _resolve_pointer_value(payload: Mapping[str, Any], pointer: str) -> Any:
@@ -207,25 +300,69 @@ def _build_sample_pointer_summary(sample: str) -> PointerSummary:
     )
 
 
+def _maybe_append_parent_summary(
+    ptr: PointerSummary,
+    filtered: Sequence[PointerSummary],
+    excluded_parents: set[str],
+    norm_exclude: Collection[str],
+    norm_labels: Mapping[str, str],
+    result: list[PointerSummary],
+) -> None:
+    """Appends a synthesized parent object `PointerSummary` when unseen."""
+    parent = ptr.parent or ""
+    if (
+        not parent
+        or parent in excluded_parents
+        or _is_excluded_pointer(parent, norm_exclude)
+    ):
+        return
+    excluded_parents.add(parent)
+    summary = _build_parent_object_summary(parent, filtered)
+    result.append(_apply_label_override(summary, norm_labels))
+
+
+def _append_sample_summaries(
+    ptr: PointerSummary,
+    existing_paths: set[str],
+    norm_exclude: Collection[str],
+    norm_labels: Mapping[str, str],
+    result: list[PointerSummary],
+) -> None:
+    """Appends scalar sample image `PointerSummary` entries for `ptr`."""
+    for sample in ptr.sample_pointers:
+        if sample in existing_paths or _is_excluded_pointer(sample, norm_exclude):
+            continue
+        existing_paths.add(sample)
+        summary = _build_sample_pointer_summary(sample)
+        result.append(_apply_label_override(summary, norm_labels))
+
+
 def _normalize_pointers(
     pointers: Sequence[PointerSummary],
+    *,
+    labels: Mapping[str, str] | None = None,
+    exclude: Collection[str] = (),
 ) -> tuple[PointerSummary, ...]:
-    """Expands `pointers` with missing parent object and array sample pointers."""
-    existing_paths = {p.path for p in pointers}
+    """Expands `pointers`, drops excluded paths, and applies agent `labels`."""
+    norm_labels = _normalize_labels(labels)
+    norm_exclude = _normalize_exclude(exclude)
+    filtered = [p for p in pointers if not _is_excluded_pointer(p.path, norm_exclude)]
+    existing_paths = {p.path for p in filtered}
     excluded_parents = existing_paths | {
-        p.path for p in pointers if p.value_type == "array"
+        p.path for p in filtered if p.value_type == "array"
     }
     result: list[PointerSummary] = []
-    for ptr in pointers:
-        parent = ptr.parent or ""
-        if parent and parent not in excluded_parents:
-            excluded_parents.add(parent)
-            result.append(_build_parent_object_summary(parent, pointers))
-        result.append(ptr)
-        for sample in ptr.sample_pointers:
-            if sample not in existing_paths:
-                existing_paths.add(sample)
-                result.append(_build_sample_pointer_summary(sample))
+    for ptr in filtered:
+        _maybe_append_parent_summary(
+            ptr,
+            filtered,
+            excluded_parents,
+            norm_exclude,
+            norm_labels,
+            result,
+        )
+        result.append(_apply_label_override(ptr, norm_labels))
+        _append_sample_summaries(ptr, existing_paths, norm_exclude, norm_labels, result)
     return tuple(result)
 
 
@@ -548,6 +685,19 @@ def _format_choice_options(raw: Any) -> list[dict[str, str]] | None:
             text = str(elem)
             formatted.append({"label": text, "value": text})
     return formatted or None
+
+
+def _bind_key_fallback_slot(
+    bound_slots: Mapping[str, SlotBinding],
+    pointers: Sequence[PointerSummary],
+) -> SlotBinding:
+    """Falls back to the label of the block's primary bound pointer for `from: ['key']`."""
+    for prev in bound_slots.values():
+        if prev.pointer:
+            ptr = next((p for p in pointers if p.path == prev.pointer), None)
+            if ptr is not None:
+                return SlotBinding(literal=ptr.label or humanize_key(ptr.key))
+    return SlotBinding()
 
 
 def _bind_scalar_slot(
@@ -1362,6 +1512,8 @@ def apply_pointer_once_per_region(
             intent=state.intent,
             preferred_paths=preferred,
             actions=state.actions,
+            labels=state.labels,
+            exclude=state.exclude,
         )
         bindings = _apply_authored_prose_summary(block.block_id, bindings, state)
         bindings = _apply_compose_action(
@@ -1469,12 +1621,15 @@ def _is_pointer_covered(path: str, claimed: set[str]) -> bool:
 
 
 def _has_uncovered_data_array(
-    pointers: Sequence[PointerSummary], claimed: set[str]
+    pointers: Sequence[PointerSummary],
+    claimed: set[str],
+    exclude: Collection[str] = (),
 ) -> bool:
-    """Returns whether `pointers` has an unclaimed non-image array."""
+    """Returns whether `pointers` has an unclaimed, non-excluded non-image array."""
     return any(
         p.value_type == "array"
         and p.cardinality > 0
+        and not _is_excluded_pointer(p.path, exclude)
         and not _is_pointer_covered(p.path, claimed)
         and "image_url" not in p.element_semantic_types.values()
         for p in pointers
@@ -1492,7 +1647,7 @@ def _try_recover_orphan_collection(
     """Appends a `collection` block when an unclaimed data array exists."""
     if present_ids & {"collection", "steps", "comparison"}:
         return
-    if not _has_uncovered_data_array(state.pointers, claimed):
+    if not _has_uncovered_data_array(state.pointers, claimed, state.exclude):
         return
     col_spec = planner.grammar.block("collection")
     resolved_col = _resolve_block_pattern(col_spec, planner._capabilities)
@@ -1507,6 +1662,8 @@ def _try_recover_orphan_collection(
         payload=state.payload,
         intent=state.intent,
         actions=state.actions,
+        labels=state.labels,
+        exclude=state.exclude,
     )
     if not col_bindings.is_bound("items"):
         return
@@ -1526,7 +1683,9 @@ def _try_recover_orphan_collection(
             instances=col_inst,
         )
     )
-    claimed.update(col_bindings.pointers())
+    recovered_ptrs = col_bindings.pointers()
+    claimed.update(recovered_ptrs)
+    state.orphan_pointers.update(recovered_ptrs)
     present_ids.add("collection")
 
 
@@ -1544,13 +1703,14 @@ def _uncovered_scalar_fact_pointers(
     *,
     allow_prose_fallback: bool,
 ) -> list[PointerSummary]:
-    """Returns unclaimed top-level scalar pointers eligible for `facts` recovery."""
+    """Returns unclaimed, non-excluded top-level scalar pointers for `facts` recovery."""
     prose_types = {"long_text", "markdown", "code"}
     return [
         p
         for p in state.pointers
         if not p.parent
         and p.value_type in {"string", "number", "boolean"}
+        and not _is_excluded_pointer(p.path, state.exclude)
         and not _is_nested_mutable_setting(p, state.pointers)
         and not is_secret_pointer(p)
         and not _is_pointer_covered(p.path, claimed)
@@ -1559,6 +1719,16 @@ def _uncovered_scalar_fact_pointers(
             or (allow_prose_fallback and p.semantic_type in prose_types)
         )
     ]
+
+
+def _select_orphan_scalars(
+    candidates: list[PointerSummary], salience_scores: Mapping[str, float]
+) -> list[PointerSummary]:
+    """Orders orphan scalar candidates by salience and caps at `MAX_ORPHAN_FACTS_ROWS`."""
+    ordered = list(candidates)
+    if salience_scores:
+        ordered.sort(key=lambda p: -salience_scores.get(p.path, 0.0))
+    return ordered[:MAX_ORPHAN_FACTS_ROWS]
 
 
 def _merge_or_insert_facts_rows(
@@ -1624,13 +1794,15 @@ def apply_no_orphaned_pointers(
     state: PlannerState,
     planner: LayoutPlanner,
 ) -> LayoutPlan:
-    """Recovers unclaimed top-level scalar or array pointers into `facts` or `collection`."""
+    """Recovers unclaimed top-level pointers (at most 8 extra `facts` rows; never `exclude`d)."""
+    state.orphan_pointers = set()
     claimed: set[str] = (
         set(state.page_claimed_pointers)
         | set(plan.page.title.pointers())
         | set(plan.page.subtitle.pointers())
         | set(plan.page.mark.pointers())
         | _collect_absorbed_siblings(state.pointers)
+        | set(state.exclude)
     )
     for b in plan.blocks:
         claimed.update(b.bindings.pointers())
@@ -1646,8 +1818,11 @@ def apply_no_orphaned_pointers(
         and plan.urgency < 1.5
         and (prose_ans is None or prose_ans.yes >= 0.50)
     )
-    uncovered_scalars = _uncovered_scalar_fact_pointers(
-        state, claimed, allow_prose_fallback=allow_prose_fallback
+    uncovered_scalars = _select_orphan_scalars(
+        _uncovered_scalar_fact_pointers(
+            state, claimed, allow_prose_fallback=allow_prose_fallback
+        ),
+        state.salience_scores,
     )
     if uncovered_scalars:
         facts_spec = planner.grammar.block("facts")
@@ -1660,6 +1835,7 @@ def apply_no_orphaned_pointers(
                 )
                 for ptr in uncovered_scalars
             )
+            state.orphan_pointers.update(p.path for p in uncovered_scalars)
             _merge_or_insert_facts_rows(
                 blocks,
                 present_ids,
@@ -2076,10 +2252,12 @@ class LayoutPlanner:
         intent: str = "",
         preferred_paths: Sequence[str] = (),
         actions: Sequence[ActionSpec] = (),
+        labels: Mapping[str, str] | None = None,
+        exclude: Collection[str] = (),
     ) -> BlockBindings:
         """Deterministically binds `spec.slots` against `pointers` excluding `used`."""
-        norm_pointers = _normalize_pointers(pointers)
-        local_used = set(used)
+        norm_pointers = _normalize_pointers(pointers, labels=labels, exclude=exclude)
+        local_used = set(used) | set(_normalize_exclude(exclude))
         bound_slots: dict[str, SlotBinding] = {}
         for slot_name, slot_spec in spec.slots.items():
             binding = self._bind_one_slot(
@@ -2093,6 +2271,8 @@ class LayoutPlanner:
                 preferred_paths=preferred_paths,
                 actions=actions,
             )
+            if not binding.bound and "key" in slot_spec.from_types:
+                binding = _bind_key_fallback_slot(bound_slots, norm_pointers)
             if binding.bound:
                 bound_slots[slot_name] = binding
                 local_used.update(binding.pointers())
@@ -2236,7 +2416,7 @@ class LayoutPlanner:
         """Orders `eligible` archetypes by brief pin first, then satisfied block shapes."""
         norm = _normalize_pointers(pointers)
         pinned_families = (
-            {r for r in brief.roles() if r in self._grammar.families()}
+            {r for r in brief.roles() if r != "none" and r in self._grammar.families()}
             if brief is not None
             else set()
         )
@@ -2269,9 +2449,15 @@ class LayoutPlanner:
         copy: AuthoredCopy | None,
         templates: Sequence[SurfaceTemplate],
         actions: Sequence[ActionSpec],
+        labels: Mapping[str, str] | None = None,
+        exclude: Collection[str] = (),
     ) -> tuple[PlannerState, tuple[LayoutArchetype, ...]]:
         """Initializes `PlannerState` and prioritized archetypes for batch building."""
-        norm_pointers = _normalize_pointers(pointers)
+        norm_labels = _normalize_labels(labels)
+        norm_exclude = _normalize_exclude(exclude)
+        norm_pointers = _normalize_pointers(
+            pointers, labels=norm_labels, exclude=norm_exclude
+        )
         action_tuple = tuple(actions)
         if eligible is None:
             elig = self._default_eligible(norm_pointers, actions=action_tuple)
@@ -2298,6 +2484,8 @@ class LayoutPlanner:
             copy=copy,
             templates=matching_templates,
             actions=action_tuple,
+            labels=norm_labels,
+            exclude=norm_exclude,
         )
         return state, prior
 
@@ -2313,11 +2501,12 @@ class LayoutPlanner:
         templates: Sequence[SurfaceTemplate] = (),
         actions: Sequence[ActionSpec] = (),
         labels: Mapping[str, str] | None = None,
+        exclude: Collection[str] = (),
     ) -> tuple[DecisionBatch, PlannerState]:
         """Builds a speculative `DecisionBatch` and `PlannerState` for one surface.
 
-        `labels` maps pointers to display labels that override humanized keys;
-        it is accepted but not yet applied.
+        `labels` maps pointers to display labels that override humanized keys.
+        `exclude` omits pointers from binding and orphan recovery.
         """
         state, prior = self._init_planner_state(
             intent,
@@ -2328,6 +2517,8 @@ class LayoutPlanner:
             copy=copy,
             templates=templates,
             actions=actions,
+            labels=labels,
+            exclude=exclude,
         )
         questions: list[DecisionQuestion] = []
         self._append_template_question(questions, state)
@@ -2357,6 +2548,8 @@ class LayoutPlanner:
         copy: AuthoredCopy | None = None,
         templates: Sequence[SurfaceTemplate] = (),
         actions: Sequence[ActionSpec] = (),
+        labels: Mapping[str, str] | None = None,
+        exclude: Collection[str] = (),
     ) -> tuple[DecisionBatch, PlannerState]:
         """Builds Stage 1 (`template`, `family`, `stakes`, `urgency`, and `archetype:*`)."""
         state, _ = self._init_planner_state(
@@ -2368,6 +2561,8 @@ class LayoutPlanner:
             copy=copy,
             templates=templates,
             actions=actions,
+            labels=labels,
+            exclude=exclude,
         )
         questions: list[DecisionQuestion] = []
         self._append_template_question(questions, state)
@@ -2405,7 +2600,10 @@ class LayoutPlanner:
     ) -> DecisionBatch:
         """Builds Stage 2 (`gate`, `anatomy`, `salience`, and `instance` for the winning archetype)."""
         self._validate_and_index_answers(state, stage1_answers)
-        if self._read_template(state) is not None:
+        if (
+            self._read_template(state) is not None
+            or self._check_no_fit_family(state)[0]
+        ):
             state.trace.clear()
             return DecisionBatch(
                 shared_context=dict(state.batch.shared_context), questions=()
@@ -2478,10 +2676,14 @@ class LayoutPlanner:
         return True
 
     def _pinned_families(self, state: PlannerState) -> list[str]:
-        """Returns family roles pinned by `state.brief`."""
+        """Returns non-`none` family roles pinned by `state.brief`."""
         if state.brief is None:
             return []
-        return [r for r in state.brief.roles() if r in self._grammar.families()]
+        return [
+            r
+            for r in state.brief.roles()
+            if r != "none" and r in self._grammar.families()
+        ]
 
     def _append_template_question(
         self, questions: list[DecisionQuestion], state: PlannerState
@@ -2528,7 +2730,7 @@ class LayoutPlanner:
                     prompt=fam_spec.question,
                     options=tuple(fam_spec.options),
                     option_texts=tuple(fam_spec.options.values()),
-                    allow_none=fam_spec.allow_none,
+                    allow_none=fam_spec.allow_none and "none" not in fam_spec.options,
                 ),
                 state,
                 seen_ids=seen_ids,
@@ -2556,6 +2758,8 @@ class LayoutPlanner:
         pinned = self._pinned_families(state)
         families_to_ask = tuple(pinned) if pinned else self._grammar.families()
         for fam in families_to_ask:
+            if fam == "none":
+                continue
             fam_archs = [a for a in state.eligible if a.family == fam]
             if not fam_archs:
                 continue
@@ -2680,6 +2884,8 @@ class LayoutPlanner:
                 payload=state.payload,
                 intent=state.intent,
                 actions=state.actions,
+                labels=state.labels,
+                exclude=state.exclude,
             )
             self._append_single_block_anatomy(
                 questions, spec, bindings, by_path, state, seen_ids
@@ -2820,6 +3026,8 @@ class LayoutPlanner:
                     payload=state.payload,
                     intent=state.intent,
                     actions=state.actions,
+                    labels=state.labels,
+                    exclude=state.exclude,
                 )
                 for q_obj in self._build_block_instance_questions(
                     spec, bindings, state
@@ -2856,7 +3064,17 @@ class LayoutPlanner:
             return []
         ptr_path = slot_binding.pointer
         val = _resolve_pointer_value(state.payload, ptr_path)
-        display = str(val) if val is not None else ptr_path.lstrip("/")
+        ptr_obj = next((p for p in state.pointers if p.path == ptr_path), None)
+        fallback_lbl = (
+            ptr_obj.label
+            if ptr_obj is not None and ptr_obj.label
+            else ptr_path.lstrip("/")
+        )
+        if ptr_path in state.labels:
+            lbl = state.labels[ptr_path]
+            display = f"{lbl} ({val})" if val is not None else lbl
+        else:
+            display = str(val) if val is not None else fallback_lbl
         built: list[DecisionQuestion] = []
         for q_name, q_spec in spec.instance.items():
             built.append(
@@ -3090,6 +3308,146 @@ class LayoutPlanner:
         )
         return None
 
+    def _recover_button_action(
+        self, idx: int, item: Mapping[str, SlotBinding]
+    ) -> ActionSpec:
+        """Recovers one surface `ActionSpec` from a bound `actions.buttons` item."""
+        act_id, label, style_str = _button_meta(idx, item)
+        style = ActionStyle(style_str) if style_str else None
+        act_slot = item.get("action")
+        ctx_meta = act_slot.fields.get("$context") if act_slot is not None else None
+        ctx = (
+            {k: sb.pointer for k, sb in ctx_meta.fields.items() if sb.pointer}
+            if ctx_meta is not None
+            else {}
+        )
+        return ActionSpec(id=act_id, label=label, context=ctx, style=style)
+
+    def _recover_scoped_collection_action(
+        self, block: PlannedBlock
+    ) -> tuple[ActionSpec, ...]:
+        """Recovers a scoped item `ActionSpec` from `collection.items.fields['action']`."""
+        items_slot = block.bindings.get("items")
+        if items_slot is None:
+            return ()
+        act_field = items_slot.fields.get("action")
+        if act_field is None or act_field.literal is None:
+            return ()
+        scope_meta = act_field.fields.get("$scope")
+        key_meta = act_field.fields.get("$key")
+        scope_val = (
+            str(scope_meta.literal)
+            if scope_meta is not None and scope_meta.literal
+            else items_slot.pointer
+        )
+        key_val = (
+            str(key_meta.literal) if key_meta is not None and key_meta.literal else None
+        )
+        lbl = block.variant_knobs.get("trailing.label") or str(act_field.literal)
+        return (
+            ActionSpec(
+                id=str(act_field.literal),
+                label=lbl,
+                scope=scope_val,
+                key=key_val,
+            ),
+        )
+
+    def _recover_block_actions(self, block: PlannedBlock) -> tuple[ActionSpec, ...]:
+        """Recovers `ActionSpec` entries already bound on `block` for region updates."""
+        buttons = block.bindings.get("buttons")
+        if buttons is not None and buttons.items:
+            return tuple(
+                self._recover_button_action(idx, item)
+                for idx, item in enumerate(buttons.items)
+            )
+        return self._recover_scoped_collection_action(block)
+
+    def _other_plan_pointers(self, plan: LayoutPlan, target_block_id: str) -> set[str]:
+        """Collects pointers claimed by `plan.page` and blocks other than `target_block_id`."""
+        claimed: set[str] = (
+            set(plan.page.title.pointers())
+            | set(plan.page.subtitle.pointers())
+            | set(plan.page.mark.pointers())
+        )
+        for block in plan.blocks:
+            if block.block_id != target_block_id:
+                claimed.update(block.bindings.pointers())
+        return claimed
+
+    def _bind_region_slots(
+        self,
+        spec: BlockSpec,
+        state: PlannerState,
+        used: set[str],
+    ) -> BlockBindings:
+        """Binds `spec` slots for a region update, retrying with `used=set()` if needed."""
+        bindings = self.bind_slots(
+            spec,
+            state.pointers,
+            set(used),
+            salience_scores=state.salience_scores,
+            payload=state.payload,
+            intent=state.intent,
+            actions=state.actions,
+            labels=state.labels,
+            exclude=state.exclude,
+        )
+        if not any(b.bound for b in bindings.slots.values()) and used:
+            return self.bind_slots(
+                spec,
+                state.pointers,
+                set(),
+                salience_scores=state.salience_scores,
+                payload=state.payload,
+                intent=state.intent,
+                actions=state.actions,
+                labels=state.labels,
+                exclude=state.exclude,
+            )
+        return bindings
+
+    def _append_region_salience_questions(
+        self,
+        questions: list[DecisionQuestion],
+        spec: BlockSpec,
+        state: PlannerState,
+        used: set[str],
+        seen_ids: set[str],
+    ) -> None:
+        """Emits `salience:<pointer>` questions only for candidate pointers of `spec`."""
+        if spec.id not in {"headline", "facts"} and spec.salience is None:
+            return
+        headline_block = self._grammar.blocks.get("headline")
+        sal_spec = spec.salience or (
+            headline_block.salience if headline_block is not None else None
+        )
+        if sal_spec is None:
+            return
+        absorbed = _collect_absorbed_siblings(state.pointers)
+        added = 0
+        for ptr in state.pointers:
+            if ptr.path in used or not self._is_salience_candidate(
+                ptr, None, absorbed, state
+            ):
+                continue
+            if added >= _MAX_SALIENCE_QUESTIONS:
+                state.budget_exhausted = True
+                break
+            if self._try_add_question(
+                questions,
+                DecisionQuestion(
+                    id=f"salience:{ptr.path}",
+                    kind=QuestionKind.SCORE,
+                    prompt=sal_spec.question.format(label=ptr.label or ptr.key),
+                    options=sal_spec.levels,
+                    allow_none=False,
+                ),
+                state,
+                seen_ids=seen_ids,
+            ):
+                added += 1
+
     def build_block_batch(
         self,
         plan: LayoutPlan,
@@ -3098,13 +3456,143 @@ class LayoutPlanner:
         *,
         intent: str = "",
         labels: Mapping[str, str] | None = None,
+        payload: Mapping[str, Any] | None = None,
+        actions: Sequence[ActionSpec] = (),
+        exclude: Collection[str] = (),
     ) -> tuple[DecisionBatch, PlannerState]:
         """Builds a batch that re-plans only `block_id` of `plan`, for region updates.
 
         Raises:
-            NotImplementedError: Always; region planning is not implemented yet.
+            A2uiValidationError: If `block_id` is not present in `plan.blocks`
+                or is unknown to the grammar.
         """
-        raise NotImplementedError("LayoutPlanner.build_block_batch is not implemented.")
+        existing = next((b for b in plan.blocks if b.block_id == block_id), None)
+        if existing is None or block_id not in self._grammar.blocks:
+            raise A2uiValidationError(
+                f"Block {block_id!r} is not present in the cached layout plan"
+                f" {list(plan.block_ids())}."
+            )
+        spec = self._grammar.block(block_id)
+        norm_labels = _normalize_labels(labels)
+        norm_exclude = _normalize_exclude(exclude)
+        norm_pointers = _normalize_pointers(
+            pointers, labels=norm_labels, exclude=norm_exclude
+        )
+        effective_actions = tuple(actions) or self._recover_block_actions(existing)
+        other_used = self._other_plan_pointers(plan, block_id)
+        selected_arch = (
+            self._grammar.archetype(plan.archetype)
+            if plan.archetype in {a.id for a in self._grammar.archetypes}
+            else None
+        )
+        state = PlannerState(
+            intent=intent,
+            pointers=norm_pointers,
+            eligible=(selected_arch,) if selected_arch is not None else (),
+            prior_archetypes=(plan.archetype,) if plan.archetype else (),
+            brief=None,
+            batch=DecisionBatch(shared_context={}, questions=()),
+            payload=dict(payload) if payload is not None else {},
+            selected_archetype=selected_arch,
+            actions=effective_actions,
+            labels=norm_labels,
+            exclude=norm_exclude,
+            region_plan=plan,
+            region_block_id=block_id,
+            region_used_pointers=other_used,
+        )
+        prelim_bindings = self._bind_region_slots(spec, state, other_used)
+        questions: list[DecisionQuestion] = []
+        seen_ids: set[str] = set()
+        by_path = {p.path: p for p in state.pointers}
+        self._append_single_block_anatomy(
+            questions, spec, prelim_bindings, by_path, state, seen_ids
+        )
+        self._append_region_salience_questions(
+            questions, spec, state, other_used, seen_ids
+        )
+        for q_obj in self._build_block_instance_questions(spec, prelim_bindings, state):
+            self._try_add_question(questions, q_obj, state, seen_ids=seen_ids)
+
+        batch = DecisionBatch(
+            shared_context={
+                "intent": intent,
+                "region": block_id,
+                "pointers": [p.path for p in state.pointers],
+            },
+            questions=tuple(questions),
+        )
+        state.batch = batch
+        return batch, state
+
+    def _apply_region_collection_rules(
+        self, block: PlannedBlock, state: PlannerState
+    ) -> PlannedBlock:
+        """Enforces picture-layout and sparse-leading rules on a region `collection`."""
+        has_image = any(
+            p.semantic_type in {"image_url", "media_object"} for p in state.pointers
+        )
+        block = _adjust_collection_picture_layout(block, has_image)
+        if block.block_id != "collection" or block.variant_knobs.get("leading") not in {
+            "thumbnail",
+            "avatar",
+        }:
+            return block
+        items = block.bindings.get("items")
+        if not _is_collection_picture_sparse(items, state.payload):
+            return block
+        fallback = "icon" if items is not None and "icon" in items.fields else "none"
+        return replace(
+            block,
+            variant_knobs={**block.variant_knobs, "leading": fallback},
+        )
+
+    def _apply_region_urgency_rule(
+        self, block: PlannedBlock, plan: LayoutPlan, state: PlannerState
+    ) -> PlannedBlock:
+        """Applies the `urgency-terse` transformation to `block` when `plan.urgency >= 1.5`."""
+        if plan.urgency < 1.5:
+            return block
+        prose_req = (
+            state.selected_archetype.requirement_of("prose") == "required"
+            if state.selected_archetype is not None
+            else True
+        )
+        terse = _terse_transform_block(
+            block, prose_req, self._capabilities.has_pattern("page")
+        )
+        return terse if terse is not None else block
+
+    def _apply_region_block_rules(
+        self,
+        block: PlannedBlock,
+        spec: BlockSpec,
+        plan: LayoutPlan,
+        state: PlannerState,
+    ) -> PlannedBlock:
+        """Applies block-level invariants (`pictures`, `actions_gate`, `urgency`) to `block`."""
+        block = self._apply_region_collection_rules(block, state)
+        if not plan.actions_allowed:
+            gated = _gate_single_block(block, set(), state)
+            if gated is None:
+                raise A2uiValidationError(
+                    f"Block {block.block_id!r} is disallowed by the cached plan's"
+                    " action gate."
+                )
+            block = gated
+        if block.block_id == "actions":
+            block = _reorder_and_enforce_actions(block, plan.stakes)
+        block = self._apply_region_urgency_rule(block, plan, state)
+        has_mut = any(p.mutable_hint for p in state.pointers) or any(
+            b.block_id in {"form", "groups"} for b in plan.blocks
+        )
+        block = _decorate_action_block(block, _form_mutable_pointers(plan), has_mut)
+        if not _block_has_required_bindings(block, spec):
+            raise A2uiValidationError(
+                f"Region update for block {block.block_id!r} could not bind its"
+                " required slots."
+            )
+        return block
 
     def read_block(
         self,
@@ -3114,9 +3602,114 @@ class LayoutPlanner:
         """Reads the answers to a `build_block_batch` batch into one planned block.
 
         Raises:
-            NotImplementedError: Always; region planning is not implemented yet.
+            A2uiValidationError: If `state` was not created by `build_block_batch`,
+                answers do not match the batch, or required slots cannot bind.
         """
-        raise NotImplementedError("LayoutPlanner.read_block is not implemented.")
+        plan = state.region_plan
+        block_id = state.region_block_id
+        if plan is None or block_id is None:
+            raise A2uiValidationError(
+                "PlannerState was not initialized by LayoutPlanner.build_block_batch."
+            )
+        existing = next((b for b in plan.blocks if b.block_id == block_id), None)
+        if existing is None:
+            raise A2uiValidationError(
+                f"Block {block_id!r} is not present in the cached layout plan."
+            )
+        self._validate_and_index_answers(state, answers)
+        self._read_salience_scores(state)
+        spec = self._grammar.block(block_id)
+        resolved = _resolve_block_pattern(spec, self._capabilities)
+        if resolved is None:
+            raise A2uiValidationError(
+                f"Block {block_id!r} has no supported pattern on the active catalog."
+            )
+        pat_name, preset_knobs = resolved
+        bindings = self._bind_region_slots(spec, state, state.region_used_pointers)
+        plan_ids = {b.block_id for b in plan.blocks}
+        bindings = _apply_compose_action(block_id, bindings, plan_ids, state.actions)
+        knobs, instances = self._resolve_block_questions(
+            spec,
+            bindings,
+            state,
+            actions_allowed=plan.actions_allowed,
+            preset_knobs=preset_knobs,
+        )
+        updated = PlannedBlock(
+            block_id=block_id,
+            pattern=pat_name,
+            bindings=bindings,
+            variant_knobs=knobs,
+            instances=instances,
+            probability=existing.probability,
+        )
+        return self._apply_region_block_rules(updated, spec, plan, state)
+
+    def _record_fit_score(
+        self,
+        state: PlannerState,
+        score: float,
+        *,
+        arch_prob: float,
+        entropy: float,
+        orphan_share: float,
+        weak_share: float,
+    ) -> None:
+        """Appends a `fit_score` `DecisionRecord` to `state.trace`."""
+        thresh = self.threshold("noFit") if "noFit" in self._grammar.thresholds else 0.5
+        state.trace.append(
+            DecisionRecord(
+                question=DecisionQuestion(
+                    id="fit_score",
+                    kind=QuestionKind.BOOLEAN,
+                    prompt="Archetype layout fit score",
+                    allow_none=False,
+                ),
+                threshold=thresh,
+                outcome=(
+                    f"{score:.4f} (archetype_prob={arch_prob:.2f},"
+                    f" entropy={entropy:.2f},"
+                    f" orphan_share={orphan_share:.2f},"
+                    f" weak_required_share={weak_share:.2f})"
+                ),
+            )
+        )
+
+    def _check_no_fit_family(self, state: PlannerState) -> tuple[bool, float]:
+        """Checks whether `family == 'none'` won at `thresholds.noFit` or higher."""
+        if self._brief_pinned_family(state.brief) is not None:
+            return False, 0.0
+        q_map = {q.id: q for q in state.batch.questions}
+        fam_q = q_map.get("family")
+        fam_ans = state.answers_by_id.get("family")
+        if fam_q is None or fam_ans is None:
+            return False, 0.0
+        chosen, prob = fam_ans.top()
+        no_fit_thresh = (
+            self.threshold("noFit") if "noFit" in self._grammar.thresholds else 0.5
+        )
+        if chosen != "none" or prob < no_fit_thresh:
+            return False, 0.0
+        state.trace.append(
+            DecisionRecord(
+                question=fam_q,
+                answer=fam_ans,
+                threshold=no_fit_thresh,
+                outcome="no_fit",
+            )
+        )
+        entropy = fam_ans.distribution.normalized_entropy()
+        non_none_mass = max(0.0, 1.0 - prob)
+        score = compute_fit_score(non_none_mass, entropy, 0.0, 0.0)
+        self._record_fit_score(
+            state,
+            score,
+            arch_prob=non_none_mass,
+            entropy=entropy,
+            orphan_share=0.0,
+            weak_share=0.0,
+        )
+        return True, score
 
     def read(
         self,
@@ -3127,13 +3720,15 @@ class LayoutPlanner:
 
         When the batch carried a `template` question and its winner clears
         the threshold, the plan's `LayoutPlan.template_id` names that
-        template; otherwise it is None.
+        template; when `family == "none"` clears `thresholds.noFit`, returns
+        `PlanOutcome(plan=None, reason=PlanReason.NO_FIT, fit_score=...)`.
         """
         self._validate_and_index_answers(state, answers)
         tpl_winner = self._read_template(state)
         if tpl_winner is not None:
             tpl_id, tpl_prob = tpl_winner
             stakes, urgency = self._read_stakes_and_urgency(state)
+            clamped_fit = min(max(tpl_prob, 0.0), 1.0)
             return PlanOutcome(
                 plan=LayoutPlan(
                     archetype="",
@@ -3143,8 +3738,15 @@ class LayoutPlanner:
                     urgency=urgency,
                     confidence=tpl_prob,
                     template_id=tpl_id,
+                    fit_score=clamped_fit,
                 ),
                 reason=PlanReason.PLANNED,
+                fit_score=clamped_fit,
+            )
+        is_no_fit, no_fit_score = self._check_no_fit_family(state)
+        if is_no_fit:
+            return PlanOutcome(
+                plan=None, reason=PlanReason.NO_FIT, fit_score=no_fit_score
             )
         family = self._read_family(state)
         if family is None:
@@ -3206,11 +3808,22 @@ class LayoutPlanner:
         return default_family
 
     def _brief_pinned_family(self, brief: LayoutBrief | None) -> str | None:
-        """Returns the first family role pinned by `brief`, if any."""
+        """Returns the first non-`none` family role pinned by `brief`, if any."""
         if brief is None:
             return None
         families = self._grammar.families()
-        return next((r for r in brief.roles() if r in families), None)
+        return next((r for r in brief.roles() if r != "none" and r in families), None)
+
+    def _best_non_none_family(self, fam_ans: DecisionAnswer) -> tuple[str, float]:
+        """Returns the highest-probability non-`none` family in `fam_ans`."""
+        candidates = [
+            (fam_id, fam_prob)
+            for fam_id, fam_prob in fam_ans.distribution.probabilities.items()
+            if fam_id != "none"
+        ]
+        if not candidates:
+            return "none", 0.0
+        return max(candidates, key=lambda kv: kv[1])
 
     def _is_family_rejected(
         self,
@@ -3240,6 +3853,8 @@ class LayoutPlanner:
         if fam_q is None or fam_ans is None:
             return state.eligible[0].family if state.eligible else None
         chosen, prob = fam_ans.top()
+        if chosen == "none":
+            chosen, prob = self._best_non_none_family(fam_ans)
         thresh = self.threshold("family")
         eligible_fams = {a.family for a in state.eligible}
         if self._is_family_rejected(
@@ -3485,6 +4100,132 @@ class LayoutPlanner:
             sticky_actions=bool(archetype.frame.get("stickyActions", False)),
         )
 
+    def _winning_entropy(self, plan: LayoutPlan, state: PlannerState) -> float:
+        """Returns normalized Shannon entropy of the winning archetype or family answer."""
+        arch_ans = state.answers_by_id.get(f"archetype:{plan.family}")
+        if arch_ans is not None:
+            return arch_ans.distribution.normalized_entropy()
+        fam_ans = state.answers_by_id.get("family")
+        if fam_ans is not None:
+            return fam_ans.distribution.normalized_entropy()
+        return 0.0
+
+    def _orphan_pointer_share(self, plan: LayoutPlan, state: PlannerState) -> float:
+        """Computes the share of final bound pointers placed by `no-orphaned-pointers`."""
+        bound: set[str] = (
+            set(plan.page.title.pointers())
+            | set(plan.page.subtitle.pointers())
+            | set(plan.page.mark.pointers())
+        )
+        for block in plan.blocks:
+            bound.update(block.bindings.pointers())
+        if not bound:
+            return 0.0
+        return len(state.orphan_pointers & bound) / len(bound)
+
+    def _slot_instance_confidences(
+        self,
+        block: PlannedBlock,
+        spec: BlockSpec,
+        slot_name: str,
+        slot_binding: SlotBinding,
+        state: PlannerState,
+    ) -> list[float]:
+        """Collects confidence scores from `instance:<block>.*` answers for `slot_binding`."""
+        prefix = f"instance:{block.block_id}."
+        slot_ptrs = set(slot_binding.pointers())
+        act_ids = {
+            _button_meta(idx, item)[0] for idx, item in enumerate(slot_binding.items)
+        }
+        confs: list[float] = []
+        for q_id, ans in state.answers_by_id.items():
+            if not q_id.startswith(prefix):
+                continue
+            q_name, _, elem_key = q_id[len(prefix) :].partition(":")
+            q_spec = spec.instance.get(q_name)
+            if q_spec is None:
+                continue
+            if (
+                elem_key not in slot_ptrs
+                and elem_key != slot_name
+                and elem_key not in act_ids
+            ):
+                continue
+            if q_spec.kind is QuestionKind.BOOLEAN:
+                confs.append(max(ans.yes, 1.0 - ans.yes))
+            else:
+                confs.append(ans.top()[1])
+        return confs
+
+    def _required_slot_weakness(
+        self,
+        block: PlannedBlock,
+        spec: BlockSpec,
+        slot_name: str,
+        slot_spec: SlotSpec,
+        state: PlannerState,
+        inst_thresh: float,
+    ) -> float:
+        """Returns `[0.0, 1.0]` share of bindings on required `slot_name` below `inst_thresh`."""
+        slot_binding = block.bindings.get(slot_name)
+        if slot_binding is None or not slot_binding.bound:
+            return 1.0
+        if (
+            slot_binding.pointer is None
+            and not slot_binding.items
+            and slot_spec.from_types != ("action",)
+        ):
+            return 1.0
+        confs = self._slot_instance_confidences(
+            block, spec, slot_name, slot_binding, state
+        )
+        if not confs:
+            return 0.0
+        return sum(1.0 for c in confs if c < inst_thresh) / len(confs)
+
+    def _is_required_slot(self, spec: BlockSpec, slot_spec: SlotSpec) -> bool:
+        """Returns whether `slot_spec` is an explicit or sole-slot required binding."""
+        return (
+            slot_spec.required
+            or len(spec.slots) == 1
+            or any(fs.required for fs in slot_spec.fields.values())
+        )
+
+    def _weak_required_slot_share(self, plan: LayoutPlan, state: PlannerState) -> float:
+        """Computes the share of required slots bound below `thresholds.instance`."""
+        inst_thresh = self.threshold("instance")
+        ratios: list[float] = []
+        for block in plan.blocks:
+            spec = self._grammar.block(block.block_id)
+            for slot_name, slot_spec in spec.slots.items():
+                if self._is_required_slot(spec, slot_spec):
+                    ratios.append(
+                        self._required_slot_weakness(
+                            block, spec, slot_name, slot_spec, state, inst_thresh
+                        )
+                    )
+        return sum(ratios) / len(ratios) if ratios else 0.0
+
+    def _finalize_planned_fit_score(
+        self, plan: LayoutPlan, state: PlannerState
+    ) -> PlanOutcome:
+        """Computes, traces, and attaches `fit_score` onto `plan` and `PlanOutcome`."""
+        arch_prob = plan.confidence
+        entropy = self._winning_entropy(plan, state)
+        orphan_share = self._orphan_pointer_share(plan, state)
+        weak_share = self._weak_required_slot_share(plan, state)
+        score = compute_fit_score(arch_prob, entropy, orphan_share, weak_share)
+        self._record_fit_score(
+            state,
+            score,
+            arch_prob=arch_prob,
+            entropy=entropy,
+            orphan_share=orphan_share,
+            weak_share=weak_share,
+        )
+        scored_plan = replace(plan, fit_score=score)
+        return PlanOutcome(plan=scored_plan, reason=PlanReason.PLANNED, fit_score=score)
+
     def _apply_all_rules(self, plan: LayoutPlan, state: PlannerState) -> PlanOutcome:
         """Runs the grammar `apply_<rule>` functions in pipeline order."""
         plan = apply_required_block_wins(plan, state)
@@ -3510,7 +4251,7 @@ class LayoutPlanner:
             return PlanOutcome(plan=None, reason=PlanReason.ACTION_GATE)
         if state.required_block_missing or not plan.blocks:
             return PlanOutcome(plan=None, reason=PlanReason.REQUIRED_BLOCK_MISSING)
-        return PlanOutcome(plan=plan, reason=PlanReason.PLANNED)
+        return self._finalize_planned_fit_score(plan, state)
 
     def _apply_scoped_collection_knobs(
         self,

@@ -40,9 +40,11 @@ CATALOG_ID = "https://example.com/catalogs/ops/v1/catalog.json"
 EXPECTED_SURFACE_ID_TEXT = (
     "The surface to render into. A new id creates a surface. Reusing an id"
     " updates that surface in place: the new layout replaces the old one, and"
-    " parts that did not change keep their state. To start the surface over,"
-    ' also set `"replace": true`; the old surface is deleted and a new one is'
-    " created."
+    " parts that did not change keep their state. To change only one part,"
+    " also set `region` to that part's role from the `layout` roles (for"
+    ' example `"actions"`); only that part is replaced. To start the surface'
+    ' over, also set `"replace": true`; the old surface is deleted and a new'
+    " one is created."
 )
 
 
@@ -88,6 +90,8 @@ def test_decision_block_minimal_defaults_and_aliases() -> None:
     assert block.actions == ()
     assert block.exclude == ()
     assert block.replace is False
+    assert block.region is None
+    assert block.labels == {}
 
     assert block.to_json() == {
         "intent": "Show service health",
@@ -101,6 +105,8 @@ def test_decision_block_minimal_defaults_and_aliases() -> None:
         "layout": None,
         "title": None,
         "summary": None,
+        "labels": None,
+        "region": None,
     }
     assert block.to_synthesis_kwargs(default_surface_id="main")["surface_id"] == "main"
 
@@ -137,6 +143,8 @@ def test_decision_block_full_round_trip_every_field() -> None:
         },
         "exclude": ["/internalToken", "/items/0/secret"],
         "replace": True,
+        "region": "headline",
+        "labels": {"/recipient": "Recipient name", "/amount": "Amount (USD)"},
         "template": "ignored_legacy_field",
     }
     block = DecisionBlock.from_mapping(raw)
@@ -150,6 +158,11 @@ def test_decision_block_full_round_trip_every_field() -> None:
     assert block.summary == "Check the details before sending."
     assert block.exclude == ("/internalToken", "/items/0/secret")
     assert block.replace is True
+    assert block.region == "headline"
+    assert block.labels == {
+        "/recipient": "Recipient name",
+        "/amount": "Amount (USD)",
+    }
     assert block.actions == (
         ActionSpec(
             id="send_transfer",
@@ -194,6 +207,8 @@ def test_decision_block_full_round_trip_every_field() -> None:
         },
         "exclude": ["/internalToken", "/items/0/secret"],
         "replace": True,
+        "region": "headline",
+        "labels": {"/recipient": "Recipient name", "/amount": "Amount (USD)"},
     }
 
     round_tripped = DecisionBlock.from_mapping(serialized)
@@ -208,6 +223,8 @@ def test_decision_block_full_round_trip_every_field() -> None:
         "layout": block.layout,
         "title": block.title,
         "summary": block.summary,
+        "labels": {"/recipient": "Recipient name", "/amount": "Amount (USD)"},
+        "region": "headline",
         "surface_id": "transfer_surface",
     }
     assert "replace" not in kwargs
@@ -415,6 +432,51 @@ def test_decision_block_preserves_action_order_and_accepts_layout_brief() -> Non
             TypeError,
             "replace",
         ),
+        (
+            {"intent": "Show", "payload": {}, "region": 123},
+            TypeError,
+            "region",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "region": ""},
+            ValueError,
+            "region",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "region": "   "},
+            ValueError,
+            "region",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "labels": ["bad"]},
+            TypeError,
+            "labels",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "labels": {123: "CPU"}},
+            TypeError,
+            "labels",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "labels": {"cpu": "CPU"}},
+            ValueError,
+            "JSON Pointers starting with '/'",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "labels": {"/": "Root"}},
+            ValueError,
+            "JSON Pointers starting with '/'",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "labels": {"/cpu": 123}},
+            TypeError,
+            "labels",
+        ),
+        (
+            {"intent": "Show", "payload": {}, "labels": {"/cpu": "   "}},
+            ValueError,
+            "non-empty",
+        ),
     ],
 )
 def test_decision_block_rejects_invalid_inputs(
@@ -461,12 +523,14 @@ def test_prompt_generator_contains_new_surface_id_rules_and_no_template() -> Non
     assert isinstance(DECISION_RULES, str)
     assert EXPECTED_SURFACE_ID_TEXT in DECISION_RULES
     assert EXPECTED_SURFACE_ID_TEXT in prompt
+    assert "`region`" in prompt
     assert "`replace`" in prompt
     assert "`actions`" in prompt
     assert '{"sign_in": "Sign In"' in prompt
     assert '"scope"' in prompt and '"context"' in prompt and '"style"' in prompt
     assert "`exclude`" in prompt
     assert "`mutablePaths`" in prompt
+    assert "`labels`" in prompt
     assert "forms and settings must list their editable pointers" in prompt
 
     # Old payload actions instruction and template section are removed.
