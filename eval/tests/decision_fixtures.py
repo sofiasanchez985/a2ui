@@ -65,10 +65,12 @@ TRANSFER_BLOCK: str = json.dumps({
         "recipient": "Alex Chen",
         "fee": 0.5,
         "arrives": "2026-10-24",
-        "actions": ["Send", "Cancel"],
     },
-    "layout": ["facts:amount,recipient,fee,arrives", "actions:actions"],
-    "mutablePaths": ["/actions"],
+    "actions": {
+        "send": "Send",
+        "cancel": "Cancel",
+    },
+    "layout": ["facts:amount,recipient,fee,arrives"],
 })
 
 TRANSFER_DECISION_BLOCK: DecisionBlock = DecisionBlock.from_mapping(
@@ -84,9 +86,7 @@ TRANSFER_ANSWERS: dict[str, Any] = {
     "gate:prose": 0.45,
     "gate:facts": 0.85,
     "gate:actions": 0.90,
-    "instance:actions.primary:/actions": ("Send", 0.90),
-    "instance:actions.destructive:0": 0.80,
-    "instance:actions.destructive:1": 0.10,
+    "instance:actions.primary:buttons": ("send", 0.90),
     "salience:/amount": 2.9,
     "salience:/recipient": 2.6,
     "salience:/fee": 1.9,
@@ -130,6 +130,8 @@ SETTINGS_ANSWERS: dict[str, Any] = {
 
 def scripted_backend(
     answers: Mapping[str, Any] | None = None,
+    *,
+    model_id: str = "mock",
 ) -> DeterministicMockBackend:
     """Returns a `DeterministicMockBackend` seeded with `answers`."""
-    return DeterministicMockBackend(scripted_answers=answers)
+    return DeterministicMockBackend(scripted_answers=answers, model_id=model_id)

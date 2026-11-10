@@ -89,9 +89,9 @@ uv run main.py --strategies skill_mode
 uv run main.py --strategies decision --decision-backend mock
 ```
 
-The `decision` strategy evaluates the two-stage decision-model synthesis route. In Stage 1, the model emits intent and payload in a `<a2ui>` block. In Stage 2, the decision synthesizer plans and expands the surface without an additional UI generation model call.
+The `decision` strategy evaluates the two-stage decision-model synthesis route on v1.0. In Stage 1, the model emits `intent`, `payload`, and optional `actions` maps, `exclude` pointers, `replace` flags, or layout hints in a `<a2ui>` block. In Stage 2, `DecisionSynthesizer` plans and expands the surface without an additional UI generation model call.
 
-- `--decision-backend`: `mock` (default when `$A2UI_DECISION_BACKEND` is unset), `jev`, or `step0`.
+- `--decision-backend`: `mock`, `jev`, `systemone`, or `step0` (required when running the `decision` strategy unless `A2UI_DECISION_BACKEND` is set).
 
 The `subagent_tool` strategy gives the outer model one tool, `a2ui_specialist`, and a second model call writes the payload. `--subagent-format {direct_json,express}` picks the format the specialist writes in (default `direct_json`).
 
@@ -333,27 +333,31 @@ It reports:
 - Token usage: prompt and output tokens per turn, and token reduction percentage.
 - Latency: median and 95th percentile wall-clock response time, plus decision-stage latency and call counts.
 
-## Decision Model Benchmarking
+## Decision Model Benchmarking and Calibration
 
-`bin/decision_bench.py` benchmarks decision backend models directly against the encrypted golden plan dataset (`datasets/decision_plans/v1.yaml`):
+`bin/decision_bench.py` benchmarks decision backends directly against the encrypted golden plan dataset (`datasets/decision_plans/v1.yaml`):
 
 ```bash
 # Run against the step-0 backend
 uv run ./bin/decision_bench.py --backend step0 --repeat 3 --markdown
 
-# Fit optimal temperature on the calibration set
-uv run ./bin/decision_bench.py --backend step0 --fit-temperature
-
-# Run against remote Jev
-uv run ./bin/decision_bench.py --backend jev --repeat 3 --markdown
+# Run against remote Jev with a custom calibration profile
+uv run ./bin/decision_bench.py --backend jev --calibration profiles.json --repeat 3 --markdown
 ```
 
 The benchmark reports:
 
-- Job family and layout archetype classification accuracy.
-- Block recall: whether all required semantic blocks were planned.
-- Calibration: Brier score and Expected Calibration Error (ECE) across probability buckets.
-- Latency: mean, median, P95, and P99 latency in milliseconds.
+1. Backend kind and model identifier (`backend_kind`, `model_id`).
+2. Job family and layout archetype classification accuracy, plus block recall and precision.
+3. Round trips per surface, fallback rate, and abstain rate.
+4. Calibration: Brier score and 10-bin Expected Calibration Error (ECE).
+5. Latency: p50 and p95 backend latency and host overhead in milliseconds.
+
+`bin/calibrate_decision_backend.py` fits per-model temperature profiles on tuning cases from `datasets/decision_plans/v1.yaml` and writes a JSON profile readable by `Calibration.load`. It refuses cases tagged `heldout` or marked `split: heldout`:
+
+```bash
+uv run ./bin/calibrate_decision_backend.py --backend jev --model jev-v0 --split tuning --out calibration.json
+```
 
 ## Running Unit Tests & Schema Validation
 

@@ -19,19 +19,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
+from typing import Any
 
 from a2ui.core.basic_catalog import BasicCatalog
 from a2ui.inference_formats.decision import DecisionSynthesizer, SynthesisConfig
 from a2ui_eval.decision_bench import (
+    BenchmarkSummary,
     load_plan_cases,
     render_markdown,
     run_benchmark,
 )
-from a2ui_eval.decision_common import build_decision_backend
+from a2ui_eval.decision_common import (
+    DECISION_BACKEND_NAMES,
+    build_decision_backend,
+)
 from a2ui_eval.shared.utils import GIT_ROOT
 from dotenv import load_dotenv
 
@@ -47,31 +51,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=["mock", "jev", "step0"],
-        default=None,
-        help="Decision backend to evaluate (mock, jev, or step0; default: env).",
-    )
-    parser.add_argument(
-        "--two-stage",
-        dest="two_stage",
-        action="store_true",
+        choices=list(DECISION_BACKEND_NAMES),
         default=None,
         help=(
-            "Force two-stage batching (Stage 1: family/archetype, Stage 2: winning"
-            " archetype blocks)."
+            "Decision backend to evaluate (mock, jev, systemone, or step0;"
+            " required unless A2UI_DECISION_BACKEND is set)."
         ),
     )
     parser.add_argument(
-        "--single-stage",
-        dest="two_stage",
-        action="store_false",
-        help="Force single-stage speculative batching.",
+        "--model",
+        type=str,
+        default=None,
+        help="Optional model identifier passed to the backend.",
+    )
+    parser.add_argument(
+        "--endpoint-url",
+        type=str,
+        default=None,
+        help="Optional endpoint URL override for remote backends.",
+    )
+    parser.add_argument(
+        "--calibration",
+        type=str,
+        default=None,
+        help="Optional path to a calibration profile JSON file.",
     )
     parser.add_argument(
         "--cases",
         type=str,
         default=str(DEFAULT_CASES_PATH),
         help="Path to YAML cases file (default: eval/datasets/decision_plans/v1.yaml).",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        help="Optional dataset split filter (tuning or heldout).",
     )
     parser.add_argument(
         "--tags",
@@ -106,9 +121,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--markdown",
         action="store_true",
         default=True,
-        help="Render summary table in markdown to stdout (default: True).",
+        help="Render summary table in Markdown to stdout (default: True).",
     )
     return parser.parse_args(argv)
+
+
+def _serialize_summary(summary: BenchmarkSummary) -> dict[str, Any]:
+    """Serializes `summary` into a JSON-compatible dictionary."""
+    return {
+        "backend_kind": summary.backend_kind,
+        "model_id": summary.model_id,
+        "cases_count": summary.cases_count,
+        "total_runs": summary.total_runs,
+        "family_accuracy": summary.family_accuracy,
+        "archetype_accuracy": summary.archetype_accuracy,
+        "block_precision": summary.block_precision,
+        "block_recall": summary.block_recall,
+        "abstain_rate": summary.abstain_rate,
+        "fallback_rate": summary.fallback_rate,
+        "round_trips_per_surface": summary.round_trips_per_surface,
+        "decision_latency_p50": summary.decision_latency_p50,
+        "decision_latency_p95": summary.decision_latency_p95,
+        "host_overhead_p50": summary.host_overhead_p50,
+        "host_overhead_p95": summary.host_overhead_p95,
+        "decision_calls_mean": summary.decision_calls_mean,
+        "brier_family": summary.brier_family,
+        "ece_family": summary.ece_family,
+        "brier_archetype": summary.brier_archetype,
+        "ece_archetype": summary.ece_archetype,
+        "brier_gates": summary.brier_gates,
+        "ece_gates": summary.ece_gates,
+        "fitted_temperature": summary.fitted_temperature,
+        "cases": [
+            {
+                "name": cs.case.name,
+                "family_accuracy": cs.family_accuracy,
+                "archetype_accuracy": cs.archetype_accuracy,
+                "block_precision": cs.block_precision,
+                "block_recall": cs.block_recall,
+                "abstain_rate": cs.abstain_rate,
+                "fallback_rate": cs.fallback_rate,
+                "round_trips_per_surface": cs.round_trips_per_surface,
+                "decision_latency_p50": cs.decision_latency_p50,
+                "host_overhead_p50": cs.host_overhead_p50,
+            }
+            for cs in summary.case_scores
+        ],
+    }
 
 
 async def _async_main(args: argparse.Namespace) -> int:
@@ -119,17 +178,25 @@ async def _async_main(args: argparse.Namespace) -> int:
     cases = load_plan_cases(
         cases_path,
         tags=args.tags,
+        split=args.split,
         include_unverified=args.include_unverified,
     )
     if not cases:
         sys.stderr.write(f"No cases found matching criteria in {cases_path}\n")
         return 1
 
-    backend = build_decision_backend(args.backend)
-    backend_name = args.backend or getattr(backend, "name", "default")
-    catalogs = [BasicCatalog("v1.0")]
-    config = SynthesisConfig(two_stage_batching=args.two_stage)
-    synth = DecisionSynthesizer(catalogs, backend, config=config)
+    cal_path = Path(args.calibration) if args.calibration else None
+    backend = build_decision_backend(
+        args.backend,
+        endpoint_url=args.endpoint_url,
+        model=args.model,
+        calibration=cal_path,
+    )
+    synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")],
+        backend,
+        config=SynthesisConfig(),
+    )
 
     try:
         summary = await run_benchmark(
@@ -139,55 +206,19 @@ async def _async_main(args: argparse.Namespace) -> int:
             fit_temp=args.fit_temperature,
         )
     finally:
-        if hasattr(backend, "aclose"):
-            await backend.aclose()
-        elif hasattr(backend, "close"):
-            backend.close()
+        await backend.aclose()
 
     if args.markdown:
-        md = render_markdown(summary, backend_name=str(backend_name))
-        print(md)
+        label = f"{summary.backend_kind}/{summary.model_id}"
+        print(render_markdown(summary, backend_name=label))
 
     if args.json_path:
         out_path = Path(args.json_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # Serialize summary to JSON
-        serializable = {
-            "cases_count": summary.cases_count,
-            "total_runs": summary.total_runs,
-            "family_accuracy": summary.family_accuracy,
-            "archetype_accuracy": summary.archetype_accuracy,
-            "block_precision": summary.block_precision,
-            "block_recall": summary.block_recall,
-            "abstain_rate": summary.abstain_rate,
-            "decision_latency_p50": summary.decision_latency_p50,
-            "decision_latency_p95": summary.decision_latency_p95,
-            "host_overhead_p50": summary.host_overhead_p50,
-            "host_overhead_p95": summary.host_overhead_p95,
-            "decision_calls_mean": summary.decision_calls_mean,
-            "brier_family": summary.brier_family,
-            "ece_family": summary.ece_family,
-            "brier_archetype": summary.brier_archetype,
-            "ece_archetype": summary.ece_archetype,
-            "brier_gates": summary.brier_gates,
-            "ece_gates": summary.ece_gates,
-            "fitted_temperature": summary.fitted_temperature,
-            "cases": [
-                {
-                    "name": cs.case.name,
-                    "family_accuracy": cs.family_accuracy,
-                    "archetype_accuracy": cs.archetype_accuracy,
-                    "block_precision": cs.block_precision,
-                    "block_recall": cs.block_recall,
-                    "abstain_rate": cs.abstain_rate,
-                    "decision_latency_p50": cs.decision_latency_p50,
-                    "host_overhead_p50": cs.host_overhead_p50,
-                }
-                for cs in summary.case_scores
-            ],
-        }
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, indent=2)
+        out_path.write_text(
+            json.dumps(_serialize_summary(summary), indent=2),
+            encoding="utf-8",
+        )
 
     return 0
 

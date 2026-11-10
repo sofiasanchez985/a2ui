@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Any
@@ -27,7 +28,7 @@ from inspect_ai.model import (
     ModelName,
     ModelOutput,
 )
-from inspect_ai.solver import Generate, TaskState
+from inspect_ai.solver import TaskState
 import pytest
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
@@ -38,12 +39,13 @@ from a2ui_eval.decision_common import (
 )
 from a2ui_eval.strategies.decision import (
     compile_decision_payload,
-    decision_solver,
     decision_system_prompt,
 )
 from decision_fixtures import (
     HOST_ANSWERS,
     HOST_BLOCK,
+    TRANSFER_ANSWERS,
+    TRANSFER_BLOCK,
     scripted_backend,
 )
 
@@ -92,11 +94,12 @@ async def test_decision_system_prompt_injection() -> None:
     system_content = str(state.messages[0].content)
     assert "You are a UI generator." in system_content
     assert "<a2ui>" in system_content
+    assert '"actions"' in system_content
 
 
 @pytest.mark.asyncio
 async def test_decision_solver_scripted_success() -> None:
-    backend = scripted_backend(HOST_ANSWERS)
+    backend = scripted_backend(HOST_ANSWERS, model_id="mock-v1")
     valid_completion = f"<a2ui>\n{HOST_BLOCK}\n</a2ui>"
     state = _make_state(
         metadata={
@@ -120,27 +123,75 @@ async def test_decision_solver_scripted_success() -> None:
     assert state.output is not None
     assert "<a2ui-json>" in state.output.completion
 
-    # Metadata keys
     for key in DECISION_METADATA_KEYS:
         assert key in state.metadata, f"Missing decision metadata key: {key}"
     assert state.metadata["decision_stage"] == "archetype"
     assert state.metadata["decision_archetype"] == "dashboard"
+    assert state.metadata["decision_backend"] == "mock"
+    assert state.metadata["decision_backend_kind"] == "mock"
+    assert state.metadata["decision_model_id"] == "mock-v1"
     assert isinstance(state.metadata["decision_block"], dict)
     assert "intent" in state.metadata["decision_block"]
     assert isinstance(state.metadata["decision_blocks"], list)
     assert len(state.metadata["decision_blocks"]) > 0
-    assert isinstance(state.metadata["decision_reasked"], bool)
-    assert state.metadata["decision_backend"] == "mock"
     assert state.metadata["decision_calls"] > 0
     assert state.metadata["decision_latency_ms"] >= 0.0
+    assert state.metadata["decision_fallback_source"] is None
+
+
+@pytest.mark.asyncio
+async def test_decision_solver_actions_map_and_exclude_round_trip() -> None:
+    backend = scripted_backend(TRANSFER_ANSWERS, model_id="mock-act")
+    block_dict = json.loads(TRANSFER_BLOCK)
+    block_dict["payload"]["internalDebugToken"] = "secret-debug"
+    block_dict["exclude"] = ["/internalDebugToken"]
+    completion = f"<a2ui>\n{json.dumps(block_dict)}\n</a2ui>"
+    state = _make_state(
+        metadata={
+            "catalog": "catalogs/basic/v1/catalog.json",
+            "allowed_surface_ids": ["main"],
+        },
+        completion=completion,
+    )
+
+    with patch(
+        "a2ui_eval.strategies.decision.build_decision_backend",
+        return_value=backend,
+    ):
+        step = compile_decision_payload("1.0", decision_backend="mock")
+        state = await step(state, _dummy_generate)
+
+    assert state.metadata.get("pass_at_1") is True
+    assert state.output is not None
+    serialized = state.output.completion
+    assert '"name": "send"' in serialized
+    assert '"name": "cancel"' in serialized
+    assert "internalDebugToken" not in json.dumps(
+        state.metadata["compiled_messages"][0].get("createSurface", {})
+    )
+
+
+@pytest.mark.asyncio
+async def test_decision_solver_requires_explicit_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("A2UI_DECISION_BACKEND", raising=False)
+    state = _make_state(
+        metadata={
+            "catalog": "catalogs/basic/v1/catalog.json",
+            "allowed_surface_ids": ["main"],
+        },
+        completion=f"<a2ui>\n{HOST_BLOCK}\n</a2ui>",
+    )
+    step = compile_decision_payload("1.0", decision_backend=None)
+    with pytest.raises(ValueError, match="A2UI_DECISION_BACKEND"):
+        await step(state, _dummy_generate)
 
 
 @pytest.mark.asyncio
 async def test_decision_solver_unscripted_abstain_fails() -> None:
-    # Deliberately unparseable / abstaining block with no fallback
-    invalid_completion = (
-        '<a2ui-decision>\n{"intent": "Unknown intent", "payload": {}}\n</a2ui-decision>'
-    )
+    # Unparseable tag / empty payload with no fallback messages
+    invalid_completion = '<a2ui>\n{"intent": "Unknown intent", "payload": {}}\n</a2ui>'
     state = _make_state(
         metadata={
             "catalog": "catalogs/basic/v1/catalog.json",
@@ -180,7 +231,6 @@ async def test_decision_solver_validation_retries() -> None:
         )
         return st
 
-    # Initially starts with invalid JSON
     state = _make_state(
         metadata={
             "catalog": "catalogs/basic/v1/catalog.json",

@@ -25,6 +25,7 @@ from typing import Any
 from inspect_ai import Task, eval_set
 from inspect_ai.dataset import MemoryDataset
 
+from a2ui_eval.decision_common import DECISION_BACKEND_NAMES
 from a2ui_eval.runner import (
     DEFAULT_STRATEGIES,
     normalize_protocol_version,
@@ -240,8 +241,8 @@ def resolve_runtime_settings(args: argparse.Namespace) -> dict[str, Any]:
     return profile
 
 
-def main() -> None:
-    """Parses CLI arguments and runs the A2UI evaluation suite."""
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Constructs the CLI argument parser for `main.py`."""
     parser = argparse.ArgumentParser(description="Run A2UI evaluations")
     parser.add_argument(
         "--sanity",
@@ -333,11 +334,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--decision-backend",
-        choices=["mock", "jev", "step0"],
+        choices=list(DECISION_BACKEND_NAMES),
         default=None,
         help=(
             "Decision backend to use for the decision strategy ('mock',"
-            " 'jev', 'step0')."
+            " 'jev', 'systemone', 'step0')."
         ),
     )
     parser.add_argument(
@@ -432,12 +433,104 @@ def main() -> None:
         default=None,
         help="Number of epochs/repetitions to run for each evaluation sample",
     )
-    args = parser.parse_args()
-    if args.sanity:
-        model = "google/gemini-3.1-flash-lite"
-    else:
-        model = resolve_model_name(args.model)
+    return parser
 
+
+def _filter_task_prompts(task_obj: Task, prompts: list[str] | None) -> None:
+    """Filters `task_obj.dataset` in place when `--prompt` filters are given."""
+    if not prompts or getattr(task_obj, "dataset", None) is None:
+        return
+    prompt_list = [p.lower() for p in prompts]
+    filtered = [
+        s
+        for s in task_obj.dataset
+        if any(
+            p in str((s.metadata or {}).get("name", "")).lower()
+            or p in str(s.input).lower()
+            for p in prompt_list
+        )
+    ]
+    task_obj.dataset = MemoryDataset(samples=filtered, name=task_obj.dataset.name)
+
+
+def _build_single_task(
+    strat: str,
+    task_version: str,
+    task_datasets: list[str],
+    *,
+    args: argparse.Namespace,
+    grading_model: str,
+    runtime: dict[str, Any],
+    tags: str | None,
+) -> Task:
+    """Builds and filters a single Inspect `Task` for `(strat, task_version)`."""
+    task_func = _task_function(task_version)
+    task_kwargs: dict[str, Any] = {
+        "strategy": strat,
+        "grading_model": grading_model,
+        "dataset": ",".join(task_datasets) or None,
+    }
+    if tags:
+        task_kwargs["tags"] = tags
+    if runtime["no_judge"]:
+        task_kwargs["no_judge"] = True
+    if args.max_validation_retries:
+        task_kwargs["max_validation_retries"] = args.max_validation_retries
+    if args.subagent_format != "direct_json":
+        task_kwargs["subagent_format"] = args.subagent_format
+    if args.decision_backend:
+        task_kwargs["decision_backend"] = args.decision_backend
+    if args.cache_generations:
+        task_kwargs["cache_generations"] = True
+
+    task_obj = task_func(**task_kwargs)
+    _filter_task_prompts(task_obj, args.prompt)
+    return task_obj
+
+
+def _build_eval_set_kwargs(
+    *,
+    tasks: list[Task],
+    model: str,
+    args: argparse.Namespace,
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Builds keyword arguments forwarded to Inspect `eval_set`."""
+    kwargs: dict[str, Any] = {
+        "tasks": tasks,
+        "model": model,
+        "log_dir": args.log_dir,
+        "retry_attempts": 0 if args.sanity else args.max_retries,
+        "limit": 2 if args.sanity else args.limit,
+        "sample_shuffle": None if args.sanity else args.sample_shuffle,
+        "working_limit": runtime["working_limit"],
+        "log_dir_allow_dirty": True,
+        "max_samples": runtime["max_samples"],
+    }
+    if runtime["max_connections"] is not None:
+        kwargs["max_connections"] = runtime["max_connections"]
+    if args.model_base_url:
+        kwargs["model_base_url"] = args.model_base_url
+    epochs = None if args.sanity else args.epochs
+    if epochs is not None:
+        kwargs["epochs"] = epochs
+    if args.thinking_budget is not None:
+        kwargs["reasoning_tokens"] = args.thinking_budget
+    if args.temperature is not None:
+        kwargs["temperature"] = args.temperature
+    if args.max_tasks is not None:
+        kwargs["max_tasks"] = args.max_tasks
+    return kwargs
+
+
+def main() -> None:
+    """Parses CLI arguments and runs the A2UI evaluation suite."""
+    args = _build_arg_parser().parse_args()
+    model = (
+        "google/gemini-3.1-flash-lite"
+        if args.sanity
+        else resolve_model_name(args.model)
+    )
     grading_model = resolve_model_name(args.grading_model)
     if any(
         family in grading_model.lower() for family in RESTRICTED_GRADING_MODEL_FAMILIES
@@ -448,15 +541,7 @@ def main() -> None:
             " 'google/gemini-3.6-flash' or 'google/gemini-3.1-flash-lite')."
         )
 
-    limit = 2 if args.sanity else args.limit
-    retry_attempts = 0 if args.sanity else args.max_retries
-    sample_shuffle = None if args.sanity else args.sample_shuffle
-    epochs = None if args.sanity else args.epochs
-
-    # Resolve dataset filters
     selected_datasets = split_dataset_names(args.datasets or args.dataset)
-
-    # Parse and validate strategies
     selected_strategies = parse_strategies(args.strategies)
     runtime = resolve_runtime_settings(args)
     tags = args.tags or args.tier
@@ -473,67 +558,24 @@ def main() -> None:
             validate_version(task_version)
             task_plan.append((strat, task_version, task_datasets))
 
-    tasks = []
-    for strat, task_version, task_datasets in task_plan:
-        task_func = _task_function(task_version)
-        task_kwargs: dict[str, Any] = {
-            "strategy": strat,
-            "grading_model": grading_model,
-            "dataset": ",".join(task_datasets) or None,
-        }
-        if tags:
-            task_kwargs["tags"] = tags
-        if runtime["no_judge"]:
-            task_kwargs["no_judge"] = True
-        if args.max_validation_retries:
-            task_kwargs["max_validation_retries"] = args.max_validation_retries
-        if args.subagent_format != "direct_json":
-            task_kwargs["subagent_format"] = args.subagent_format
-        if args.decision_backend:
-            task_kwargs["decision_backend"] = args.decision_backend
-        if args.cache_generations:
-            task_kwargs["cache_generations"] = True
-
-        task_obj = task_func(**task_kwargs)
-        if args.prompt and getattr(task_obj, "dataset", None) is not None:
-            prompt_list = [p.lower() for p in args.prompt]
-            filtered = [
-                s
-                for s in task_obj.dataset
-                if any(
-                    p in str((s.metadata or {}).get("name", "")).lower()
-                    or p in str(s.input).lower()
-                    for p in prompt_list
-                )
-            ]
-            task_obj.dataset = MemoryDataset(
-                samples=filtered, name=task_obj.dataset.name
-            )
-        tasks.append(task_obj)
-
-    eval_set_kwargs: dict[str, Any] = {
-        "tasks": tasks,
-        "model": model,
-        "log_dir": args.log_dir,
-        "retry_attempts": retry_attempts,
-        "limit": limit,
-        "sample_shuffle": sample_shuffle,
-        "working_limit": runtime["working_limit"],
-        "log_dir_allow_dirty": True,
-    }
-    if runtime["max_connections"] is not None:
-        eval_set_kwargs["max_connections"] = runtime["max_connections"]
-    if args.model_base_url:
-        eval_set_kwargs["model_base_url"] = args.model_base_url
-    if epochs is not None:
-        eval_set_kwargs["epochs"] = epochs
-    if args.thinking_budget is not None:
-        eval_set_kwargs["reasoning_tokens"] = args.thinking_budget
-    if args.temperature is not None:
-        eval_set_kwargs["temperature"] = args.temperature
-    if args.max_tasks is not None:
-        eval_set_kwargs["max_tasks"] = args.max_tasks
-    eval_set_kwargs["max_samples"] = runtime["max_samples"]
+    tasks = [
+        _build_single_task(
+            strat,
+            task_version,
+            task_datasets,
+            args=args,
+            grading_model=grading_model,
+            runtime=runtime,
+            tags=tags,
+        )
+        for strat, task_version, task_datasets in task_plan
+    ]
+    eval_set_kwargs = _build_eval_set_kwargs(
+        tasks=tasks,
+        model=model,
+        args=args,
+        runtime=runtime,
+    )
 
     print(f"Starting evaluation for strategies {selected_strategies}...")
     success, _ = eval_set(**eval_set_kwargs)

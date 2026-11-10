@@ -23,6 +23,7 @@ from typing import Any
 
 from a2ui.inference_formats.decision import (
     ArchetypeGrammar,
+    DecisionFormat,
     DecisionFormatFactory,
     DecisionPromptGenerator,
 )
@@ -30,7 +31,11 @@ from a2ui.parser.messages import to_message_dicts
 from inspect_ai.model import CachePolicy, ChatMessageSystem
 from inspect_ai.solver import Generate, Solver, TaskState, solver
 
-from ..decision_common import build_decision_backend, decision_metadata
+from ..decision_common import (
+    DEFAULT_DECISION_BLOCK_EXAMPLES,
+    build_decision_backend,
+    decision_metadata,
+)
 from ..runner import (
     DEFAULT_PARSE_TIMEOUT_SEC,
     build_catalogs_and_examples,
@@ -73,6 +78,19 @@ def _decision_retry_prompt(error: str) -> str:
     )
 
 
+def _accumulate_decision_metadata(state: TaskState, meta: dict[str, Any]) -> None:
+    """Accumulates decision latency and call counts across validation retries."""
+    state.metadata["decision_latency_ms"] = (
+        state.metadata.get("decision_latency_ms") or 0.0
+    ) + meta.get("decision_latency_ms", 0.0)
+    state.metadata["decision_calls"] = (
+        state.metadata.get("decision_calls") or 0
+    ) + meta.get("decision_calls", 0)
+    for k, v in meta.items():
+        if k not in ("decision_latency_ms", "decision_calls"):
+            state.metadata[k] = v
+
+
 @solver
 def decision_system_prompt(version: str) -> Solver:
     """Injects system prompt instructions using the decision inference format."""
@@ -82,14 +100,14 @@ def decision_system_prompt(version: str) -> Solver:
         resolved_catalog_path = str(GIT_ROOT / catalog_path)
         options = runner_options_from_metadata(state.metadata, resolved_catalog_path)
 
-        catalogs, examples = build_catalogs_and_examples(
+        catalogs, _ = build_catalogs_and_examples(
             resolved_catalog_path,
             version,
             options.to_dict() if options else None,
         )
         generator = DecisionPromptGenerator(
             catalogs,
-            examples=examples,
+            block_examples=DEFAULT_DECISION_BLOCK_EXAMPLES,
             archetypes=ArchetypeGrammar.default(),
         )
         generated_snippet = generator.generate()
@@ -101,6 +119,69 @@ def decision_system_prompt(version: str) -> Solver:
     return solve
 
 
+async def _synthesize_completion(
+    state: TaskState,
+    completion: str,
+    *,
+    format_obj: DecisionFormat,
+    backend_label: str,
+    version: str,
+    resolved_catalog_path: str,
+    allowed_surface_ids: list[str],
+    options: Any,
+) -> _CompileResult:
+    """Synthesizes and validates one model completion containing `<a2ui>` blocks."""
+    surface_id = _find_surface_id(completion, allowed_surface_ids)
+    parser = format_obj.create_parser(conversation_id=str(state.sample_id))
+    try:
+        parsed_blocks = parser._extract_blocks(completion)  # pylint: disable=protected-access
+        outputs = await parser.synthesize_blocks(
+            completion, default_surface_id=surface_id
+        )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        return _CompileResult(error=str(e))
+
+    if not outputs:
+        return _CompileResult(error="No decision blocks produced any messages")
+
+    meta = decision_metadata(
+        outputs,
+        backend_name=backend_label,
+        block=parsed_blocks[0] if parsed_blocks else None,
+    )
+    _accumulate_decision_metadata(state, meta)
+
+    all_message_dicts: list[dict[str, Any]] = []
+    for out in outputs:
+        all_message_dicts.extend(to_message_dicts(out.messages))
+
+    if not all_message_dicts:
+        return _CompileResult(
+            error=(
+                "The layout engine could not choose components for this"
+                " block; restate the intent and give the payload descriptive"
+                " keys."
+            )
+        )
+
+    formatted = f"<a2ui-json>\n{json.dumps(all_message_dicts, indent=2)}\n</a2ui-json>"
+    try:
+        await asyncio.to_thread(
+            parse_and_validate,
+            "direct_json",
+            version,
+            resolved_catalog_path,
+            surface_id,
+            formatted,
+            DEFAULT_PARSE_TIMEOUT_SEC,
+            options=options,
+        )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        return _CompileResult(error=str(e))
+
+    return _CompileResult(formatted=formatted, compiled_jsons=all_message_dicts)
+
+
 @solver
 def compile_decision_payload(
     version: str,
@@ -110,9 +191,10 @@ def compile_decision_payload(
 ) -> Solver:
     """Synthesizes decision blocks into validated A2UI JSON components.
 
-    Runs the DecisionSynthesizer on the generated decision block, validates the
-    resulting A2UI messages using the Direct JSON validator, and stores the
-    compiled messages and decision metadata on the task state.
+    Runs `DecisionSynthesizer` on the generated decision block using an
+    explicitly configured backend (`decision_backend` or `A2UI_DECISION_BACKEND`),
+    validates the resulting A2UI messages, and stores the compiled messages and
+    decision metadata on the task state.
     """
     measured = measured_generate()
 
@@ -123,79 +205,33 @@ def compile_decision_payload(
         resolved_catalog_path = str(GIT_ROOT / state.metadata["catalog"])
         options = runner_options_from_metadata(state.metadata, resolved_catalog_path)
         allowed_surface_ids = state.metadata.get("allowed_surface_ids") or ["main"]
+        default_surface = allowed_surface_ids[0]
 
         catalogs, _ = build_catalogs_and_examples(
             resolved_catalog_path,
             version,
             options.to_dict() if options else None,
         )
-        backend_name = (
-            decision_backend or os.environ.get("A2UI_DECISION_BACKEND") or "mock"
+        backend = build_decision_backend(decision_backend)
+        backend_label = decision_backend or backend.backend_kind
+        factory = DecisionFormatFactory(
+            backend=backend,
+            surface_id=default_surface,
+            block_examples=DEFAULT_DECISION_BLOCK_EXAMPLES,
         )
-        backend = build_decision_backend(backend_name)
-        factory = DecisionFormatFactory(backend=backend)
         format_obj = factory.create_format(catalogs)
 
         async def attempt_synthesize(completion: str) -> _CompileResult:
-            surface_id = _find_surface_id(completion, allowed_surface_ids)
-            parser = format_obj.create_parser()
-            try:
-                parsed_blocks = parser._extract_blocks(completion)  # pylint: disable=protected-access
-                outputs = await parser.synthesize_blocks(
-                    completion, default_surface_id=surface_id
-                )
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                return _CompileResult(error=str(e))
-
-            if not outputs:
-                return _CompileResult(error="No decision blocks produced any messages")
-
-            meta = decision_metadata(
-                outputs,
-                backend_name=backend_name,
-                block=parsed_blocks[0] if parsed_blocks else None,
+            return await _synthesize_completion(
+                state,
+                completion,
+                format_obj=format_obj,
+                backend_label=backend_label,
+                version=version,
+                resolved_catalog_path=resolved_catalog_path,
+                allowed_surface_ids=allowed_surface_ids,
+                options=options,
             )
-            state.metadata["decision_latency_ms"] = (
-                state.metadata.get("decision_latency_ms") or 0.0
-            ) + meta.get("decision_latency_ms", 0.0)
-            state.metadata["decision_calls"] = (
-                state.metadata.get("decision_calls") or 0
-            ) + meta.get("decision_calls", 0)
-            for k, v in meta.items():
-                if k not in ("decision_latency_ms", "decision_calls"):
-                    state.metadata[k] = v
-
-            all_message_dicts: list[dict[str, Any]] = []
-            for out in outputs:
-                all_message_dicts.extend(to_message_dicts(out.messages))
-
-            if not all_message_dicts:
-                return _CompileResult(
-                    error=(
-                        "The layout engine could not choose components for this"
-                        " block; restate the intent and give the payload descriptive"
-                        " keys."
-                    )
-                )
-
-            formatted = (
-                f"<a2ui-json>\n{json.dumps(all_message_dicts, indent=2)}\n</a2ui-json>"
-            )
-            try:
-                await asyncio.to_thread(
-                    parse_and_validate,
-                    "direct_json",
-                    version,
-                    resolved_catalog_path,
-                    surface_id,
-                    formatted,
-                    DEFAULT_PARSE_TIMEOUT_SEC,
-                    options=options,
-                )
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                return _CompileResult(error=str(e))
-
-            return _CompileResult(formatted=formatted, compiled_jsons=all_message_dicts)
 
         try:
             result, completion, _ = await retry_until_ok(

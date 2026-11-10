@@ -40,7 +40,7 @@ All format strategies (`direct`, `express`, `elemental`, and `atom`), `skill_mod
 
 ### **The Decision Strategy**
 
-The `decision` strategy evaluates the two-stage decision-model synthesis route. In Stage 1, the model emits intent, payload, and optional copy or layout hints in a `<a2ui>` block. In Stage 2, the decision synthesizer plans and expands the surface using the configured decision backend (`--decision-backend`, defaulting to `mock`) without an additional UI generation model call. The strategy tracks Stage 1 validation retries (`pass_at_1`), decision latency (`decision_latency_ms`), decision calls (`decision_calls`), and planned archetype metadata.
+The `decision` strategy evaluates the two-stage decision-model synthesis route on A2UI v1.0. In Stage 1, the outer model emits `intent`, `payload`, and optional explicit `actions` maps, `exclude` pointers, `replace` flags, or layout hints in a `<a2ui>` block. In Stage 2, `DecisionSynthesizer` plans and expands the surface through an explicitly selected decision backend (`--decision-backend` or `A2UI_DECISION_BACKEND`, with no implicit mock fallback) without calling a second UI generation model. The strategy records Stage 1 validation retries (`pass_at_1`), backend kind and model identifier (`decision_backend_kind`, `decision_model_id`), decision latency (`decision_latency_ms`), round trips per surface (`decision_calls`), fallback diagnostics (`decision_fallback_source`, `decision_fallback_reason`), and planned template or archetype metadata.
 
 ### **Runner Options**
 

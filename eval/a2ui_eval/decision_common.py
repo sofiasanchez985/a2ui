@@ -17,67 +17,181 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import os
+from pathlib import Path
 from typing import Any
 
 from a2ui.inference_formats.decision import (
+    ActionSpec,
+    Calibration,
     DecisionBackend,
     DecisionBlock,
     DeterministicMockBackend,
-    JevHttpBackend,
     SynthesisOutput,
     create_decision_backend,
 )
 
-DECISION_BACKEND_NAMES: tuple[str, ...] = ("mock", "jev", "step0")
+DECISION_BACKEND_NAMES: tuple[str, ...] = (
+    "mock",
+    "jev",
+    "systemone",
+    "step0",
+)
 
 DECISION_METADATA_KEYS: tuple[str, ...] = (
     "decision_backend",
+    "decision_backend_kind",
+    "decision_model_id",
     "decision_stage",
+    "decision_operation",
     "decision_latency_ms",
     "decision_calls",
     "decision_confidence",
     "decision_archetype",
+    "decision_template_id",
     "decision_block",
     "decision_blocks",
-    "decision_reasked",
     "decision_answers",
     "decision_fallback_source",
+    "decision_fallback_reason",
 )
+
+DEFAULT_DECISION_BLOCK_EXAMPLES: tuple[DecisionBlock, ...] = (
+    DecisionBlock(
+        surface_id="main",
+        intent="Show host health metrics for prod-1",
+        payload={
+            "host": "prod-1",
+            "cpu": 0.78,
+            "cpuDelta": 0.12,
+            "status": "degraded",
+            "uptimeHours": 412,
+        },
+        layout=("headline:cpu,cpuDelta,status", "facts:host,uptimeHours"),
+    ),
+    DecisionBlock(
+        surface_id="main",
+        intent="Confirm wire transfer to Acme Corp before sending",
+        payload={
+            "recipient": "Acme Corp",
+            "amount": 1500.0,
+            "currency": "USD",
+            "sourceAccount": "Checking ...4821",
+        },
+        actions=(
+            ActionSpec(id="confirm_transfer", label="Confirm Transfer"),
+            ActionSpec(id="cancel", label="Cancel"),
+        ),
+        layout=("facts:recipient,amount,sourceAccount", "actions:confirm_transfer"),
+    ),
+)
+
+
+def is_transcrypt_ciphertext(path: str | Path) -> bool:
+    """Returns True when `path` appears to hold encrypted Transcrypt ciphertext."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+    try:
+        prefix = file_path.read_bytes()[:16]
+    except OSError:
+        return False
+    if prefix.startswith(b"U2FsdGVkX1") or prefix.startswith(b"Salted__"):
+        return True
+    try:
+        prefix.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
 
 
 def build_decision_backend(
     name: str | None = None,
     *,
     endpoint_url: str | None = None,
+    model: str | None = None,
+    calibration: Calibration | Path | None = None,
 ) -> DecisionBackend:
-    """Instantiates a DecisionBackend by short name ('mock', 'jev', 'step0').
-
-    When `name` is None, `create_decision_backend()` reads from the environment.
+    """Instantiates a `DecisionBackend` explicitly or from `A2UI_DECISION_BACKEND`.
 
     Raises:
-        ValueError: If `name` is not in `DECISION_BACKEND_NAMES`.
+        ValueError: If no backend is specified (neither `name` nor
+            `A2UI_DECISION_BACKEND`), if `name` is unknown, or if required
+            credentials are missing.
     """
     if name is None:
-        return create_decision_backend()
-    if name == "mock":
-        return DeterministicMockBackend()
-    if name == "jev":
-        import os
-
-        if not os.environ.get("JEV_API_KEY") and not os.environ.get("TYPESAFE_API_KEY"):
+        return create_decision_backend(
+            endpoint_url=endpoint_url,
+            model=model,
+            calibration=calibration,
+        )
+    clean = name.strip().lower()
+    if clean not in DECISION_BACKEND_NAMES:
+        raise ValueError(
+            f"Unknown decision backend: {name}. Expected one of"
+            f" {DECISION_BACKEND_NAMES}"
+        )
+    if clean == "mock":
+        return DeterministicMockBackend(model_id=model or "mock")
+    if clean in {"jev", "systemone"}:
+        has_auth = bool(
+            os.environ.get("JEV_API_KEY")
+            or os.environ.get("TYPESAFE_API_KEY")
+            or os.environ.get("A2UI_DECISION_AUTH")
+            or os.environ.get("A2UI_DECISION_TOKEN")
+        )
+        if (
+            not has_auth
+            and not endpoint_url
+            and not os.environ.get("A2UI_DECISION_URL")
+        ):
             raise ValueError(
                 "JEV_API_KEY or TYPESAFE_API_KEY must be set in the environment"
                 " to use the jev decision backend"
             )
         return create_decision_backend(
-            "jev",
-            endpoint_url=endpoint_url or "https://api.typesafe.ai/v1/systemone",
+            clean,
+            endpoint_url=endpoint_url,
+            model=model,
+            calibration=calibration,
         )
-    if name == "step0":
-        return create_decision_backend("step0", endpoint_url=endpoint_url)
-    raise ValueError(
-        f"Unknown decision backend: {name}. Expected one of {DECISION_BACKEND_NAMES}"
+    return create_decision_backend(
+        "step0",
+        endpoint_url=endpoint_url,
+        model=model,
+        calibration=calibration,
     )
+
+
+def _first_plan_info(
+    outputs: Sequence[SynthesisOutput],
+) -> tuple[str | None, str | None, list[str]]:
+    """Extracts `(archetype, template_id, block_ids)` from the first planned output."""
+    for out in outputs:
+        if out.selected_template_id is not None:
+            return None, out.selected_template_id, []
+        if out.layout_plan is not None:
+            return (
+                out.layout_plan.archetype or None,
+                out.layout_plan.template_id,
+                list(out.layout_plan.block_ids()),
+            )
+    return None, None, []
+
+
+def _first_fallback_info(
+    outputs: Sequence[SynthesisOutput],
+) -> tuple[str | None, str | None]:
+    """Extracts `(fallback_source, fallback_reason)` from `outputs`."""
+    for out in outputs:
+        if out.fallback_source is not None or out.fallback_reason is not None:
+            source = (
+                getattr(out.fallback_source, "value", str(out.fallback_source))
+                if out.fallback_source is not None
+                else None
+            )
+            return source, out.fallback_reason
+    return None, None
 
 
 def decision_metadata(
@@ -86,58 +200,35 @@ def decision_metadata(
     backend_name: str,
     block: DecisionBlock | None = None,
 ) -> dict[str, Any]:
-    """Aggregates metrics and diagnostics from synthesized outputs into task metadata.
-
-    Args:
-        outputs: Sequence of `SynthesisOutput` instances from synthesizing blocks.
-        backend_name: Short name of the decision backend ('mock', 'local', 'jev').
-        block: Optional parsed `DecisionBlock` for additional context.
-
-    Returns:
-        Mapping of metadata keys conforming to `DECISION_METADATA_KEYS`.
-    """
+    """Aggregates metrics and diagnostics from synthesized outputs into task metadata."""
     latency_ms = sum(out.decision_latency_ms for out in outputs)
     calls = sum(out.decision_calls for out in outputs)
     confidence = min((out.confidence for out in outputs), default=0.0)
-    stage = outputs[0].stage.value if outputs else None
-    archetype: str | None = None
-    blocks: list[str] = []
-    fallback_source: str | None = None
-    answers_count = 0
-    for out in outputs:
-        answers_count += len(out.decision_answers)
-        if archetype is None and out.layout_plan is not None:
-            archetype = out.layout_plan.archetype
-            blocks = list(out.layout_plan.block_ids())
-        elif (
-            archetype is None
-            and out.component_tree_spec
-            and "archetype" in out.component_tree_spec
-        ):
-            archetype = str(out.component_tree_spec["archetype"])
-            if isinstance(out.component_tree_spec.get("blocks"), list):
-                blocks = [
-                    str(b.get("id"))
-                    for b in out.component_tree_spec["blocks"]
-                    if isinstance(b, dict) and b.get("id")
-                ]
-        if fallback_source is None and out.fallback_source is not None:
-            fallback_source = str(out.fallback_source)
-    block_dict = (
-        {"intent": block.intent, "payload": block.payload}
-        if block is not None
-        else None
-    )
+    first = outputs[0] if outputs else None
+    stage = first.stage.value if first is not None else None
+    operation = first.operation.value if first is not None else None
+    backend_kind = (
+        first.backend_kind if first is not None and first.backend_kind else ""
+    ) or backend_name
+    model_id = first.model_id if first is not None else ""
+    archetype, template_id, blocks = _first_plan_info(outputs)
+    fallback_source, fallback_reason = _first_fallback_info(outputs)
+    answers_count = sum(len(out.decision_answers) for out in outputs)
+    block_dict = block.to_json() if block is not None else None
     return {
         "decision_backend": backend_name,
+        "decision_backend_kind": backend_kind,
+        "decision_model_id": model_id,
         "decision_stage": stage,
+        "decision_operation": operation,
         "decision_latency_ms": latency_ms,
         "decision_calls": calls,
         "decision_confidence": confidence,
         "decision_archetype": archetype,
+        "decision_template_id": template_id,
         "decision_block": block_dict,
         "decision_blocks": blocks,
-        "decision_reasked": any(out.decision_calls > 1 for out in outputs),
         "decision_answers": answers_count,
         "decision_fallback_source": fallback_source,
+        "decision_fallback_reason": fallback_reason,
     }

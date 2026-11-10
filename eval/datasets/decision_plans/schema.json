@@ -18,10 +18,36 @@
         "type": "object",
         "description": "Structured JSON data payload passed to the decision synthesizer."
       },
+      "actions": {
+        "type": "object",
+        "description": "Optional map of explicit action IDs to label strings or ActionSpec objects."
+      },
+      "exclude": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Optional list of JSON pointer paths to omit from the surface."
+      },
+      "replace": {
+        "type": "boolean",
+        "description": "Whether the decision block replaces an existing surface layout."
+      },
       "mutable_paths": {
         "type": "array",
         "items": {"type": "string"},
         "description": "Optional list of JSON pointer paths that are mutable."
+      },
+      "layout": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Optional layout hint entries."
+      },
+      "title": {
+        "type": "string",
+        "description": "Optional explicit surface title."
+      },
+      "summary": {
+        "type": "string",
+        "description": "Optional explicit surface summary."
       },
       "expected": {
         "type": "object",
@@ -62,6 +88,11 @@
         },
         "required": ["family", "archetypes"],
         "additionalProperties": false
+      },
+      "split": {
+        "type": "string",
+        "enum": ["tuning", "heldout"],
+        "description": "Dataset split: tuning for calibration and iteration, heldout for final evaluation."
       },
       "tags": {
         "type": "array",
