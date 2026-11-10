@@ -16,16 +16,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
 import json
 import math
 import re
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from a2ui.core import A2uiValidationError, CatalogApi
 from a2ui.core.schema import AgentToRendererMessage
+
+if TYPE_CHECKING:
+    from .payload_inspector import PointerSummary
 
 
 class _WireEnum(str, Enum):
@@ -179,7 +183,9 @@ class PlanReason(_WireEnum):
 
     `ACTION_GATE` means the archetype would have rendered but its actions were
     refused by the confidence gate: the synthesizer must abstain rather than
-    fall through to the flat path.
+    fall through to the flat path. `NO_FIT` means the model chose the job
+    family `none` at or above `thresholds.noFit`: no archetype suits the
+    request, so the synthesizer runs its fallback chain.
     """
 
     PLANNED = "planned"
@@ -187,6 +193,7 @@ class PlanReason(_WireEnum):
     NO_ARCHETYPE = "no_archetype"
     REQUIRED_BLOCK_MISSING = "required_block_missing"
     ACTION_GATE = "action_gate"
+    NO_FIT = "no_fit"
 
 
 class DecisionWireFormat(_WireEnum):
@@ -618,9 +625,13 @@ class LayoutPlan:
     actions_allowed: bool = False
     template_id: str | None = None
     """The registered template chosen by the batch's template question, if any."""
+    fit_score: float | None = None
+    """How well the archetype fits the payload, in [0, 1], when the planner scored it."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
+        if self.fit_score is not None:
+            _validate_unit_interval("fit_score", self.fit_score)
 
     def block_ids(self) -> tuple[str, ...]:
         """The ids of the planned blocks in render order."""
@@ -633,6 +644,9 @@ class PlanOutcome:
 
     plan: LayoutPlan | None
     reason: PlanReason
+    fit_score: float | None = None
+    """The planner's fit score, kept here so a `NO_FIT` outcome without a plan
+    still reports it."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "reason", PlanReason(self.reason))
@@ -640,6 +654,8 @@ class PlanOutcome:
             raise ValueError(
                 "PlanOutcome.plan must be set exactly when reason is 'planned'."
             )
+        if self.fit_score is not None:
+            _validate_unit_interval("fit_score", self.fit_score)
 
 
 @runtime_checkable
@@ -960,6 +976,111 @@ def validate_threshold_relations(thresholds: Mapping[str, float], owner: str) ->
 
 
 @dataclass(frozen=True)
+class PlanCacheKey:
+    """Identifies a cached layout plan.
+
+    Two requests share a key only when they target the same surface with the
+    same catalog and grammar, and their payload shape and planning inputs
+    hash to the same `shape_signature` (see `plan_shape_signature`).
+    """
+
+    surface_id: str
+    catalog_id: str
+    grammar_version: str
+    shape_signature: str
+
+
+def _pointer_shape(pointer: PointerSummary) -> dict[str, Any]:
+    """The data-independent parts of one pointer summary."""
+    return {
+        "path": pointer.path,
+        "valueType": pointer.value_type,
+        "semanticType": str(pointer.semantic_type),
+        "elementKeys": sorted(pointer.element_keys),
+        "elementTypes": {
+            key: str(value)
+            for key, value in sorted(pointer.element_semantic_types.items())
+        },
+        "mutable": pointer.mutable_hint,
+    }
+
+
+def _action_shape(action: ActionSpec) -> dict[str, Any]:
+    """Every option of one action, so a changed option re-plans."""
+    return {
+        "id": action.id,
+        "label": action.label,
+        "scope": action.scope,
+        "key": action.key,
+        "context": dict(sorted(action.context.items())),
+        "style": None if action.style is None else action.style.value,
+    }
+
+
+def plan_shape_signature(
+    pointers: Iterable[PointerSummary],
+    *,
+    intent: str,
+    actions: Sequence[ActionSpec] = (),
+    exclude: Collection[str] = (),
+    mutable_paths: Collection[str] = (),
+    labels: Mapping[str, str] | None = None,
+    layout: Sequence[str] = (),
+    title: str | None = None,
+    summary: str | None = None,
+    template_ids: Collection[str] = (),
+    conservativeness: float = 0.5,
+    model_id: str = "",
+) -> str:
+    """Hashes a payload's shape and every planning input into a cache signature.
+
+    The shape keeps each pointer's path, coarse and semantic types, element
+    keys and types, and mutability. It leaves out array lengths, sample
+    values, and detector hints, so a payload whose values change but whose
+    structure does not keeps its signature and reuses the cached plan. Any
+    change to a planning input (the intent, an action or one of its options,
+    the excluded or mutable pointers, labels, layout brief, authored copy,
+    registered templates, conservativeness, or the backend model) changes the
+    signature and forces a re-plan.
+
+    Args:
+        pointers: The payload's pointer summaries.
+        intent: The block's intent text.
+        actions: The block's actions, in render order.
+        exclude: Pointers the surface must not show.
+        mutable_paths: Pointers the user may edit.
+        labels: Display labels keyed by pointer.
+        layout: Raw ``role:key,key`` brief items, in order.
+        title: Authored surface title.
+        summary: Authored surface summary.
+        template_ids: Ids of the registered templates offered to the planner.
+        conservativeness: `SynthesisConfig.conservativeness`.
+        model_id: `DecisionBackend.model_id` of the backend that plans.
+
+    Returns:
+        The hex SHA-256 digest of the canonical JSON of the inputs.
+    """
+    canonical = {
+        "shape": sorted(
+            (_pointer_shape(p) for p in pointers), key=lambda shape: shape["path"]
+        ),
+        "intent": intent,
+        "actions": [_action_shape(action) for action in actions],
+        "exclude": sorted(exclude),
+        "mutablePaths": sorted(mutable_paths),
+        "labels": dict(sorted((labels or {}).items())),
+        "layout": list(layout),
+        "title": title,
+        "summary": summary,
+        "templates": sorted(template_ids),
+        "conservativeness": conservativeness,
+        "modelId": model_id,
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
 class SynthesisOutput:
     """Result produced by a single decision-model synthesis pass."""
 
@@ -991,6 +1112,8 @@ class SynthesisOutput:
     """Number of backend `answer` calls made during synthesis."""
     decision_answers: tuple[DecisionAnswer, ...] = ()
     """The batch answers that produced the layout plan, in question order."""
+    cache_hit: bool = False
+    """Whether a cached plan produced `messages` without a backend call."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace", tuple(self.trace))
