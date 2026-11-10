@@ -28,6 +28,7 @@
       - act
       - input
       - follow
+      - none
     archetype_count: 14
     block_count: 19
 
