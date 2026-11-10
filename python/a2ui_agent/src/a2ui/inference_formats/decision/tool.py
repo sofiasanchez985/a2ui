@@ -40,7 +40,9 @@ from .catalog_graph import CatalogDecisionGraph
 from .decision_block import DecisionBlock
 from .models import (
     BRIEF_ITEM_PATTERN,
+    ActionStyle,
     MAX_BRIEF_SECTIONS,
+    SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
 )
@@ -54,6 +56,49 @@ _DEFAULT_DESCRIPTION = (
     " (intent) and the data to show (payload). A local decision model picks"
     " the components; do not describe components yourself."
 )
+
+
+_ACTIONS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Optional buttons, as a map from action id (the event name the agent"
+        " receives) to a label, or to an options object."
+    ),
+    "additionalProperties": {
+        "anyOf": [
+            {"type": "string"},
+            {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "description": (
+                            "JSON Pointer of a collection; the action repeats"
+                            " on each item."
+                        ),
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Item field that identifies the item.",
+                    },
+                    "context": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Event context: name to JSON Pointer.",
+                    },
+                    "style": {
+                        "type": "string",
+                        "enum": [s.value for s in ActionStyle],
+                    },
+                },
+                "required": ["label"],
+                "additionalProperties": False,
+            },
+        ]
+    },
+}
+"""JSON Schema of the `actions` map, matching `ActionSpec.from_block_value`."""
 
 
 class DecisionRenderTool:
@@ -115,7 +160,7 @@ class DecisionRenderTool:
             backend: Decision backend. Required; build one with
                 `create_decision_backend()` to read the environment.
             config: Synthesis thresholds and limits.
-            registry: Surface templates offered through the `template` field.
+            registry: Surface templates the model may choose for matching payloads.
             archetypes: Layout archetype grammar.
             patterns: Catalog pattern library.
             fallback_fn: Custom fallback called when the model abstains.
@@ -148,15 +193,6 @@ class DecisionRenderTool:
         `payload` accepts an object, an array, or a JSON-encoded string of
         either, since models often stringify nested arguments.
         """
-        template_ids = [
-            t.template_id for t in self.synthesizer.registry.list_templates()
-        ]
-        template_schema: dict[str, Any] = {
-            "type": "string",
-            "description": "Id of a registered surface template to render directly.",
-        }
-        if template_ids:
-            template_schema["enum"] = template_ids
         return {
             "type": "object",
             "properties": {
@@ -184,7 +220,22 @@ class DecisionRenderTool:
                     "type": "string",
                     "description": "Surface to create or update.",
                 },
-                "template": template_schema,
+                "replace": {
+                    "type": "boolean",
+                    "description": (
+                        "Delete the surface and create it again instead of"
+                        " creating it fresh. Defaults to false."
+                    ),
+                },
+                "actions": _ACTIONS_SCHEMA,
+                "exclude": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional JSON Pointers in `payload` the interface must"
+                        " not show, such as internal ids."
+                    ),
+                },
                 "fallbackDsl": {
                     "type": "string",
                     "description": (
@@ -234,7 +285,10 @@ class DecisionRenderTool:
         self, args: Mapping[str, Any]
     ) -> tuple[DecisionBlock, dict[str, Any]]:
         block = DecisionBlock.from_mapping(args)
-        return block, block.to_synthesis_kwargs(default_surface_id=self._surface_id)
+        kwargs = block.to_synthesis_kwargs(default_surface_id=self._surface_id)
+        if block.replace:
+            kwargs["operation"] = SurfaceOperation.REPLACE
+        return block, kwargs
 
     def format_result(
         self,

@@ -37,7 +37,7 @@ from a2ui.parser import (
 from a2ui.parser.messages import to_message_models
 
 from .decision_block import DecisionBlock, decision_block_from_messages
-from .models import SurfaceOperation, SynthesisOutput
+from .models import DecisionBackendError, SurfaceOperation, SynthesisOutput
 from .prompt_generator import DecisionPromptGenerator
 from .synthesizer import DecisionSynthesizer
 
@@ -138,16 +138,8 @@ class DecisionParser(Parser):
                 surface_sends_data_model=sends_data_model,
                 **block.to_synthesis_kwargs(default_surface_id=default_id),
             )
-        except A2uiError:
-            raise
-        except (TypeError, ValueError) as exc:
-            raise A2uiCompilationValidationError(
-                message=str(exc), raw_content=format_content
-            ) from exc
         except Exception as exc:
-            raise A2uiCompilationError(
-                f"Failed to compile A2UI block: {exc}", format_content
-            ) from exc
+            raise _as_compilation_error(exc, format_content) from exc
         _require_messages(output, format_content)
         return output
 
@@ -261,7 +253,8 @@ class DecisionParser(Parser):
             A2uiCompilationValidationError: If a block lacks required fields or
                 the synthesizer rejects it.
             A2uiCompilationError: If the decision model abstains and no
-                fallback produced any messages.
+                fallback produced any messages, or the decision backend
+                fails or times out.
         """
         blocks = self._extract_blocks(format_content)
         outputs: list[SynthesisOutput] = []
@@ -278,12 +271,8 @@ class DecisionParser(Parser):
                     block.payload,
                     **block.to_synthesis_kwargs(default_surface_id=default_id),
                 )
-            except A2uiError:
-                raise
-            except (TypeError, ValueError) as exc:
-                raise A2uiCompilationValidationError(
-                    message=str(exc), raw_content=format_content
-                ) from exc
+            except Exception as exc:
+                raise _as_compilation_error(exc, format_content) from exc
             _require_messages(output, format_content)
             outputs.append(output)
         return outputs
@@ -324,6 +313,31 @@ class DecisionParser(Parser):
         return DecisionPromptGenerator.wrap_block(
             decision_block_from_messages(a2ui_payload)
         )
+
+
+def _as_compilation_error(exc: Exception, format_content: str) -> A2uiError:
+    """Maps a synthesis failure to the error the parser raises.
+
+    A2UI errors pass through. Bad block values become validation errors. A
+    `DecisionBackendError` (timeout or transport failure) becomes a
+    compilation error naming the backend; no fallback runs for it.
+    """
+    if isinstance(exc, A2uiError):
+        return exc
+    if isinstance(exc, DecisionBackendError):
+        return A2uiCompilationError(
+            message=(
+                f"The decision backend {exc.backend_kind!r} (model"
+                f" {exc.model_id!r}) failed: {exc}"
+            ),
+            raw_content=format_content,
+            help_message="Check the decision backend's endpoint and timeout.",
+        )
+    if isinstance(exc, (TypeError, ValueError)):
+        return A2uiCompilationValidationError(
+            message=str(exc), raw_content=format_content
+        )
+    return A2uiCompilationError(f"Failed to compile A2UI block: {exc}", format_content)
 
 
 def _require_messages(output: SynthesisOutput, format_content: str) -> None:

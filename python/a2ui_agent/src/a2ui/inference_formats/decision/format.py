@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import threading
 from typing import TYPE_CHECKING, Any
+import warnings
 
 from a2ui.core import CatalogApi
 from a2ui.core.schema import AgentToRendererMessage
@@ -37,6 +38,7 @@ from a2ui.inference_formats._shared import check_mixed_catalogs
 from .archetypes import ArchetypeGrammar
 from .backends import DecisionBackend
 from .catalog_graph import CatalogDecisionGraph
+from .decision_block import DecisionBlock
 from .models import SynthesisConfig
 from .parser import DecisionParser
 from .patterns import MergedPatternLibrary, PatternLibrary
@@ -46,6 +48,19 @@ from .template_registry import TemplateRegistry
 
 if TYPE_CHECKING:
     from a2ui.utils import RendererState
+
+
+def _warn_message_examples(
+    examples: Sequence[Sequence[AgentToRendererMessage]] | None,
+) -> None:
+    """Warns that A2UI message examples are ignored by the decision format."""
+    if examples:
+        warnings.warn(
+            "DecisionFormat ignores A2UI message examples; pass block_examples"
+            " (DecisionBlock instances) instead.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 class DecisionFormat(InferenceFormat):
@@ -74,12 +89,15 @@ class DecisionFormat(InferenceFormat):
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
         surface_id: str = "main",
         fallback_fn: FallbackCallback | None = None,
+        block_examples: Sequence[DecisionBlock] = (),
     ) -> None:
         """Creates a decision format.
 
         Args:
-            catalogs: The active catalogs.
-            examples: Few-shot example turns shown in the prompt.
+            catalogs: The active catalogs; every one must target A2UI v1.0.
+            examples: A2UI message examples. Ignored with a `UserWarning`:
+                decompiled messages lose the intent and actions a decision
+                block carries. Use `block_examples`.
             backend: Decision backend. Required; build one with
                 `create_decision_backend()` to read the environment.
             config: Synthesis thresholds and limits.
@@ -93,9 +111,15 @@ class DecisionFormat(InferenceFormat):
                 consulted on this path.
             fallback_fn: Custom fallback called when the model abstains and
                 the block carries no `fallbackDsl`.
+            block_examples: Few-shot decision blocks for the prompt.
+
+        Raises:
+            TypeError: If `backend` is None.
+            ValueError: If any catalog's protocol version is not v1.0.
         """
+        _warn_message_examples(examples)
         self._catalogs = list(check_mixed_catalogs(catalogs))
-        self._examples = [list(t) for t in examples] if examples is not None else None
+        self._block_examples = tuple(block_examples)
         self._registry = registry if registry is not None else TemplateRegistry()
         self.surface_id = surface_id
         self._synthesizer = DecisionSynthesizer(
@@ -117,9 +141,9 @@ class DecisionFormat(InferenceFormat):
         return list(self._catalogs)
 
     @property
-    def examples(self) -> list[list[AgentToRendererMessage]] | None:
-        """The configured few-shot example turns, if any."""
-        return [list(t) for t in self._examples] if self._examples is not None else None
+    def block_examples(self) -> tuple[DecisionBlock, ...]:
+        """The few-shot decision blocks configured for the prompt."""
+        return self._block_examples
 
     @property
     def synthesizer(self) -> DecisionSynthesizer:
@@ -132,7 +156,6 @@ class DecisionFormat(InferenceFormat):
         if self._prompt_generator is None:
             self._prompt_generator = DecisionPromptGenerator(
                 self._catalogs,
-                examples=self._examples,
                 registry=self._registry,
                 archetypes=self._synthesizer.archetypes,
             )
@@ -192,6 +215,7 @@ class DecisionFormatFactory(InferenceFormatFactory):
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
         surface_id: str = "main",
         fallback_fn: FallbackCallback | None = None,
+        block_examples: Sequence[DecisionBlock] = (),
     ) -> None:
         """Stores the settings every created format shares. See `DecisionFormat`.
 
@@ -205,6 +229,7 @@ class DecisionFormatFactory(InferenceFormatFactory):
                 set via `MergedPatternLibrary.for_catalogs`.
             surface_id: See `DecisionFormat`.
             fallback_fn: See `DecisionFormat`.
+            block_examples: See `DecisionFormat`.
 
         Raises:
             TypeError: If `backend` is None.
@@ -224,6 +249,7 @@ class DecisionFormatFactory(InferenceFormatFactory):
         ] = {}
         self._surface_id = surface_id
         self._fallback_fn = fallback_fn
+        self._block_examples = tuple(block_examples)
 
     @property
     def backend(self) -> DecisionBackend:
@@ -246,9 +272,10 @@ class DecisionFormatFactory(InferenceFormatFactory):
         catalogs: Sequence[CatalogApi],
         examples: Sequence[Sequence[AgentToRendererMessage]] | None = None,
     ) -> DecisionFormat:
+        """Creates a format for `catalogs`; message `examples` are ignored with a warning."""
+        _warn_message_examples(examples)
         return DecisionFormat(
             catalogs,
-            examples=examples,
             backend=self._backend,
             config=self._config,
             registry=self._registry,
@@ -256,6 +283,7 @@ class DecisionFormatFactory(InferenceFormatFactory):
             patterns=self._patterns_for_catalogs(catalogs),
             surface_id=self._surface_id,
             fallback_fn=self._fallback_fn,
+            block_examples=self._block_examples,
         )
 
     async def aclose(self) -> None:

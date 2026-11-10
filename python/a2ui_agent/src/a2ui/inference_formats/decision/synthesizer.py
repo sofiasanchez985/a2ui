@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-stage local decision-model A2UI surface synthesizer."""
+"""Local decision-model A2UI surface synthesizer: one planning path per surface."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import collections
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 import concurrent.futures
 import contextvars
+import copy as copy_lib
 from dataclasses import dataclass, replace
 import inspect
 import re
@@ -29,7 +30,8 @@ from typing import Any, TypeAlias
 
 from a2ui.core import A2uiValidationError, CatalogApi
 from a2ui.core.schema import AgentToRendererMessage
-from a2ui.parser.messages import to_message_models
+from a2ui.parser.errors import A2uiCompilationError
+from a2ui.parser.messages import to_message_dicts, to_message_models
 from a2ui.utils import validate_payload
 
 from .archetypes import ArchetypeGrammar, LayoutArchetype
@@ -48,8 +50,11 @@ from .models import (
     FallbackSource,
     LayoutBrief,
     LayoutPlan,
+    PageBindings,
+    PlannedBlock,
     PlanOutcome,
     QuestionKind,
+    SlotBinding,
     SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
@@ -63,6 +68,7 @@ from .patterns import (
     PatternExpander,
     PatternLibrary,
     eligible_archetypes,
+    resolve_fallback_pattern,
     shape_signature,
 )
 from .payload_inspector import (
@@ -95,9 +101,14 @@ instead, either directly or as an awaitable. Dicts are validated with
 """
 
 
-def _wire_version(protocol_version: str) -> str:
-    """Returns the canonical A2UI wire envelope version string."""
-    return "1.0" if _is_v10(protocol_version) else "v0.9"
+_WIRE_VERSION = "1.0"
+"""The only A2UI wire version the decision format emits."""
+
+_FACTS_BLOCK = "facts"
+_ABSTAIN_HELP = (
+    "Add a 'fallbackDsl' field, configure fallback_fn, or make sure the"
+    " catalog's patterns include a 'facts' pattern."
+)
 
 
 def _as_data_model(
@@ -121,79 +132,6 @@ def _populates_data_model(message: AgentToRendererMessage) -> bool:
         return True
     create = dumped.get("createSurface")
     return isinstance(create, Mapping) and "dataModel" in create
-
-
-_MUTABLE_BRIEF_ROLES: frozenset[str] = frozenset({
-    "input",
-    "form",
-    "settings",
-    "groups",
-    "filters",
-    "compose",
-})
-_FRAMING_SCALAR_KEYS: frozenset[str] = frozenset({
-    "title",
-    "subtitle",
-    "heading",
-    "subheading",
-    "subject",
-    "description",
-    "summary",
-    "instructions",
-})
-_ACTION_KEYS: frozenset[str] = frozenset({"actions", "buttons", "cta"})
-
-
-def _pinned_mutable_paths(brief: LayoutBrief | None) -> set[str]:
-    """Returns pointer paths pinned under mutable roles in `brief`."""
-    if brief is None:
-        return set()
-    return {
-        p
-        for sec in brief.sections
-        if sec.role in _MUTABLE_BRIEF_ROLES
-        for p in sec.pointers
-    }
-
-
-def _matches_pinned_path(path: str, pinned_paths: set[str]) -> bool:
-    """Returns whether `path` is in `pinned_paths` or a descendant of one."""
-    return path in pinned_paths or any(path.startswith(f"{bp}/") for bp in pinned_paths)
-
-
-def _editable_pointer_paths(pointers: Sequence[PointerSummary]) -> set[str]:
-    """Selects default editable pointer paths when no brief pins mutable roles."""
-    editable = [
-        p
-        for p in pointers
-        if p.value_type in {"string", "number", "boolean", "object"}
-        and p.key.lower() not in _ACTION_KEYS
-    ]
-    non_framing = {
-        p.path
-        for p in editable
-        if p.parent or p.key.lower() not in _FRAMING_SCALAR_KEYS
-    }
-    return non_framing if non_framing else {p.path for p in editable}
-
-
-def _promote_mutable_pointers(
-    pointers: Sequence[PointerSummary],
-    brief: LayoutBrief | None = None,
-) -> tuple[PointerSummary, ...]:
-    """Marks editable pointers as `mutable_hint=True` when the caller omitted `mutable_paths`."""
-    pinned_paths = _pinned_mutable_paths(brief)
-    if pinned_paths:
-        return tuple(
-            replace(p, mutable_hint=True)
-            if _matches_pinned_path(p.path, pinned_paths)
-            else p
-            for p in pointers
-        )
-    target_paths = _editable_pointer_paths(pointers)
-    return tuple(
-        replace(p, mutable_hint=True) if p.path in target_paths else p for p in pointers
-    )
 
 
 def _coerce_layout_brief(
@@ -281,12 +219,43 @@ def _record_trace_reason(trace: list[DecisionRecord], reason: str, prompt: str) 
     )
 
 
+def _require_v10(graph: CatalogDecisionGraph) -> None:
+    """Raises `ValueError` unless every catalog targets A2UI protocol v1.0."""
+    others = [
+        f"{c.catalog_id} ({c.protocol_version})"
+        for c in graph.catalogs
+        if not _is_v10(str(c.protocol_version))
+    ]
+    if others:
+        raise ValueError(
+            "The decision format supports A2UI protocol v1.0 only; these catalogs"
+            f" use another version: {', '.join(others)}."
+        )
+
+
+def _abstention_reason(abstained: SynthesisOutput) -> str:
+    """The last planning outcome recorded in the trace, as the fallback reason."""
+    for record in reversed(abstained.trace):
+        if record.outcome:
+            return record.outcome
+    return "no layout plan"
+
+
+def _creates_surface(
+    messages: Sequence[AgentToRendererMessage], surface_id: str
+) -> bool:
+    return any(
+        isinstance(d.get("createSurface"), Mapping)
+        and d["createSurface"].get("surfaceId") == surface_id
+        for d in to_message_dicts(messages)
+    )
+
+
 @dataclass(frozen=True)
 class _SurfaceRequest:
     """Per-call settings that `synthesize` threads through planning and output."""
 
     surface_id: str
-    config: SynthesisConfig
     brief: LayoutBrief | None = None
     copy: AuthoredCopy | None = None
     actions: tuple[ActionSpec, ...] = ()
@@ -329,6 +298,25 @@ def resolve_surface_operation(
     ):
         return SurfaceOperation.REPLACE
     return requested
+
+
+def _as_fresh_surface(
+    messages: list[AgentToRendererMessage], request: _SurfaceRequest
+) -> tuple[list[AgentToRendererMessage], SurfaceOperation]:
+    """Prepends `deleteSurface` when fallback messages recreate an existing surface.
+
+    Fallback messages (Express DSL or a host callback) usually start with
+    `createSurface`. On a surface the client already shows, that would be
+    rejected, so the output becomes a `REPLACE`.
+    """
+    if request.operation is SurfaceOperation.CREATE or not _creates_surface(
+        messages, request.surface_id
+    ):
+        return messages, request.operation
+    delete = to_message_models(
+        [{"version": _WIRE_VERSION, "deleteSurface": {"surfaceId": request.surface_id}}]
+    )
+    return [*delete, *messages], SurfaceOperation.REPLACE
 
 
 class DecisionSynthesizer:
@@ -383,6 +371,7 @@ class DecisionSynthesizer:
 
         Raises:
             TypeError: If `backend` is None.
+            ValueError: If any catalog's protocol version is not v1.0.
         """
         if backend is None:
             raise TypeError(
@@ -394,6 +383,7 @@ class DecisionSynthesizer:
             if isinstance(catalogs, CatalogDecisionGraph)
             else CatalogDecisionGraph(catalogs)
         )
+        _require_v10(self.graph)
         self.backend: DecisionBackend = backend
         self.registry = registry if registry is not None else TemplateRegistry()
         self.config = config if config is not None else SynthesisConfig()
@@ -497,7 +487,6 @@ class DecisionSynthesizer:
             surface_id=(
                 surface_id if surface_id is not None else self.config.default_surface_id
             ),
-            config=self.config,
             brief=_coerce_layout_brief(layout, self.archetypes),
             copy=(
                 AuthoredCopy(title=title, summary=summary)
@@ -529,14 +518,10 @@ class DecisionSynthesizer:
             backend_kind=self.backend.backend_kind,
             model_id=self.backend.model_id,
         )
-        if output.stage is not SynthesisStage.ABSTAIN_FALLBACK or output.messages:
+        if output.messages:
             return output
-        return await self._resolve_abstention_fallback(
-            output,
-            intent,
-            data,
-            surface_id=request.surface_id,
-            fallback_dsl=fallback_dsl,
+        return await self._fallback(
+            output, intent, data, pointers, request, fallback_dsl
         )
 
     async def _backend_answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
@@ -589,22 +574,23 @@ class DecisionSynthesizer:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(run_in_new_loop).result()
 
-    def _render_named_template(
+    def _render_template(
         self,
-        template_id: str,
+        plan: LayoutPlan,
+        state: PlannerState,
         data: Mapping[str, Any],
-        surface_id: str,
-        *,
-        confidence: float = 1.0,
+        request: _SurfaceRequest,
     ) -> SynthesisOutput:
-        """Renders a registered template by id.
+        """Renders the registered template the plan's template question chose.
 
-        Track hook: the synthesizer calls this when `LayoutPlan.template_id`
-        is set, instead of expanding the plan's blocks.
+        The template's components go through the same message builder as an
+        expanded plan, so all three surface operations apply. Templates carry
+        no `sendDataModel` requirement, so they never escalate.
 
         Raises:
-            ValueError: If `template_id` names no registered template.
+            ValueError: If `plan.template_id` names no registered template.
         """
+        template_id = plan.template_id or ""
         template = self.registry.get(template_id)
         if template is None:
             known = ", ".join(t.template_id for t in self.registry.list_templates())
@@ -612,47 +598,171 @@ class DecisionSynthesizer:
                 f"Unknown template '{template_id}'. Registered templates:"
                 f" {known or 'none'}."
             )
-        messages = template.render_messages(data, surface_id=surface_id)
-        validate_payload(self.graph.catalogs, messages)
+        components = [copy_lib.deepcopy(dict(c)) for c in template.components]
+        messages = self._build_validated_messages(
+            request.surface_id, components, data, request.operation
+        )
+        _, entropy = _archetype_confidence_and_entropy(state, plan)
         return SynthesisOutput(
             stage=SynthesisStage.TEMPLATE_SELECT,
             messages=messages,
-            confidence=confidence,
-            entropy=0.0,
+            confidence=plan.confidence,
+            entropy=entropy,
             selected_template_id=template.template_id,
+            layout_plan=plan,
+            trace=tuple(state.trace),
+            decision_answers=tuple(state.answers_by_id.values()),
+            operation=request.operation,
         )
 
-    async def _resolve_abstention_fallback(
+    async def _fallback(
         self,
         abstained: SynthesisOutput,
         intent: str,
         data: Mapping[str, Any],
-        *,
-        surface_id: str,
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
         fallback_dsl: str | None,
     ) -> SynthesisOutput:
-        """Fills an abstained output from the first applicable fallback.
+        """Runs the fallback chain for an abstained output.
 
-        Order: `fallback_dsl`, then the configured `fallback_fn`. The `facts`
-        pattern link and the final `A2uiCompilationError` are not wired yet;
-        with no applicable fallback the abstained output is returned
-        unchanged.
+        Order: the block's `fallback_dsl`, then the configured `fallback_fn`,
+        then one `facts` pattern rendering of the payload from the active
+        pattern library. `fallback_source` names the link that produced the
+        messages and `fallback_reason` why the chain ran.
+
+        Raises:
+            A2uiCompilationError: If no link produced messages.
         """
-        messages: list[AgentToRendererMessage] | None = None
-        source: FallbackSource | None = None
+        reason = _abstention_reason(abstained)
         if fallback_dsl and fallback_dsl.strip():
-            messages = self._compile_fallback_dsl(fallback_dsl, data, surface_id)
-            source = FallbackSource.DSL
-        elif self._fallback_fn is not None:
-            produced = self._fallback_fn(intent, data, surface_id)
-            if inspect.isawaitable(produced):
-                produced = await produced
-            messages = to_message_models(list(produced))
-            validate_payload(self.graph.catalogs, messages)
-            source = FallbackSource.CALLBACK
-        if not messages:
-            return abstained
-        return replace(abstained, messages=messages, fallback_source=source)
+            messages = self._compile_fallback_dsl(
+                fallback_dsl, data, request.surface_id
+            )
+            return self._fallback_output(
+                abstained, messages, FallbackSource.DSL, reason, request
+            )
+        if self._fallback_fn is not None:
+            messages = await self._run_fallback_fn(intent, data, request.surface_id)
+            return self._fallback_output(
+                abstained, messages, FallbackSource.CALLBACK, reason, request
+            )
+        facts = self._facts_fallback(intent, data, pointers, request)
+        if facts is not None:
+            messages, operation = facts
+            return replace(
+                abstained,
+                messages=messages,
+                operation=operation,
+                fallback_source=FallbackSource.FACTS,
+                fallback_reason=reason,
+            )
+        raise A2uiCompilationError(
+            message=(
+                f"The decision model abstained ({reason}) and no fallback produced"
+                " messages."
+            ),
+            raw_content=intent,
+            help_message=_ABSTAIN_HELP,
+        )
+
+    def _fallback_output(
+        self,
+        abstained: SynthesisOutput,
+        messages: list[AgentToRendererMessage],
+        source: FallbackSource,
+        reason: str,
+        request: _SurfaceRequest,
+    ) -> SynthesisOutput:
+        """Wraps fallback messages, recreating an existing surface when they create it."""
+        messages, operation = _as_fresh_surface(messages, request)
+        return replace(
+            abstained,
+            messages=messages,
+            operation=operation,
+            fallback_source=source,
+            fallback_reason=reason,
+        )
+
+    async def _run_fallback_fn(
+        self, intent: str, data: Mapping[str, Any], surface_id: str
+    ) -> list[AgentToRendererMessage]:
+        """Calls the host fallback callback and validates its messages."""
+        assert self._fallback_fn is not None
+        produced = self._fallback_fn(intent, data, surface_id)
+        if inspect.isawaitable(produced):
+            produced = await produced
+        messages = to_message_models(list(produced))
+        validate_payload(self.graph.catalogs, messages)
+        return messages
+
+    def _facts_fallback(
+        self,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+    ) -> tuple[list[AgentToRendererMessage], SurfaceOperation] | None:
+        """Renders the payload as one `facts` block, or None when that is impossible.
+
+        Uses the grammar's `facts` block, its pattern fallback chain in the
+        active library, and the planner's deterministic slot binding; no
+        model call is made.
+        """
+        plan = self._facts_plan(intent, data, pointers, request)
+        if plan is None:
+            return None
+        try:
+            expansion = self._expand_plan(plan)
+            operation = resolve_surface_operation(
+                request.operation,
+                send_data_model=expansion.send_data_model,
+                surface_sends_data_model=request.surface_sends_data_model,
+            )
+            messages = self._build_validated_messages(
+                request.surface_id,
+                list(expansion.components),
+                data,
+                operation,
+                send_data_model=expansion.send_data_model,
+            )
+        except (PatternError, A2uiValidationError):
+            return None
+        return messages, operation
+
+    def _facts_plan(
+        self,
+        intent: str,
+        data: Mapping[str, Any],
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+    ) -> LayoutPlan | None:
+        """Builds a one-block `facts` plan bound to `pointers`, if the catalog can draw it."""
+        if _FACTS_BLOCK not in self.archetypes.blocks:
+            return None
+        spec = self.archetypes.block(_FACTS_BLOCK)
+        resolved = resolve_fallback_pattern(spec, self.patterns)
+        if resolved is None:
+            return None
+        bindings = self.planner.bind_slots(
+            spec, pointers, set(), payload=data, intent=intent
+        )
+        if not bindings.pointers():
+            return None
+        title = request.copy.title if request.copy is not None else None
+        return LayoutPlan(
+            archetype=_FACTS_BLOCK,
+            family="",
+            blocks=(
+                PlannedBlock(
+                    block_id=_FACTS_BLOCK,
+                    pattern=resolved.pattern,
+                    variant_knobs=resolved.knobs,
+                    bindings=bindings,
+                ),
+            ),
+            page=PageBindings(title=SlotBinding(literal=title)),
+        )
 
     def _compile_fallback_dsl(
         self, dsl: str, data: Mapping[str, Any], surface_id: str
@@ -671,7 +781,7 @@ class DecisionSynthesizer:
         if data and not any(_populates_data_model(m) for m in messages):
             messages.extend(
                 to_message_models([{
-                    "version": _wire_version(self.graph.protocol_version),
+                    "version": _WIRE_VERSION,
                     "updateDataModel": {
                         "surfaceId": surface_id,
                         "path": "/",
@@ -862,14 +972,6 @@ class DecisionSynthesizer:
             operation=operation,
         )
 
-    def _family_chose_input(self, state: PlannerState) -> bool:
-        """Returns whether the `family` answer in `state` selected `input` above threshold."""
-        fam_ans = state.answers_by_id.get("family")
-        if fam_ans is None:
-            return False
-        chosen, prob = fam_ans.top()
-        return chosen == "input" and prob >= self.archetypes.threshold("family")
-
     def _eligible_archetypes(
         self, pointers: Sequence[PointerSummary]
     ) -> tuple[LayoutArchetype, ...]:
@@ -884,49 +986,6 @@ class DecisionSynthesizer:
         while len(self._eligibility_cache) > _ELIGIBILITY_CACHE_SIZE:
             self._eligibility_cache.popitem(last=False)
         return result
-
-    def _should_retry_with_mutable_promotion(
-        self,
-        outcome: PlanOutcome,
-        state: PlannerState,
-        active_pointers: Sequence[PointerSummary],
-    ) -> bool:
-        """Returns whether planning should retry after promoting mutable pointers."""
-        return (
-            outcome.reason == "no_family"
-            and not any(p.mutable_hint for p in active_pointers)
-            and self._family_chose_input(state)
-        )
-
-    def _prepare_archetype_pointers(
-        self,
-        pointers: Sequence[PointerSummary],
-        brief: LayoutBrief | None,
-    ) -> Sequence[PointerSummary]:
-        """Promotes mutable pointers when `brief` pins mutable roles."""
-        if (
-            brief is not None
-            and not any(p.mutable_hint for p in pointers)
-            and any(r in _MUTABLE_BRIEF_ROLES for r in brief.roles())
-        ):
-            return _promote_mutable_pointers(pointers, brief)
-        return pointers
-
-    async def _plan_with_promotion(
-        self,
-        intent: str,
-        data: Mapping[str, Any],
-        pointers: Sequence[PointerSummary],
-        request: _SurfaceRequest,
-    ) -> tuple[PlanOutcome, PlannerState]:
-        """Plans once, and again with promoted mutable pointers when that may help."""
-        outcome, state = await self._plan_layout(intent, data, pointers, request)
-        if not self._should_retry_with_mutable_promotion(outcome, state, pointers):
-            return outcome, state
-        promoted = _promote_mutable_pointers(pointers, request.brief)
-        if not any(a.family == "input" for a in self._eligible_archetypes(promoted)):
-            return outcome, state
-        return await self._plan_layout(intent, data, promoted, request)
 
     def _action_gate_output(
         self, state: PlannerState, trace: list[DecisionRecord]
@@ -950,9 +1009,8 @@ class DecisionSynthesizer:
         request: _SurfaceRequest,
     ) -> tuple[SynthesisOutput | None, tuple[DecisionRecord, ...]]:
         """Attempts archetype-planned synthesis, returning `(output, trace)`."""
-        active_pointers = self._prepare_archetype_pointers(pointers, request.brief)
         trace: list[DecisionRecord] = []
-        if not self._eligible_archetypes(active_pointers):
+        if not self._eligible_archetypes(pointers):
             _record_trace_reason(
                 trace,
                 "no eligible archetype",
@@ -961,9 +1019,7 @@ class DecisionSynthesizer:
             )
             return None, tuple(trace)
         try:
-            outcome, state = await self._plan_with_promotion(
-                intent, data, active_pointers, request
-            )
+            outcome, state = await self._plan_layout(intent, data, pointers, request)
             trace = list(state.trace)
             if outcome.reason == "action_gate":
                 gated = self._action_gate_output(state, trace)
@@ -973,6 +1029,9 @@ class DecisionSynthesizer:
                     trace, str(outcome.reason), "Archetype planning outcome"
                 )
                 return None, tuple(trace)
+            if outcome.plan.template_id is not None:
+                rendered = self._render_template(outcome.plan, state, data, request)
+                return rendered, rendered.trace
             finished = self._finish_archetype_output(
                 outcome.plan, state, self._expand_plan(outcome.plan), data, request
             )
@@ -1022,7 +1081,7 @@ class DecisionSynthesizer:
         `updateComponents` and `updateDataModel`, relying on stable per-block
         component ids. `REPLACE` emits `deleteSurface` and then `CREATE`.
         """
-        wire_ver = _wire_version(self.graph.protocol_version)
+        wire_ver = _WIRE_VERSION
         raw_messages: list[dict[str, Any]] = []
         if operation is SurfaceOperation.REPLACE:
             raw_messages.append(
