@@ -20,6 +20,11 @@ import pytest
 
 from a2ui.core import A2uiValidationError
 from a2ui.inference_formats.decision import (
+    BlockBindings,
+    LayoutPlan,
+    PageBindings,
+    PlannedBlock,
+    SlotBinding,
     SurfaceTemplate,
     SynthesisOutput,
     SynthesisStage,
@@ -361,3 +366,52 @@ class TestTemplateRegistry:
         explicit_v08 = _make_v09_template("explicit_v08", protocol_version="v0.8")
         v08_dicts = to_message_dicts(explicit_v08.render_messages({"cpu": 10}))
         assert [m["version"] for m in v08_dicts] == ["v0.9", "v0.9", "v0.9"]
+
+    def test_promote_plan_requires_every_bound_pointer(self) -> None:
+        registry = TemplateRegistry()
+        plan = LayoutPlan(
+            archetype="dashboard",
+            family="monitor",
+            page=PageBindings(title=SlotBinding(pointer="/title")),
+            blocks=(
+                PlannedBlock(
+                    block_id="headline",
+                    pattern="headline",
+                    bindings=BlockBindings(
+                        slots={
+                            "tiles": SlotBinding(
+                                items=(
+                                    {"value": SlotBinding(pointer="/cpu")},
+                                    {"value": SlotBinding(pointer="/title")},
+                                )
+                            )
+                        }
+                    ),
+                ),
+            ),
+        )
+        components = [{"id": "root", "component": "Text", "text": {"path": "/cpu"}}]
+
+        template = registry.promote_plan(
+            "dash", "CPU dashboard", plan, components, catalog_id="basic"
+        )
+
+        assert registry.get("dash") is template
+        assert template.required_pointers == ("/title", "/cpu")
+        assert template.surface_id == "main"
+        assert template.catalog_id == "basic"
+        assert template.protocol_version == "v1.0"
+        assert template.matches_payload({"/title", "/cpu"})
+        assert not template.matches_payload({"/cpu"})
+        components[0]["id"] = "mutated"
+        assert template.components[0]["id"] == "root"
+
+    def test_promote_plan_rejects_blank_id_and_description(self) -> None:
+        registry = TemplateRegistry()
+        plan = LayoutPlan(archetype="a", family="browse", blocks=())
+        components = [{"id": "root", "component": "Text", "text": "hi"}]
+        with pytest.raises(A2uiValidationError):
+            registry.promote_plan(" ", "desc", plan, components)
+        with pytest.raises(A2uiValidationError):
+            registry.promote_plan("t", "", plan, components)
+        assert registry.list_templates() == ()

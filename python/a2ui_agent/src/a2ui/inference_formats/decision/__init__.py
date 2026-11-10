@@ -63,6 +63,7 @@ from .models import (
     LayoutPlan,
     PageBindings,
     PatternCapabilities,
+    PlanCacheKey,
     PlannedBlock,
     PlanOutcome,
     PlanReason,
@@ -76,6 +77,7 @@ from .models import (
     SynthesisOutput,
     SynthesisStage,
     coerce_decision_payload,
+    plan_shape_signature,
 )
 from .parser import DecisionParser, surface_operation_for
 from .patterns import (
@@ -171,6 +173,7 @@ __all__ = [
     "PatternExpander",
     "PatternLibrary",
     "PatternRef",
+    "PlanCacheKey",
     "PlanOutcome",
     "PlanReason",
     "PlannedBlock",
@@ -199,6 +202,7 @@ __all__ = [
     "humanize_key",
     "inspect_payload_pointers",
     "lint_components",
+    "plan_shape_signature",
     "resolve_fallback_pattern",
     "resolve_surface_operation",
     "shape_signature",

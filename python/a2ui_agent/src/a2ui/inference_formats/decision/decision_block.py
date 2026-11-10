@@ -21,7 +21,7 @@ read and write the same field names.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from a2ui.core.schema import AgentToRendererMessage
@@ -174,6 +174,11 @@ class DecisionBlock:
         exclude: JSON Pointers in `payload` the surface must not show.
         replace: When True, the surface is deleted and created again instead
             of updated in place.
+        region: Id of one planned block to re-plan on an existing surface,
+            or None to update the whole surface. Not yet read by
+            `from_mapping`.
+        labels: Display labels keyed by JSON Pointer, overriding the
+            humanized keys. Not yet read by `from_mapping`.
     """
 
     intent: str
@@ -187,6 +192,8 @@ class DecisionBlock:
     actions: tuple[ActionSpec, ...] = ()
     exclude: tuple[str, ...] = ()
     replace: bool = False
+    region: str | None = None
+    labels: Mapping[str, str] = field(default_factory=dict, hash=False)
 
     @classmethod
     def from_mapping(cls, source: Mapping[str, Any]) -> DecisionBlock:

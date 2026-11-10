@@ -2312,8 +2312,13 @@ class LayoutPlanner:
         copy: AuthoredCopy | None = None,
         templates: Sequence[SurfaceTemplate] = (),
         actions: Sequence[ActionSpec] = (),
+        labels: Mapping[str, str] | None = None,
     ) -> tuple[DecisionBatch, PlannerState]:
-        """Builds a speculative `DecisionBatch` and `PlannerState` for one surface."""
+        """Builds a speculative `DecisionBatch` and `PlannerState` for one surface.
+
+        `labels` maps pointers to display labels that override humanized keys;
+        it is accepted but not yet applied.
+        """
         state, prior = self._init_planner_state(
             intent,
             pointers,
@@ -3084,6 +3089,34 @@ class LayoutPlanner:
             )
         )
         return None
+
+    def build_block_batch(
+        self,
+        plan: LayoutPlan,
+        block_id: str,
+        pointers: Sequence[PointerSummary],
+        *,
+        intent: str = "",
+        labels: Mapping[str, str] | None = None,
+    ) -> tuple[DecisionBatch, PlannerState]:
+        """Builds a batch that re-plans only `block_id` of `plan`, for region updates.
+
+        Raises:
+            NotImplementedError: Always; region planning is not implemented yet.
+        """
+        raise NotImplementedError("LayoutPlanner.build_block_batch is not implemented.")
+
+    def read_block(
+        self,
+        state: PlannerState,
+        answers: Sequence[DecisionAnswer],
+    ) -> PlannedBlock:
+        """Reads the answers to a `build_block_batch` batch into one planned block.
+
+        Raises:
+            NotImplementedError: Always; region planning is not implemented yet.
+        """
+        raise NotImplementedError("LayoutPlanner.read_block is not implemented.")
 
     def read(
         self,
