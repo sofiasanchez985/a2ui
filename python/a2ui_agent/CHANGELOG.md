@@ -249,9 +249,10 @@
     `DecisionSynthesizer`.
   - A `DecisionBlock` carries `intent`, `payload`, `surfaceId`, `actions` (a
     map from action id to a label or an options object, parsed into
-    `ActionSpec` with `ActionStyle`), `exclude`, `replace`, `mutablePaths`,
-    `layout`, `title`, `summary`, and `fallbackDsl`. The action id is the event
-    name the agent receives; labels are presentational only.
+    `ActionSpec` with `ActionStyle`), `exclude`, `replace`, `region`, `labels`
+    (pointer-to-label overrides), `mutablePaths`, `layout`, `title`, `summary`,
+    and `fallbackDsl`. The action id is the event name the agent receives;
+    labels are presentational only.
   - Every constructor requires an explicit `DecisionBackend`;
     `create_decision_backend()` reads `A2UI_DECISION_BACKEND` and raises
     `ValueError` when it is unset (the mock backend is used only when asked
@@ -264,23 +265,32 @@
   - `DecisionSynthesizer.synthesize` plans each surface with one `answer()`
     call (two for backends that declare `two_stage`), renders a registered
     template when the batch's template question picks one, and otherwise
-    expands the planned layout archetype. When the model abstains it runs
-    `fallback_dsl`, then `fallback_fn`, then one `facts` pattern rendering of
-    the payload, and raises `A2uiCompilationError` if none applies.
+    expands the planned layout archetype. When the model abstains (including
+    when `job.family` picks `none` at or above `thresholds.noFit`, returning
+    `PlanReason.NO_FIT`) it runs `fallback_dsl`, then `fallback_fn`, then one
+    `facts` pattern rendering of the payload, and raises `A2uiCompilationError`
+    if none applies. `LayoutPlan` and `PlanOutcome` carry `fit_score`, and
     `SynthesisOutput` reports `fallback_source` (`FallbackSource`),
-    `fallback_reason`, `backend_kind`, `model_id`, and the `SurfaceOperation`
-    it emitted.
+    `fallback_reason`, `backend_kind`, `model_id`, `cache_hit`, and the
+    `SurfaceOperation` it emitted.
   - Surfaces persist across turns: `DecisionParser` reads the
     `RendererState`, so reusing a `surfaceId` replaces the surface's root in
     place (`updateComponents` with stable per-block component ids and
-    `updateDataModel`), and `replace: true` sends `deleteSurface` and creates
-    the surface again. An update whose actions need `sendDataModel` on a
-    surface created without it becomes a replace. Without a bound state,
-    `DecisionFormat.create_parser(conversation_id=...)` keeps one
-    `RendererState` per conversation.
+    `updateDataModel`), or emits only `updateDataModel` with no backend call
+    (`cache_hit=True`) when `PlanCache` (`PlanCacheKey`, `CachedPlan`,
+    `plan_shape_signature`) has a matching entry for that `RendererState` and
+    surface. Setting `region` re-plans only that block's questions
+    (`LayoutPlanner.build_block_batch` and `read_block`) and updates its
+    subtree in place; `replace: true` invalidates the cache, sends
+    `deleteSurface`, and creates the surface again. An update whose actions
+    need `sendDataModel` on a surface created without it becomes a replace.
+    Without a bound state, `DecisionFormat.create_parser(conversation_id=...)`
+    keeps one `RendererState` per conversation.
   - `DecisionRenderTool` supplies a JSON Schema tool declaration (with
-    `actions`, `exclude`, and `replace`) and `run_async` / `run_sync` runners
-    for MCP, ADK, and function-calling agents; build one with
+    `actions`, `exclude`, `replace`, `region`, and `labels`), `run_async` /
+    `run_sync` runners with a tool-mode plan cache keyed by tool name, and
+    `promote(template_id, description)` to export the last cached plan into a
+    `SurfaceTemplate` via `TemplateRegistry.promote_plan`; build one with
     `DecisionRenderTool.create(catalogs, backend=...)`.
   - `SynthesisConfig` holds `default_surface_id`, `max_pairs`, and
     `conservativeness`, which scales the action confidence gate between the

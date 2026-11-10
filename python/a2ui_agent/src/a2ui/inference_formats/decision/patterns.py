@@ -2004,6 +2004,41 @@ def _adapt_fallback_bindings(
     return BlockBindings(slots=slots)
 
 
+def _catalog_slug(catalog_id: str) -> str:
+    """Extracts a short identifier slug from a catalog URI or ID."""
+    parts = [
+        p
+        for p in catalog_id.split("/")
+        if p
+        and not p.endswith(".json")
+        and not p.startswith("http")
+        and not re.match(r"^v\d", p)
+    ]
+    raw = parts[-1] if parts else catalog_id
+    return re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower() or "cat"
+
+
+def _stamp_function_calls(value: Any, catalog_id: str) -> None:
+    """Recursively stamps `catalogId` onto function call dicts inside `value`."""
+    if isinstance(value, list):
+        for item in value:
+            _stamp_function_calls(item, catalog_id)
+        return
+    if not isinstance(value, dict):
+        return
+    if ("@call" in value or "call" in value) and "args" in value:
+        value.setdefault("catalogId", catalog_id)
+    for child in value.values():
+        _stamp_function_calls(child, catalog_id)
+
+
+def _normalize_id_prefix(raw_prefix: str) -> str:
+    """Strips a trailing ``_root`` suffix so block child IDs stay ``<role>_*``."""
+    if raw_prefix and raw_prefix != "root" and raw_prefix.endswith("_root"):
+        return raw_prefix.removesuffix("_root")
+    return raw_prefix
+
+
 def _compute_root_id(prefix: str, root_local_id: str) -> str:
     """Computes the surface or block root component ID for `prefix`."""
     if prefix == "root":
@@ -2134,6 +2169,42 @@ class PatternExpander:
         self.protocol_version: str = "1.0"
         _validate_library_grammar_version(self.library, self.grammar)
 
+    def _owner_catalog_id(self, base_pattern: str) -> str | None:
+        """Resolves the catalog ID owning `base_pattern` for multi-catalog surfaces."""
+        owner: str | None = None
+        if isinstance(self.library, MergedPatternLibrary):
+            owner = self.library.owner_catalog_id(base_pattern)
+        elif self.library.catalog_id:
+            owner = self.library.catalog_id
+        if owner is None and self.graph.catalogs:
+            owner = self.graph.catalogs[0].catalog_id
+        return owner
+
+    def _default_block_prefix(
+        self, block_id: str, base_pattern: str
+    ) -> tuple[str, str | None]:
+        """Computes the stable `(id_prefix, owner_catalog_id)` for `block_id`."""
+        if self.graph.surface_catalog_id is not None:
+            return block_id, None
+        owner = self._owner_catalog_id(base_pattern)
+        slug = _catalog_slug(owner) if owner else "cat"
+        return f"{slug}_{block_id}", owner
+
+    def _stamp_multi_catalog_components(
+        self, components: Sequence[dict[str, Any]], owner: str | None
+    ) -> None:
+        """Stamps `catalogId` on `components` when the surface spans multiple catalogs."""
+        if self.graph.surface_catalog_id is not None or not components:
+            return
+        default_cat = owner or (
+            self.graph.catalogs[0].catalog_id if self.graph.catalogs else None
+        )
+        if default_cat is None:
+            return
+        for comp in components:
+            comp.setdefault("catalogId", default_cat)
+            _stamp_function_calls(comp, default_cat)
+
     def _resolve_block_pattern(
         self,
         block_id: str,
@@ -2143,12 +2214,17 @@ class PatternExpander:
         active_knobs: dict[str, str],
     ) -> tuple[CatalogPattern, BlockBindings]:
         """Resolves `base_pattern` (or its fallback chain) from `self.library`."""
-        cat_pattern = self.library.get(base_pattern)
-        if cat_pattern is not None:
-            return cat_pattern, bindings
         block_spec = self.grammar.blocks.get(block_id) or self.grammar.blocks.get(
             base_pattern
         )
+        cat_pattern = self.library.get(base_pattern)
+        if cat_pattern is not None:
+            effective = (
+                _adapt_fallback_bindings(block_spec.pattern, base_pattern, bindings)
+                if block_spec is not None and block_spec.pattern != base_pattern
+                else bindings
+            )
+            return cat_pattern, effective
         if block_spec is not None:
             resolved = resolve_fallback_pattern(block_spec, self.library)
             if resolved is not None:
@@ -2175,6 +2251,10 @@ class PatternExpander:
     ) -> Expansion:
         """Expands one block pattern into flat A2UI component dicts.
 
+        Preserves the block's stable component ids (``<prefix>_root`` and
+        ``<prefix>_*``) whether called during full-surface expansion or
+        standalone for a `region` update.
+
         Args:
             block_id: Grammar block id; prefixes every emitted component id.
             pattern: Pattern name, optionally ``name:variant``.
@@ -2183,7 +2263,8 @@ class PatternExpander:
             instances: Per-element instance answers in the
                 `PlannedBlock.instances` shape: element key to a mapping of
                 question name to option.
-            id_prefix: Overrides `block_id` as the component id prefix.
+            id_prefix: Overrides `block_id` as the component id prefix (a
+                trailing ``_root`` suffix is normalized automatically).
 
         Returns:
             The block's components and whether any of its submit actions
@@ -2201,7 +2282,8 @@ class PatternExpander:
             block_id, pattern, base_pattern, bindings, active_knobs
         )
         variant = cat_pattern.select_variant(active_knobs)
-        prefix = id_prefix or block_id
+        default_prefix, owner = self._default_block_prefix(block_id, cat_pattern.name)
+        prefix = _normalize_id_prefix(id_prefix) or default_prefix
         templates_by_id = {str(c["id"]): c for c in variant.components if "id" in c}
         root_id = _compute_root_id(prefix, variant.root)
         tracker = _ExpansionTracker()
@@ -2222,9 +2304,11 @@ class PatternExpander:
             scope,
             emitted,
         )
+        pruned = _prune_empty_containers(emitted, root_id)
+        self._stamp_multi_catalog_components(pruned, owner)
         has_mut = _block_has_mutable(block_id, effective_bindings)
         return Expansion(
-            components=_prune_empty_containers(emitted, root_id),
+            components=pruned,
             send_data_model=has_mut and tracker.has_empty_non_item_action,
             _has_mutable=has_mut,
             _has_empty_non_item_action=tracker.has_empty_non_item_action,

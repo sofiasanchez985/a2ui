@@ -100,6 +100,12 @@ class DecisionParser(Parser):
         self._synthesizer = synthesizer
         self.surface_id = surface_id
         self._conversation_state = conversation_state
+        self._last_output: SynthesisOutput | None = None
+
+    @property
+    def last_output(self) -> SynthesisOutput | None:
+        """The `SynthesisOutput` of the most recently synthesized block, if any."""
+        return self._last_output
 
     @property
     def synthesizer(self) -> DecisionSynthesizer:
@@ -129,6 +135,8 @@ class DecisionParser(Parser):
     ) -> SynthesisOutput:
         """Synthesizes one block, mapping failures to compilation errors."""
         target = block.surface_id or default_id
+        if block.replace and state is not None:
+            self._synthesizer.plan_cache.invalidate(state, target)
         operation, sends_data_model = surface_operation_for(block, state, target)
         try:
             output = self._synthesizer.synthesize_sync(
@@ -136,6 +144,7 @@ class DecisionParser(Parser):
                 block.payload,
                 operation=operation,
                 surface_sends_data_model=sends_data_model,
+                state=state,
                 **block.to_synthesis_kwargs(default_surface_id=default_id),
             )
         except A2uiError:
@@ -143,6 +152,7 @@ class DecisionParser(Parser):
         except Exception as exc:
             raise _as_compilation_error(exc, format_content) from exc
         _require_messages(output, format_content)
+        self._last_output = output
         return output
 
     def _apply_block(

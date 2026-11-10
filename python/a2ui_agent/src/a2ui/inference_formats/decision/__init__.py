@@ -97,6 +97,7 @@ from .payload_inspector import (
     PointerSummary,
     inspect_payload_pointers,
 )
+from .plan_cache import CachedPlan, PlanCache
 from .prompt_generator import DecisionPromptGenerator, decision_rules
 from .semantic_types import classify_scalar, humanize_key
 from .synthesizer import (
@@ -131,6 +132,7 @@ __all__ = [
     "BlockBindings",
     "BlockSpec",
     "BriefSection",
+    "CachedPlan",
     "Calibration",
     "CatalogDecisionGraph",
     "CatalogPattern",
@@ -173,6 +175,7 @@ __all__ = [
     "PatternExpander",
     "PatternLibrary",
     "PatternRef",
+    "PlanCache",
     "PlanCacheKey",
     "PlanOutcome",
     "PlanReason",

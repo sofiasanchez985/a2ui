@@ -42,13 +42,22 @@ from .models import (
     BRIEF_ITEM_PATTERN,
     ActionStyle,
     MAX_BRIEF_SECTIONS,
+    PlanCacheKey,
     SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
 )
 from .patterns import MergedPatternLibrary, PatternLibrary
-from .synthesizer import DecisionSynthesizer, FallbackCallback
-from .template_registry import TemplateRegistry
+from .payload_inspector import inspect_payload_pointers
+from .plan_cache import CachedPlan, PlanCache
+from .synthesizer import (
+    DecisionSynthesizer,
+    FallbackCallback,
+    _as_data_model,
+    _with_labels,
+    _without_excluded,
+)
+from .template_registry import SurfaceTemplate, TemplateRegistry
 
 _DEFAULT_TOOL_NAME = "render_a2ui_decision"
 _DEFAULT_DESCRIPTION = (
@@ -136,6 +145,8 @@ class DecisionRenderTool:
         self.synthesizer = synthesizer
         self._surface_id = surface_id
         self.include_trace = include_trace
+        self._last_cached: CachedPlan | None = None
+        self._last_surface_id: str | None = None
 
     @classmethod
     def create(
@@ -148,6 +159,7 @@ class DecisionRenderTool:
         archetypes: ArchetypeGrammar | None = None,
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
         fallback_fn: FallbackCallback | None = None,
+        plan_cache: PlanCache | None = None,
         name: str = _DEFAULT_TOOL_NAME,
         description: str = _DEFAULT_DESCRIPTION,
         surface_id: str | None = None,
@@ -164,6 +176,7 @@ class DecisionRenderTool:
             archetypes: Layout archetype grammar.
             patterns: Catalog pattern library.
             fallback_fn: Custom fallback called when the model abstains.
+            plan_cache: Optional `PlanCache` shared with the synthesizer.
             name: Tool name advertised to the model.
             description: Tool description advertised to the model.
             surface_id: Surface used when a call names none; None defers to
@@ -178,6 +191,7 @@ class DecisionRenderTool:
             archetypes=archetypes,
             patterns=patterns,
             fallback_fn=fallback_fn,
+            plan_cache=plan_cache,
         )
         return cls(
             synthesizer,
@@ -276,6 +290,21 @@ class DecisionRenderTool:
                         " subtitles or alert text."
                     ),
                 },
+                "region": {
+                    "type": "string",
+                    "description": (
+                        "Optional block role to re-plan and replace in place on"
+                        " an existing surface."
+                    ),
+                },
+                "labels": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": (
+                        "Optional map from JSON Pointer (starting with '/') to"
+                        " a display label overriding the humanized key name."
+                    ),
+                },
             },
             "required": ["intent", "payload"],
             "additionalProperties": False,
@@ -289,6 +318,115 @@ class DecisionRenderTool:
         if block.replace:
             kwargs["operation"] = SurfaceOperation.REPLACE
         return block, kwargs
+
+    def _tool_cache_key(
+        self, block: DecisionBlock
+    ) -> tuple[PlanCacheKey, Mapping[str, Any]]:
+        data = _as_data_model(block.payload)
+        pointers = _with_labels(
+            _without_excluded(
+                inspect_payload_pointers(data, mutable_paths=block.mutable_paths),
+                block.exclude,
+            ),
+            block.labels,
+        )
+        key = self.synthesizer.make_cache_key(
+            self.name,
+            block.intent,
+            pointers,
+            actions=block.actions,
+            exclude=block.exclude,
+            mutable_paths=block.mutable_paths,
+            labels=block.labels,
+            layout=block.layout,
+            title=block.title,
+            summary=block.summary,
+        )
+        return key, data
+
+    def _check_tool_cache(
+        self, block: DecisionBlock, kwargs: Mapping[str, Any]
+    ) -> tuple[PlanCacheKey, str, SynthesisOutput | None]:
+        target_surface_id = str(
+            kwargs.get("surface_id") or self.synthesizer.config.default_surface_id
+        )
+        cache = self.synthesizer.plan_cache
+        if block.replace:
+            cache.invalidate_tool(self.name)
+        cache_key, data = self._tool_cache_key(block)
+        if not block.replace and block.region is None:
+            cached = cache.get_tool(cache_key)
+            if cached is not None:
+                self._last_cached = cached
+                self._last_surface_id = target_surface_id
+                return (
+                    cache_key,
+                    target_surface_id,
+                    self.synthesizer.render_cached_tool_plan(
+                        cached, target_surface_id, data
+                    ),
+                )
+        return cache_key, target_surface_id, None
+
+    def _record_tool_output(
+        self,
+        cache_key: PlanCacheKey,
+        target_surface_id: str,
+        output: SynthesisOutput,
+    ) -> SynthesisOutput:
+        if (
+            output.layout_plan is not None
+            and output.messages
+            and output.fallback_source is None
+        ):
+            entry = self.synthesizer._store_cached_plan(None, cache_key, output)
+            if entry is not None:
+                self.synthesizer.plan_cache.put_tool(cache_key, entry)
+                self._last_cached = entry
+                self._last_surface_id = target_surface_id
+        return output
+
+    def promote(
+        self,
+        template_id: str,
+        description: str,
+        *,
+        is_mutable: bool = False,
+    ) -> SurfaceTemplate:
+        """Promotes the last cached plan from this tool into a registered `SurfaceTemplate`.
+
+        Args:
+            template_id: Identifier for the new template.
+            description: Description used by the template question.
+            is_mutable: Whether the template's data is user-editable.
+
+        Returns:
+            The registered `SurfaceTemplate`.
+
+        Raises:
+            ValueError: If no plan has been cached by this tool yet.
+        """
+        cached = self._last_cached or self.synthesizer.plan_cache.last_tool_entry(
+            self.name
+        )
+        if cached is None:
+            raise ValueError(
+                "No cached plan to promote; run the tool on a payload first."
+            )
+        surface_id = (
+            self._last_surface_id
+            or self._surface_id
+            or self.synthesizer.config.default_surface_id
+        )
+        return self.synthesizer.registry.promote_plan(
+            template_id,
+            description,
+            cached.plan,
+            cached.components,
+            surface_id=surface_id,
+            catalog_id=self.synthesizer.graph.surface_catalog_id,
+            is_mutable=is_mutable,
+        )
 
     def format_result(
         self,
@@ -339,7 +477,13 @@ class DecisionRenderTool:
         """
         del include_trace
         block, kwargs = self._synthesis_kwargs(args)
-        return await self.synthesizer.synthesize(block.intent, block.payload, **kwargs)
+        cache_key, target_surface_id, hit = self._check_tool_cache(block, kwargs)
+        if hit is not None:
+            return hit
+        output = await self.synthesizer.synthesize(
+            block.intent, block.payload, **kwargs
+        )
+        return self._record_tool_output(cache_key, target_surface_id, output)
 
     def run_sync(
         self, args: Mapping[str, Any], *, include_trace: bool | None = None
@@ -347,7 +491,11 @@ class DecisionRenderTool:
         """Renders one tool call from synchronous code. See `run_async`."""
         del include_trace
         block, kwargs = self._synthesis_kwargs(args)
-        return self.synthesizer.synthesize_sync(block.intent, block.payload, **kwargs)
+        cache_key, target_surface_id, hit = self._check_tool_cache(block, kwargs)
+        if hit is not None:
+            return hit
+        output = self.synthesizer.synthesize_sync(block.intent, block.payload, **kwargs)
+        return self._record_tool_output(cache_key, target_surface_id, output)
 
 
 __all__ = ["DecisionRenderTool"]

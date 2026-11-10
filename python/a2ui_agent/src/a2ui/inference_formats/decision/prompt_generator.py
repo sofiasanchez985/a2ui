@@ -59,13 +59,17 @@ one JSON object (or a JSON array of such objects, one per surface).
    `actions` field. If you pass an array, it is stored under the `items` key,
    so bindings read `/items/0/...`.
 
-3. `surfaceId` (optional, string): The surface to render into. A new id creates a surface. Reusing an id updates that surface in place: the new layout replaces the old one, and parts that did not change keep their state. To start the surface over, also set `"replace": true`; the old surface is deleted and a new one is created.
+3. `surfaceId` (optional, string): The surface to render into. A new id creates a surface. Reusing an id updates that surface in place: the new layout replaces the old one, and parts that did not change keep their state. To change only one part, also set `region` to that part's role from the `layout` roles (for example `"actions"`); only that part is replaced. To start the surface over, also set `"replace": true`; the old surface is deleted and a new one is created.
 
-4. `replace` (optional, boolean): When `true` on an existing `surfaceId`,
+4. `region` (optional, string): When updating an existing `surfaceId`, the
+   block role (for example `"headline"` or `"actions"`) of the single part to
+   re-plan and replace in place.
+
+5. `replace` (optional, boolean): When `true` on an existing `surfaceId`,
    deletes the old surface and creates a new one instead of updating it in
    place. Defaults to `false`.
 
-5. `actions` (optional, object): A map from action id (in display order) to a
+6. `actions` (optional, object): A map from action id (in display order) to a
    button label string or an options object; the action id is the event name
    sent back when the user triggers the action. Example:
    `{{{{"sign_in": "Sign In", "create_account": "Create account"}}}}`. When an
@@ -76,25 +80,29 @@ one JSON object (or a JSON array of such objects, one per surface).
    pointers), and `"style"` (`"primary"`, `"secondary"`, or `"destructive"`).
    Example: `{{{{"cancel_order": {{{{"label": "Cancel", "scope": "/orders", "style": "destructive"}}}}}}}}`.
 
-6. `exclude` (optional, array of strings): JSON pointers starting with `"/"`
+7. `exclude` (optional, array of strings): JSON pointers starting with `"/"`
    (for example `["/internalId", "/auth/token"]`) in `payload` that the surface
    must not display.
 
-7. `mutablePaths` (optional, array of strings): JSON pointers (for example `["/email", "/password", "/rememberMe"]`) for fields in `payload` that the user edits. Required for any form or settings surface: forms and settings must list their editable pointers here, or those fields render as read-only display.
+8. `mutablePaths` (optional, array of strings): JSON pointers (for example `["/email", "/password", "/rememberMe"]`) for fields in `payload` that the user edits. Required for any form or settings surface: forms and settings must list their editable pointers here, or those fields render as read-only display.
 
-8. `layout` (optional, array of up to {MAX_BRIEF_SECTIONS} strings): An ordered
+9. `layout` (optional, array of up to {MAX_BRIEF_SECTIONS} strings): An ordered
    layout brief grouping payload keys by role, each formatted as
    `"<role>:<key>,<key>"` (keys may be bare top-level names or `/`-prefixed
    JSON pointers; no nested sections). Valid roles are {{brief_roles}}.
    Example: `["picture:name,logoUrl", "collection:/photos", "facts:address,phone"]`.
 
-9. `fallbackDsl` (optional, string): A2UI Express source rendered if the
-   decision model is not confident enough to choose components.
+10. `labels` (optional, object): A map from JSON pointer starting with `"/"`
+    (for example `{{{{"/cpu": "Processor load", "/uptimeHours": "Uptime (h)"}}}}`)
+    to the display label to show instead of the humanized key name.
 
-10. `title` (optional, string): An optional title for the surface. When supplied,
+11. `fallbackDsl` (optional, string): A2UI Express source rendered if the
+    decision model is not confident enough to choose components.
+
+12. `title` (optional, string): An optional title for the surface. When supplied,
     the grammar places it into the page heading or banner without rewriting.
 
-11. `summary` (optional, string): An optional one-line summary or caption for the
+13. `summary` (optional, string): An optional one-line summary or caption for the
     surface. When supplied, the grammar places it into supporting prose without rewriting.
 
 ## Example
