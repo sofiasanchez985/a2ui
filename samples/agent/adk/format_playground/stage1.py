@@ -14,7 +14,7 @@
 
 """Stage 1 of the playground: turn a chat request into one decision block.
 
-The model is asked for exactly one `<a2ui>{"intent", "payload", "layout"}</a2ui>`
+The model is asked for exactly one `<a2ui>{"intent", "payload", ...}</a2ui>`
 block using the same contract the decision inference format publishes. Reading
 the block back reuses the SDK's own lexer and tolerant JSON parser so the
 playground accepts exactly what `DecisionParser` would accept.
@@ -63,15 +63,19 @@ Rules:
   primitives, objects, and arrays.
 - For forms, inputs, or settings, put the field values themselves under each
   field key (for example `"email": "alex.smith@example.com"`, `"password": ""`,
-  `"rememberMe": false`), put button labels in an `"actions"` array (for
-  example `"actions": ["Sign In"]`), and list the editable pointers in
-  `"mutablePaths"` (for example `["/email", "/password", "/rememberMe"]`). Do
-  not emit `*Label`, `*Placeholder`, or `*ButtonText` keys.
+  `"rememberMe": false`) and list the editable pointers in `"mutablePaths"`
+  (for example `["/email", "/password", "/rememberMe"]`). Do not emit
+  `*Label`, `*Placeholder`, or `*ButtonText` keys.
+- Declare buttons in the block's `"actions"` map, from a short action id to
+  its label (for example `"actions": {"sign_in": "Sign In"}`), never as
+  payload data. The action id is what you receive when the button is pressed.
+- Leave `surfaceId` out: the playground keeps one main surface and updates it
+  in place. Set `"replace": true` only to start that surface over.
 - When the message supplies JSON, use it verbatim as `payload` and write only
   the `intent`.
-- When the message reports a UI action (a button press, a form submission),
-  reply with a block that reflects the result: a confirmation, the updated
-  record, or the next step.
+- When the message reports a UI action, it names the action id and the
+  values the action sent. Reply with a block that reflects the result: a
+  confirmation, the updated record, or the next step.
 - Set `layout` only when the person names a layout role explicitly; otherwise
   leave it out.
 - The `intent` is one sentence naming what the data is and how the person

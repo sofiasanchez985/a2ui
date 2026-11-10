@@ -170,7 +170,7 @@ case "${PRESET}" in
       export A2UI_DECISION_MODEL="${A2UI_DECISION_MODEL:-${JEV_MODEL:-jev}}"
     else
       export A2UI_DECISION_URL="${A2UI_DECISION_URL:-https://api.typesafe.ai/v1/systemone}"
-      export A2UI_DECISION_MODEL="${A2UI_DECISION_MODEL:-${JEV_MODEL:-jev-latest}}"
+      export A2UI_DECISION_MODEL="${A2UI_DECISION_MODEL:-${JEV_MODEL:-jev-v0}}"
     fi
     RENDER_MODE="decision"
     ;;

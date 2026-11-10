@@ -22,4 +22,6 @@ export const playgroundConfig: AppConfig = {
   placeholder: 'Describe a UI, paste JSON, or type /help',
   loadingText: ['Describing the interface...', 'Planning the layout...', 'Rendering...'],
   serverUrl: 'http://localhost:10010',
+  // The playground reuses its main surface id across turns.
+  clearSurfacesOnResponse: false,
 };

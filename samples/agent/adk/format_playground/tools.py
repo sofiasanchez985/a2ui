@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from a2ui.inference_formats.decision import ActionSpec, ActionStyle
+
 
 def get_host_health(host: str = "prod-1") -> dict[str, Any]:
     """Retrieves operational and health metrics for a production host server."""
@@ -49,7 +51,6 @@ def get_transfer_quote(
         "amount": amount,
         "fee": 25.0,
         "sourceAccount": "Checking ...4821",
-        "actions": ["Confirm Transfer", "Cancel"],
     }
 
 
@@ -59,7 +60,6 @@ def get_playback_settings() -> dict[str, Any]:
         "volume": 80,
         "subtitles": True,
         "theme": "dark",
-        "actions": ["Save", "Cancel"],
     }
 
 
@@ -73,9 +73,23 @@ TOOL_INTENTS: dict[str, str] = {
 TOOL_MUTABLE_PATHS: dict[str, tuple[str, ...]] = {
     "get_host_health": (),
     "get_resort": (),
-    "get_transfer_quote": ("/actions",),
-    "get_playback_settings": ("/volume", "/subtitles", "/theme", "/actions"),
+    "get_transfer_quote": (),
+    "get_playback_settings": ("/volume", "/subtitles", "/theme"),
 }
+
+TOOL_ACTIONS: dict[str, tuple[ActionSpec, ...]] = {
+    "get_host_health": (),
+    "get_resort": (),
+    "get_transfer_quote": (
+        ActionSpec(id="confirm_transfer", label="Confirm Transfer"),
+        ActionSpec(id="cancel_transfer", label="Cancel"),
+    ),
+    "get_playback_settings": (
+        ActionSpec(id="save_settings", label="Save", style=ActionStyle.PRIMARY),
+        ActionSpec(id="discard_settings", label="Cancel"),
+    ),
+}
+"""The buttons each tool's surface offers; their ids are the events the agent gets."""
 
 TOOLS: list[Callable[..., Any]] = [
     get_host_health,

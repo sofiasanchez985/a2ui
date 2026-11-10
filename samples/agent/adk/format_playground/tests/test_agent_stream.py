@@ -122,7 +122,11 @@ async def test_help_mode_and_trace_before_any_render(
 
     monkeypatch.setenv("JEV_API_KEY", "vcp_test_key")
     backend_parts = await collect(agent, "/backend jev", "s1")
-    assert "Decision backend set to `jev (jev)`." in status_text(backend_parts)
+    assert "Decision backend set to `jev`." in status_text(backend_parts)
+    nameless = await collect(agent, "/backend", "s1")
+    assert "`/backend` needs a backend name" in status_text(nameless)
+    remix = await collect(agent, "/remix", "s1")
+    assert "Unknown command `/remix`" in status_text(remix)
     reset_parts = await collect(agent, "/backend mock", "s1")
     assert "Decision backend set to `mock`." in status_text(reset_parts)
 
@@ -133,14 +137,13 @@ async def test_help_mode_and_trace_before_any_render(
     assert isinstance(text_only[0].root, TextPart)
 
 
-@pytest.mark.parametrize("version", ["0.9", "1.0"])
 async def test_decision_turn_renders_surface_footer_and_trace(
-    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller, version: str
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
     scripted_llm.script("stage1", STAGE1_BLOCK)
-    parts = await collect(agent, "I want to see the resort", "s2", version)
+    parts = await collect(agent, "I want to see the resort", "s2", "1.0")
     ids = surface_ids(parts)
-    assert ids == ["turn-1", "turn-1-decision-footer"]
+    assert ids == ["main", "turn-1-decision-footer"]
     footer = status_text(parts)
     assert "**decision** · mock · 1 LLM call" in footer
     assert "archetype" in footer
@@ -148,8 +151,37 @@ async def test_decision_turn_renders_surface_footer_and_trace(
     assert stage1_call["session_id"] == "s2"
     assert "Format playground" in str(stage1_call["instruction"])
 
-    trace = await collect(agent, "/trace", "s2", version)
+    trace = await collect(agent, "/trace", "s2", "1.0")
     assert "`family`" in status_text(trace)
+    assert "**Backend**: `mock`" in status_text(trace)
+
+
+async def test_decision_mode_needs_a_v10_client(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    scripted_llm.script("stage1", STAGE1_BLOCK)
+    parts = await collect(agent, "I want to see the resort", "s2-v09", "0.9")
+    assert surface_ids(parts) == ["turn-1-decision-footer"]
+    assert "v1.0 only" in status_text(parts)
+
+
+async def test_second_turn_updates_the_main_surface_in_place(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    scripted_llm.script("stage1", STAGE1_BLOCK, STAGE1_BLOCK)
+    first = await collect(agent, "show the resort", "s-reuse", "1.0")
+    second = await collect(agent, "show it again", "s-reuse", "1.0")
+    assert surface_ids(first) == ["main", "turn-1-decision-footer"]
+    # Turn 2 reuses `main`: no second createSurface, so no INTEGRITY_ERROR.
+    assert surface_ids(second) == ["turn-2-decision-footer"]
+    main_updates = [
+        m
+        for m in messages_of(second)
+        if m.get("updateComponents", {}).get("surfaceId") == "main"
+    ]
+    assert main_updates
+    assert "surface update_root" in status_text(second)
+    assert "INTEGRITY_ERROR" not in json.dumps(messages_of(second))
 
 
 async def test_express_turn_uses_fresh_stage2_session(
@@ -169,14 +201,14 @@ async def test_express_turn_uses_fresh_stage2_session(
 async def test_compare_renders_three_surfaces_and_resets(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
-    await collect(agent, "/compare", "s4")
+    await collect(agent, "/compare", "s4", "1.0")
     scripted_llm.script("stage1", STAGE1_BLOCK, STAGE1_BLOCK)
-    scripted_llm.script("express:0.9", EXPRESS_OK.replace("turn-1", "turn-1-express"))
+    scripted_llm.script("express:1.0", EXPRESS_OK.replace("turn-1", "turn-1-express"))
     scripted_llm.script(
-        "direct:0.9",
-        direct_json_reply(agent.renderers, "0.9").replace("turn-1", "turn-1-direct"),
+        "direct:1.0",
+        direct_json_reply(agent.renderers, "1.0").replace("turn-1", "turn-1-direct"),
     )
-    parts = await collect(agent, "compare the resort", "s4")
+    parts = await collect(agent, "compare the resort", "s4", "1.0")
     assert surface_ids(parts) == [
         "turn-1-decision",
         "turn-1-decision-footer",
@@ -192,8 +224,8 @@ async def test_compare_renders_three_surfaces_and_resets(
     assert len(scripted_llm.calls_for("stage1")) == 1
 
     # The next turn is back to the single default mode.
-    again = await collect(agent, "again", "s4")
-    assert surface_ids(again) == ["turn-2", "turn-2-decision-footer"]
+    again = await collect(agent, "again", "s4", "1.0")
+    assert surface_ids(again) == ["main", "turn-2-decision-footer"]
 
 
 async def test_prose_from_stage1_and_stage2_failures_never_raise(
@@ -218,8 +250,8 @@ async def test_ui_action_text_goes_through_stage1(
 ) -> None:
     scripted_llm.script("stage1", STAGE1_BLOCK)
     action_text = "User interacted with the UI: action `submit` with context {}."
-    parts = await collect(agent, action_text, "s6")
-    assert surface_ids(parts)[0] == "turn-1"
+    parts = await collect(agent, action_text, "s6", "1.0")
+    assert surface_ids(parts)[0] == "main"
     assert scripted_llm.calls_for("stage1")[-1]["user_text"] == action_text
     assert action_text.startswith(UI_ACTION_PREFIX)
     assert RenderMode.DECISION.value in status_text(parts)
@@ -255,9 +287,9 @@ async def test_tool_mode_renders_surface_with_tool_result(
             latency_ms=120.0,
         ),
     )
-    parts = await collect(agent, "check host 01 health", "s-tool-1")
+    parts = await collect(agent, "check host 01 health", "s-tool-1", "1.0")
     ids = surface_ids(parts)
-    assert ids == ["turn-1", "turn-1-tool-footer"]
+    assert ids == ["main", "turn-1-tool-footer"]
     footer = status_text(parts)
     assert "**tool**" in footer
     assert "1 LLM call (tool call only)" in footer
@@ -322,25 +354,24 @@ async def test_rate_command_records_preference_and_summarizes(
     assert "`decision`: 1 (100.0%)" in status_text(summary)
 
 
-async def test_remix_command_resamples_layout_with_zero_calls(
-    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
-) -> None:
-    # Remix before decision turn
-    unremixed = await collect(agent, "/remix", "s-remix")
-    assert "No previous decision render to remix" in status_text(unremixed)
+async def test_action_events_route_by_id_with_context() -> None:
+    from agent_executor import action_query, build_query, classify_data_part
 
-    # Valid decision turn
-    scripted_llm.script("stage1", STAGE1_BLOCK)
-    parts = await collect(agent, "show resort", "s-remix")
-    assert surface_ids(parts) == ["turn-1", "turn-1-decision-footer"]
-
-    # Invalid seed
-    bad_seed = await collect(agent, "/remix abc", "s-remix")
-    assert "Invalid seed `abc`" in status_text(bad_seed)
-
-    # Valid remix with seed
-    remixed = await collect(agent, "/remix 42", "s-remix")
-    assert surface_ids(remixed) == ["turn-1", "turn-1-remix-footer"]
-    footer = status_text(remixed)
-    assert "**decision** · remix · 0 LLM calls · 0 decision calls" in footer
-    assert "remix seed 42" in footer
+    event = {
+        "version": "1.0",
+        "action": {
+            "name": "save_profile",
+            "surfaceId": "main",
+            "sourceComponentId": "actions_action_button_0",
+            "timestamp": "2026-11-10T00:00:00Z",
+            "context": {"email": "alex@example.com", "name": "Alex"},
+        },
+    }
+    kind, action = classify_data_part(event)
+    assert kind == "action"
+    query = action_query(action)
+    assert query.startswith(UI_ACTION_PREFIX)
+    assert "action `save_profile` on surface `main`" in query
+    assert '"email": "alex@example.com"' in query
+    parts = [Part(root=DataPart(data=event))]
+    assert build_query(parts) == query

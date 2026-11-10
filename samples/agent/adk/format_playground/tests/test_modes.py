@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 from modes import (
+    MAIN_SURFACE_ID,
     LlmTurn,
     PlaygroundSettings,
     RenderMode,
     RenderResult,
     TurnMetrics,
     as_mode,
+    status_surface_id,
     surface_id_for,
 )
 
@@ -88,8 +90,13 @@ def test_surface_ids_and_turn_counter() -> None:
     assert settings.turn == 1
     assert surface_id_for(settings) == "turn-1"
     assert surface_id_for(settings, RenderMode.EXPRESS) == "turn-1"
+    # Decision and tool renders reuse one surface across turns.
+    assert surface_id_for(settings, RenderMode.DECISION) == MAIN_SURFACE_ID
+    assert surface_id_for(settings.next_turn(), RenderMode.TOOL) == MAIN_SURFACE_ID
+    assert status_surface_id(settings, "status") == "turn-1-status"
     comparing = PlaygroundSettings(compare=True, turn=3)
     assert surface_id_for(comparing, RenderMode.EXPRESS) == "turn-3-express"
+    assert surface_id_for(comparing, RenderMode.DECISION) == "turn-3-decision"
     assert surface_id_for(comparing) == "turn-3"
 
 
@@ -135,34 +142,6 @@ def test_path_summary_and_decision_timing_across_stages() -> None:
         " · path: templates · template login_card (0.91)"
     )
 
-    container_m = TurnMetrics(
-        mode=RenderMode.DECISION,
-        backend="jev",
-        llm_calls=0,
-        latency_ms=385.0,
-        decision_latency_ms=380.0,
-        stage="container_2pass",
-        root_component="Column",
-        confidence=0.74,
-    )
-    assert "path: decision model · 2-pass container Column (0.74)" in (
-        container_m.footer()
-    )
-
-    leaf_m = TurnMetrics(
-        mode=RenderMode.DECISION,
-        backend="mock",
-        llm_calls=0,
-        latency_ms=0.5,
-        decision_latency_ms=0.42,
-        stage="fast_1pass_leaf",
-        root_component="Text",
-        confidence=0.83,
-    )
-    assert "decision 0.42 ms · path: decision model · 1-pass leaf Text (0.83)" in (
-        leaf_m.footer()
-    )
-
     fallback_m = TurnMetrics(
         mode=RenderMode.DECISION,
         backend="jev",
@@ -170,9 +149,28 @@ def test_path_summary_and_decision_timing_across_stages() -> None:
         latency_ms=345.0,
         decision_latency_ms=340.0,
         stage="abstain_fallback",
-        fallback="card",
+        fallback="fallback_facts",
+        fallback_reason="no_family",
         confidence=0.31,
+        model_id="jev-v0",
     )
-    assert (
-        "path: fallback (card) · decision model abstained (0.31)" in fallback_m.footer()
+    footer = fallback_m.footer()
+    assert footer.startswith("**decision** · jev (jev-v0) · 0 LLM calls")
+    assert footer.endswith(
+        "path: fallback (fallback_facts) · decision model abstained: no_family"
+    )
+
+
+def test_footer_shows_model_id_and_non_create_operations() -> None:
+    metrics = TurnMetrics(
+        mode=RenderMode.DECISION,
+        backend="mock",
+        model_id="mock",
+        llm_calls=0,
+        latency_ms=1.0,
+        decision_latency_ms=1.0,
+        operation="update_root",
+    )
+    assert metrics.footer() == (
+        "**decision** · mock · 0 LLM calls · decision 1 ms · surface update_root"
     )

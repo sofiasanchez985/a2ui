@@ -33,14 +33,14 @@ import time
 from typing import Any
 
 from a2a.types import Part
-import httpx
 
 from a2ui.a2a import create_a2ui_part
 from a2ui.core import A2uiError
 from a2ui.core.basic_catalog import BasicCatalog
 from a2ui.inference_formats.decision import (
+    ActionSpec,
     DecisionBackend,
-    DecisionBackendType,
+    DecisionBackendError,
     DecisionBlock,
     DecisionFormat,
     DecisionFormatFactory,
@@ -50,17 +50,17 @@ from a2ui.inference_formats.decision import (
     DeterministicMockBackend,
     JevHttpBackend,
     QuestionKind,
-    StepZeroLogprobBackend,
     SynthesisConfig,
     SynthesisOutput,
     create_decision_backend,
+    surface_operation_for,
 )
 from a2ui.inference_formats.direct_json import DirectJsonFormatFactory
 from a2ui.inference_formats.express import ExpressFormatFactory
 from a2ui.parser import A2uiPart
 from a2ui.parser.messages import to_message_dicts
 from a2ui.processor import A2uiGenerator, A2uiRequestProcessor, CatalogConfig
-from a2ui.utils import to_version_number
+from a2ui.utils import RendererState, to_version_number
 from modes import (
     LlmCaller,
     LlmTurn,
@@ -72,30 +72,27 @@ from modes import (
 
 logger = logging.getLogger(__name__)
 
-_BACKEND_NAMES: dict[type, DecisionBackendType] = {
-    DeterministicMockBackend: DecisionBackendType.MOCK,
-    JevHttpBackend: DecisionBackendType.JEV,
-    StepZeroLogprobBackend: DecisionBackendType.STEP_ZERO,
-}
 _STAGE2_RETRIES = 1
+DECISION_VERSION = "1.0"
+"""The only protocol version the decision format renders."""
+_DECISION_ERRORS = (A2uiError, ValueError, TypeError, DecisionBackendError)
 
 
 def backend_display_name(backend: DecisionBackend) -> str:
-    """The short name of a bundled backend (`mock`, `jev`, `gev`, `step0`) or its class name."""
+    """The backend's `backend_kind`, plus its `model_id` when it is not a default."""
     if isinstance(backend, JevHttpBackend):
         url_lower = backend.endpoint_url.lower()
-        is_local_gev = backend.model.startswith("vertex/") or (
+        is_local_gev = backend.model_id.startswith("vertex/") or (
             ("127.0.0.1" in url_lower or "localhost" in url_lower)
             and url_lower.rstrip("/").endswith("/v1/systemone")
         )
-        label = "gev" if is_local_gev else "jev"
-        if backend.model and backend.model != "default":
-            return f"{label} ({backend.model})"
-        return label
-    for cls, kind in _BACKEND_NAMES.items():
-        if isinstance(backend, cls):
-            return kind.value
-    return type(backend).__name__
+        label = "gev" if is_local_gev else backend.backend_kind
+    else:
+        label = getattr(backend, "backend_kind", type(backend).__name__)
+    model_id = getattr(backend, "model_id", "")
+    if model_id and model_id not in ("default", label):
+        return f"{label} ({model_id})"
+    return label
 
 
 def build_named_backend(name: str) -> DecisionBackend:
@@ -163,46 +160,40 @@ def _record_line(record: DecisionRecord) -> str:
     return " · ".join(pieces)
 
 
-def _output_summary_line(output: SynthesisOutput) -> str:
-    """Formats a summary header line for `/trace` showing path and decision latency."""
+def _output_path(output: SynthesisOutput) -> str:
     conf = f"p={output.confidence:.2f}"
     stage = output.stage.value
     if stage == "template_select":
         tpl = f" `{output.selected_template_id}`" if output.selected_template_id else ""
-        path = f"**Path**: templates · template{tpl} ({conf})"
-    elif stage == "archetype" and output.layout_plan is not None:
+        return f"**Path**: templates · template{tpl} ({conf})"
+    if stage == "archetype" and output.layout_plan is not None:
         plan = output.layout_plan
         blocks = ", ".join(f"`{b.block_id}:{b.pattern}`" for b in plan.blocks)
         n = len(plan.blocks)
         block_desc = (
             f"{n} block{'' if n == 1 else 's'}: {blocks}" if blocks else "0 blocks"
         )
-        path = (
+        return (
             f"**Path**: decision model · archetype `{plan.archetype}`"
             f" ({conf}, {block_desc})"
         )
-    elif stage == "fast_1pass_leaf":
-        root = (output.component_tree_spec or {}).get("root_component")
-        comp = f" `{root}`" if root else ""
-        path = f"**Path**: decision model · 1-pass leaf{comp} ({conf})"
-    elif stage == "container_2pass":
-        root = (output.component_tree_spec or {}).get("root_component")
-        comp = f" `{root}`" if root else ""
-        path = f"**Path**: decision model · 2-pass container{comp} ({conf})"
-    else:
-        source = (
-            str(output.fallback_source)
-            if output.fallback_source is not None
-            else "abstained"
-        )
-        path = f"**Path**: fallback (`{source}`) · decision model abstained ({conf})"
+    source = str(output.fallback_source) if output.fallback_source else "abstained"
+    reason = f": {output.fallback_reason}" if output.fallback_reason else ""
+    return f"**Path**: fallback (`{source}`) · decision model abstained{reason}"
+
+
+def _output_summary_line(output: SynthesisOutput) -> str:
+    """Formats a summary header line for `/trace`: path, backend, and decision time."""
     calls = output.decision_calls
     call_label = f"{calls} call{'' if calls == 1 else 's'}"
+    backend = f"`{output.backend_kind}`" + (
+        f" (`{output.model_id}`)" if output.model_id else ""
+    )
     timing = (
         f"**Decision time**: {format_decision_ms(output.decision_latency_ms)}"
         f" ({call_label})"
     )
-    return f"{path} · {timing}"
+    return f"{_output_path(output)} · **Backend**: {backend} · {timing}"
 
 
 def trace_lines(output: SynthesisOutput) -> tuple[str, ...]:
@@ -239,15 +230,15 @@ class Renderers:
         self._versions = tuple(versions)
         self._config = config
         self._raw_backend = backend
-        self._decision_factory = DecisionFormatFactory(
-            backend=backend, config=config, fallback_card=True
-        )
+        self._decision_factory = DecisionFormatFactory(backend=backend, config=config)
+        self._states: dict[str, RendererState] = {}
         self._processors: dict[tuple[RenderMode, str], A2uiRequestProcessor] = {}
         for version in self._versions:
             key = to_version_number(version)
-            self._processors[(RenderMode.DECISION, key)] = self._build_processor(
-                version, self._decision_factory
-            )
+            if key == DECISION_VERSION:
+                self._processors[(RenderMode.DECISION, key)] = self._build_processor(
+                    version, self._decision_factory
+                )
             self._processors[(RenderMode.EXPRESS, key)] = self._build_processor(
                 version, ExpressFormatFactory()
             )
@@ -260,12 +251,11 @@ class Renderers:
         old_factory = self._decision_factory
         self._raw_backend = backend
         self._decision_factory = DecisionFormatFactory(
-            backend=backend, config=self._config, fallback_card=True
+            backend=backend, config=self._config
         )
-        for version in self._versions:
-            key = to_version_number(version)
-            self._processors[(RenderMode.DECISION, key)] = self._build_processor(
-                version, self._decision_factory
+        if (RenderMode.DECISION, DECISION_VERSION) in self._processors:
+            self._processors[(RenderMode.DECISION, DECISION_VERSION)] = (
+                self._build_processor(DECISION_VERSION, self._decision_factory)
             )
         try:
             loop = asyncio.get_running_loop()
@@ -294,6 +284,11 @@ class Renderers:
         return backend_display_name(self._raw_backend)
 
     @property
+    def backend_kind(self) -> str:
+        """The active decision backend's `backend_kind`."""
+        return self._raw_backend.backend_kind
+
+    @property
     def versions(self) -> tuple[str, ...]:
         """Protocol version numbers this instance renders for."""
         return tuple(sorted({v for _, v in self._processors}))
@@ -311,26 +306,80 @@ class Renderers:
         return self.processor(mode, version).prompt_snippet
 
     def _synthesizer(self, version: str) -> DecisionSynthesizer:
+        """The decision synthesizer for `version`.
+
+        Raises:
+            ValueError: If `version` is not v1.0, the only one the decision
+                format renders.
+        """
+        if to_version_number(version) != DECISION_VERSION:
+            raise ValueError(
+                f"The decision format renders A2UI v{DECISION_VERSION} only; this"
+                f" client asked for v{to_version_number(version)}."
+            )
         fmt = self.processor(RenderMode.DECISION, version).format
         if not isinstance(fmt, DecisionFormat):
             raise TypeError(f"Expected a DecisionFormat, got {type(fmt).__name__}.")
         return fmt.synthesizer
 
-    async def render_decision(
-        self, block: DecisionBlock, *, surface_id: str, version: str
+    def state_for(self, conversation_id: str) -> RendererState:
+        """The renderer state for one conversation's decision surfaces.
+
+        Kept here rather than on the `DecisionFormat`, so it survives a
+        `/backend` switch that replaces the format.
+        """
+        state = self._states.get(conversation_id)
+        if state is None:
+            catalogs = self.processor(RenderMode.DECISION, DECISION_VERSION)
+            state = RendererState(catalogs.active_catalogs)
+            self._states[conversation_id] = state
+        return state
+
+    async def _synthesize(
+        self,
+        block: DecisionBlock,
+        *,
+        surface_id: str,
+        version: str,
+        conversation_id: str | None,
+    ) -> SynthesisOutput:
+        """Synthesizes `block`, updating the conversation's surfaces in place.
+
+        With a conversation id, the block's surface is looked up in that
+        conversation's state first, so a reused id updates the surface and
+        `replace` recreates it; the messages are then applied to the state.
+        """
+        synthesizer = self._synthesizer(version)
+        kwargs = block.to_synthesis_kwargs(default_surface_id=surface_id)
+        kwargs["surface_id"] = surface_id
+        if conversation_id is None:
+            return await synthesizer.synthesize(block.intent, block.payload, **kwargs)
+        state = self.state_for(conversation_id)
+        operation, sends_data_model = surface_operation_for(block, state, surface_id)
+        output = await synthesizer.synthesize(
+            block.intent,
+            block.payload,
+            operation=operation,
+            surface_sends_data_model=sends_data_model,
+            **kwargs,
+        )
+        state.apply(output.messages)
+        return output
+
+    def _decision_result(
+        self,
+        block: DecisionBlock,
+        started: float,
+        mode: RenderMode,
+        *,
+        output: SynthesisOutput | None,
+        version: str,
+        error: str | None = None,
     ) -> RenderResult:
-        """Compiles `block` with the decision synthesizer; no model call."""
-        started = time.perf_counter()
-        try:
-            kwargs = block.to_synthesis_kwargs(default_surface_id=surface_id)
-            kwargs["surface_id"] = surface_id
-            output = await self._synthesizer(version).synthesize(
-                block.intent, block.payload, **kwargs
-            )
-        except (A2uiError, ValueError, httpx.HTTPError) as exc:
-            logger.warning("Decision render failed: %s", exc)
+        if output is None:
             return RenderResult(
-                metrics=self._decision_metrics(None, started), error=str(exc)
+                metrics=self._decision_metrics(None, started, mode=mode),
+                error=error,
             )
         parts = [
             create_a2ui_part(message, version=version)
@@ -338,116 +387,64 @@ class Renderers:
         ]
         return RenderResult(
             parts=parts,
-            metrics=self._decision_metrics(output, started),
+            metrics=self._decision_metrics(output, started, mode=mode),
             trace_lines=trace_lines(output),
             decision_answers=output.decision_answers,
             output=output,
             error=None if parts else "The decision model produced no surface.",
+        )
+
+    async def render_decision(
+        self,
+        block: DecisionBlock,
+        *,
+        surface_id: str,
+        version: str,
+        conversation_id: str | None = None,
+        mode: RenderMode = RenderMode.DECISION,
+    ) -> RenderResult:
+        """Compiles `block` with the decision synthesizer; no model call."""
+        started = time.perf_counter()
+        try:
+            output = await self._synthesize(
+                block,
+                surface_id=surface_id,
+                version=version,
+                conversation_id=conversation_id,
+            )
+        except _DECISION_ERRORS as exc:
+            logger.warning("Decision render failed: %s", exc)
+            return self._decision_result(
+                block, started, mode, output=None, version=version, error=str(exc)
+            )
+        return self._decision_result(
+            block, started, mode, output=output, version=version
         )
 
     async def render_tool_result(
         self,
         intent: str,
-        payload: dict[str, Any],
+        payload: Any,
         *,
         surface_id: str,
-        version: str = "1.0",
+        version: str = DECISION_VERSION,
         mutable_paths: Sequence[str] = (),
+        actions: Sequence[ActionSpec] = (),
+        conversation_id: str | None = None,
     ) -> RenderResult:
         """Renders tool data directly via decision synthesizer with no UI-writing model call."""
-        started = time.perf_counter()
-        try:
-            output = await self._synthesizer(version).synthesize(
-                intent,
-                payload,
-                surface_id=surface_id,
-                mutable_paths=mutable_paths,
-            )
-        except (A2uiError, ValueError, httpx.HTTPError) as exc:
-            logger.warning("Tool render failed: %s", exc)
-            return RenderResult(
-                metrics=self._decision_metrics(None, started, mode=RenderMode.TOOL),
-                error=str(exc),
-            )
-        parts = [
-            create_a2ui_part(message, version=version)
-            for message in to_message_dicts(output.messages)
-        ]
-        return RenderResult(
-            parts=parts,
-            metrics=self._decision_metrics(output, started, mode=RenderMode.TOOL),
-            trace_lines=trace_lines(output),
-            decision_answers=output.decision_answers,
-            output=output,
-            error=None if parts else "The decision model produced no surface.",
+        block = DecisionBlock(
+            intent=intent,
+            payload=payload,
+            mutable_paths=tuple(mutable_paths),
+            actions=tuple(actions),
         )
-
-    async def remix(
-        self,
-        intent: str,
-        payload: Mapping[str, Any] | Sequence[Any] | str,
-        answers: Sequence[Any],
-        *,
-        surface_id: str,
-        version: str = "1.0",
-        mutable_paths: Sequence[str] = (),
-        title: str | None = None,
-        summary: str | None = None,
-        seed: int | None = None,
-    ) -> RenderResult:
-        """Re-plans a previous decision surface using variety sampling with 0 backend calls."""
-        started = time.perf_counter()
-        try:
-            output = await self._synthesizer(version).remix(
-                intent,
-                payload,
-                answers,
-                surface_id=surface_id,
-                mutable_paths=mutable_paths,
-                title=title,
-                summary=summary,
-                seed=seed,
-            )
-        except (A2uiError, ValueError, httpx.HTTPError) as exc:
-            logger.warning("Remix failed: %s", exc)
-            return RenderResult(
-                metrics=TurnMetrics(
-                    mode=RenderMode.DECISION,
-                    backend="remix",
-                    llm_calls=0,
-                    decision_calls=0,
-                    decision_latency_ms=0.0,
-                    latency_ms=(time.perf_counter() - started) * 1000.0,
-                    remix_seed=seed,
-                ),
-                error=str(exc),
-            )
-        parts = [
-            create_a2ui_part(message, version=version)
-            for message in to_message_dicts(output.messages)
-        ]
-        metrics = TurnMetrics(
-            mode=RenderMode.DECISION,
-            backend="remix",
-            llm_calls=0,
-            decision_calls=0,
-            decision_latency_ms=0.0,
-            latency_ms=(time.perf_counter() - started) * 1000.0,
-            archetype=output.layout_plan.archetype if output.layout_plan else None,
-            block_count=(
-                len(output.layout_plan.blocks) if output.layout_plan else None
-            ),
-            confidence=output.confidence,
-            stage=output.stage.value,
-            remix_seed=seed,
-        )
-        return RenderResult(
-            parts=parts,
-            metrics=metrics,
-            trace_lines=trace_lines(output),
-            decision_answers=output.decision_answers,
-            output=output,
-            error=None if parts else "Remix produced no surface.",
+        return await self.render_decision(
+            block,
+            surface_id=surface_id,
+            version=version,
+            conversation_id=conversation_id,
+            mode=RenderMode.TOOL,
         )
 
     def _decision_metrics(
@@ -457,36 +454,32 @@ class Renderers:
         mode: RenderMode = RenderMode.DECISION,
     ) -> TurnMetrics:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        plan = output.layout_plan if output is not None else None
-        tree = output.component_tree_spec if output is not None else None
-        root_comp = (
-            str(tree["root_component"])
-            if isinstance(tree, dict) and tree.get("root_component")
-            else None
-        )
-        decision_ms = (
-            output.decision_latency_ms
-            if output is not None and output.decision_latency_ms > 0.0
-            else elapsed_ms
-        )
+        if output is None:
+            return TurnMetrics(
+                mode=mode,
+                backend=self._raw_backend.backend_kind,
+                model_id=self._raw_backend.model_id,
+                llm_calls=0,
+                latency_ms=elapsed_ms,
+                decision_latency_ms=elapsed_ms,
+            )
+        plan = output.layout_plan
         return TurnMetrics(
             mode=mode,
-            backend=self.backend_name,
+            backend=output.backend_kind or self._raw_backend.backend_kind,
+            model_id=output.model_id or None,
             llm_calls=0,
             latency_ms=elapsed_ms,
-            archetype=plan.archetype if plan is not None else None,
-            confidence=output.confidence if output is not None else None,
+            archetype=plan.archetype if plan is not None and plan.archetype else None,
+            confidence=output.confidence,
             block_count=len(plan.blocks) if plan is not None else None,
-            fallback=(
-                str(output.fallback_source)
-                if output is not None and output.fallback_source is not None
-                else None
-            ),
-            stage=output.stage.value if output is not None else None,
-            decision_latency_ms=decision_ms,
-            decision_calls=output.decision_calls if output is not None else None,
-            template_id=(output.selected_template_id if output is not None else None),
-            root_component=root_comp,
+            fallback=str(output.fallback_source) if output.fallback_source else None,
+            fallback_reason=output.fallback_reason,
+            stage=output.stage.value,
+            decision_latency_ms=output.decision_latency_ms or elapsed_ms,
+            decision_calls=output.decision_calls,
+            template_id=output.selected_template_id,
+            operation=str(output.operation),
         )
 
     async def _call_and_parse(

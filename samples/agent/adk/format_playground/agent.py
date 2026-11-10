@@ -20,7 +20,6 @@ from collections import OrderedDict
 from collections.abc import AsyncIterable, Sequence
 import logging
 import os
-import random
 import time
 from typing import Any
 import uuid
@@ -54,6 +53,7 @@ from modes import (
     TurnMetrics,
     as_mode,
     format_decision_ms,
+    status_surface_id,
     surface_id_for,
 )
 from ratings import (
@@ -69,7 +69,7 @@ from stage1 import (
     stage1_instruction,
     stage1_user_text,
 )
-from tools import TOOL_INTENTS, TOOL_MUTABLE_PATHS, TOOLS
+from tools import TOOL_ACTIONS, TOOL_INTENTS, TOOL_MUTABLE_PATHS, TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -270,17 +270,6 @@ class PlaygroundAgent:
         self._last_turn: OrderedDict[
             str, tuple[str, list[tuple[RenderMode, RenderResult, TurnMetrics]]]
         ] = OrderedDict()
-        self._last_decision_context: OrderedDict[
-            str,
-            tuple[
-                str,
-                Any,
-                tuple[Any, ...],
-                Sequence[str],
-                str | None,
-                str | None,
-            ],
-        ] = OrderedDict()
         self.agent_card = self._build_agent_card()
 
     def _build_agent_card(self) -> AgentCard:
@@ -290,7 +279,7 @@ class PlaygroundAgent:
                 supported_catalog_ids=[
                     c.catalog_id
                     for c in self.renderers.processor(
-                        RenderMode.DECISION, version
+                        RenderMode.EXPRESS, version
                     ).active_catalogs
                 ],
             )
@@ -345,7 +334,7 @@ class PlaygroundAgent:
     ) -> list[Part]:
         return self.renderers.status_surface(
             lines,
-            surface_id=f"{surface_id_for(settings)}-{suffix}",
+            surface_id=status_surface_id(settings, suffix),
             version=version,
         )
 
@@ -407,10 +396,6 @@ class PlaygroundAgent:
             lines = self._rate_turn(session_id, command.argument, command.text)
         elif command.name == "ratings":
             lines = self._show_ratings()
-        elif command.name == "remix":
-            return await self._remix_turn(
-                session_id, command.argument, new_settings, version
-            )
         else:
             lines = [reply or ""]
         return self._status(lines, new_settings, version)
@@ -419,8 +404,8 @@ class PlaygroundAgent:
         if not argument:
             choices = ", ".join(DECISION_BACKENDS)
             return [
-                f"Active decision backend: `{self.renderers.backend_name}`"
-                f" (choose {choices})."
+                f"`/backend` needs a backend name: choose {choices}.",
+                f"Active decision backend: `{self.renderers.backend_name}`.",
             ]
         try:
             backend = build_named_backend(argument)
@@ -468,26 +453,13 @@ class PlaygroundAgent:
         results: list[tuple[RenderMode, RenderResult]] = []
         turn_candidates: list[tuple[RenderMode, RenderResult, TurnMetrics]] = []
         for mode in modes:
-            result = await self._render_mode(mode, block, settings, version)
+            result = await self._render_mode(mode, block, settings, version, session_id)
             results.append((mode, result))
             parts.extend(result.parts)
             parts.extend(self._footer_parts(mode, result, stage1, settings, version))
             if mode is RenderMode.DECISION:
                 if result.trace_lines:
                     self._remember(self._last_trace, session_id, result.trace_lines)
-                if result.decision_answers:
-                    self._remember(
-                        self._last_decision_context,
-                        session_id,
-                        (
-                            block.intent,
-                            block.payload,
-                            result.decision_answers,
-                            block.mutable_paths,
-                            block.title,
-                            block.summary,
-                        ),
-                    )
             cand_metrics = (
                 result.metrics
                 or TurnMetrics(mode=mode, backend="llm", llm_calls=0, latency_ms=0.0)
@@ -567,6 +539,8 @@ class PlaygroundAgent:
             surface_id=surface_id,
             version=version,
             mutable_paths=mutable_paths,
+            actions=TOOL_ACTIONS.get(tool_turn.tool_name, ()),
+            conversation_id=session_id,
         )
 
         stage1_equivalent = LlmTurn(
@@ -577,7 +551,7 @@ class PlaygroundAgent:
         )
         base_metrics = result.metrics or TurnMetrics(
             mode=RenderMode.TOOL,
-            backend=self.renderers.backend_name,
+            backend=self.renderers.backend_kind,
             llm_calls=0,
             latency_ms=0.0,
         )
@@ -593,19 +567,6 @@ class PlaygroundAgent:
 
         if result.trace_lines:
             self._remember(self._last_trace, session_id, result.trace_lines)
-        if result.decision_answers:
-            self._remember(
-                self._last_decision_context,
-                session_id,
-                (
-                    intent,
-                    tool_result,
-                    result.decision_answers,
-                    mutable_paths,
-                    None,
-                    None,
-                ),
-            )
 
         self._remember(
             self._last_turn,
@@ -616,90 +577,6 @@ class PlaygroundAgent:
             self._settings,
             session_id,
             settings.__class__(mode=settings.mode, turn=settings.turn),
-        )
-        return parts
-
-    async def _remix_turn(
-        self,
-        session_id: str,
-        argument: str | None,
-        settings: PlaygroundSettings,
-        version: str,
-    ) -> list[Part]:
-        context = self._last_decision_context.get(session_id)
-        if not context:
-            return self._status(
-                [
-                    "No previous decision render to remix. Render something"
-                    " in `decision` or `tool` mode first."
-                ],
-                settings,
-                version,
-            )
-        seed: int | None = None
-        if argument:
-            try:
-                seed = int(argument)
-            except ValueError:
-                return self._status(
-                    [
-                        f"Invalid seed `{argument}`; provide an integer (e.g."
-                        " `/remix 42`)."
-                    ],
-                    settings,
-                    version,
-                )
-        else:
-            seed = random.randint(1, 1000000)
-
-        intent, payload, answers, mutable_paths, title, summary = context
-        surface_id = surface_id_for(settings, RenderMode.DECISION)
-        result = await self.renderers.remix(
-            intent,
-            payload,
-            answers,
-            surface_id=surface_id,
-            version=version,
-            mutable_paths=mutable_paths,
-            title=title,
-            summary=summary,
-            seed=seed,
-        )
-        if not result.ok:
-            return self._status([f"Remix failed: {result.error}"], settings, version)
-
-        parts = list(result.parts)
-        metrics = result.metrics or TurnMetrics(
-            mode=RenderMode.DECISION,
-            backend="remix",
-            llm_calls=0,
-            latency_ms=0.0,
-            remix_seed=seed,
-        )
-        footer_lines = [metrics.footer()]
-        parts.extend(
-            self._status(footer_lines, settings, version, suffix="remix-footer")
-        )
-
-        if result.trace_lines:
-            self._remember(self._last_trace, session_id, result.trace_lines)
-        if result.decision_answers:
-            self._remember(
-                self._last_decision_context,
-                session_id,
-                (
-                    intent,
-                    payload,
-                    result.decision_answers,
-                    mutable_paths,
-                    title,
-                    summary,
-                ),
-            )
-        self._remember(
-            self._last_turn,
-            session_id,
-            (f"/remix {seed}", [(RenderMode.DECISION, result, metrics)]),
         )
         return parts
 
@@ -771,12 +648,19 @@ class PlaygroundAgent:
         block: DecisionBlock,
         settings: PlaygroundSettings,
         version: str,
+        session_id: str,
     ) -> RenderResult:
         surface_id = surface_id_for(settings, mode)
+        # Compare turns render fresh per-turn surfaces, so they skip the
+        # conversation's surface state.
+        conversation_id = None if settings.compare else session_id
         try:
             if mode is RenderMode.DECISION:
                 return await self.renderers.render_decision(
-                    block, surface_id=surface_id, version=version
+                    block,
+                    surface_id=surface_id,
+                    version=version,
+                    conversation_id=conversation_id,
                 )
             if mode is RenderMode.TOOL:
                 return await self.renderers.render_tool_result(
@@ -785,6 +669,8 @@ class PlaygroundAgent:
                     surface_id=surface_id,
                     version=version,
                     mutable_paths=block.mutable_paths,
+                    actions=block.actions,
+                    conversation_id=conversation_id,
                 )
             return await self.renderers.render_with_llm(
                 mode, block, surface_id=surface_id, version=version, llm=self.llm

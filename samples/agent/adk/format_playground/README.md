@@ -6,7 +6,7 @@ In chat mode, the agent works in two stages. Stage 1 is a single model call that
 
 In `tool` mode, the language model is provided domain tools (`get_host_health`, `get_resort`, `get_transfer_quote`, `get_playback_settings`). The tool output is passed directly to the decision synthesizer without asking the language model to write UI code.
 
-Every turn ends with a footer card naming the mode, the backend, the number of model calls, the latency, token counts, and archetype or path details.
+Every turn ends with a footer card naming the mode, the decision backend and its model id, the number of model calls, the latency, token counts, and archetype or path details, including why a fallback ran.
 
 ## Prerequisites
 
@@ -64,10 +64,14 @@ yarn dev
 
 Open `http://localhost:<port>/?app=playground` with the port Vite prints.
 
-Two things about this client are worth knowing. It renders A2UI surfaces only
-and clears them before each reply, so the agent's text replies (`/help`, the
-footer, `/trace`) arrive as small cards, and earlier turns do not stay on
-screen. And if you paste a message that is a bare JSON object, the shell sends
+Three things about this client are worth knowing. It renders A2UI surfaces
+only, so the agent's text replies (`/help`, the footer, `/trace`) arrive as
+small cards. The playground config sets `clearSurfacesOnResponse: false`, so
+surfaces stay on screen: `decision` and `tool` renders reuse one `main`
+surface and update it in place from turn to turn (or recreate it when a block
+sets `replace`), while `express`, `direct`, and `/compare` renders get a new
+surface per turn. The `decision` and `tool` modes need a client that speaks
+A2UI v1.0. And if you paste a message that is a bare JSON object, the shell sends
 it as data rather than text; the agent uses it verbatim as the payload, which is
 the quickest way to try your own data shapes.
 
@@ -76,30 +80,33 @@ the quickest way to try your own data shapes.
 | Command                                             | Effect                                                                                 |
 | :-------------------------------------------------- | :------------------------------------------------------------------------------------- |
 | `/mode decision` \| `express` \| `direct` \| `tool` | Picks how the next requests render.                                                    |
-| `/backend jev` \| `gev` \| `mock`                   | Switches the active decision model backend at runtime.                                 |
+| `/backend jev` \| `gev` \| `mock`                   | Switches the active decision model backend at runtime; a backend name is required.     |
 | `/compare`                                          | Renders the next request through all three chat modes from the same data.              |
 | `/trace`                                            | Shows the planner's questions, answers, and thresholds for the last `decision` render. |
 | `/rate <mode> [comment]`                            | Records a preference vote for the last rendered turn.                                  |
 | `/ratings`                                          | Summarizes recorded mode preference win counts from the ratings log.                   |
-| `/remix [seed]`                                     | Re-samples the last decision layout with 0 model calls and 0 decision backend queries. |
 | `/help`                                             | Shows the active settings and these commands.                                          |
 
 Anything else is a render request. A message that contains a JSON object or
-array uses it verbatim as the payload. Pressing a button on a rendered surface
-sends the action back to stage 1 as text, so forms round-trip.
+array uses it verbatim as the payload. Buttons come from the block's `actions`
+map, so pressing one sends its action id, its surface, and the values it
+bound (form fields, an item's id) back to stage 1, and forms round-trip.
 
 ## What the footer tells you
 
 ```text
-decision · mock · 1 LLM call · 1.8 s · 412 in / 96 out tokens · archetype detail (0.82) · 4 blocks
+decision · jev (jev-v0) · 1 LLM call · decision 412 ms (total 1.8 s) · 412 in / 96 out tokens · surface update_root · path: decision model · archetype detail (0.82) · 4 blocks
 express · llm · 2 LLM calls · 4.1 s · 5,210 in / 318 out tokens
 direct · llm · 2 LLM calls · 5.6 s · 12,044 in / 890 out tokens
 ```
 
 The `decision` row counts only the stage-1 call; the other two add the format's
 own call. When stage 2 had to retry an invalid reply the footer says
-`fallback: validation_retry`; when the decision planner abstained and rendered
-the fallback card it says `abstained -> card`.
+`fallback: validation_retry`. When the decision model abstained, the path names
+the fallback that rendered the surface and the reason, for example
+`path: fallback (fallback_facts) · decision model abstained: no_family`.
+`surface update_root` or `surface replace` appears when a turn updated an
+existing surface instead of creating one.
 
 ## Disclaimer
 

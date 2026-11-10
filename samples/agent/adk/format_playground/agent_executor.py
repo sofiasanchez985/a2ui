@@ -69,12 +69,20 @@ def classify_data_part(data: Any) -> tuple[DataPartKind, Any]:
 
 
 def action_query(action: Mapping[str, Any]) -> str:
-    """The stage-1 text for a UI action."""
-    name = action.get("name", "unknown")
+    """The stage-1 text for a UI action, routed by its action id.
+
+    The event name is the action id the decision block declared, and its
+    context carries the values the action bound (form fields, the item id).
+    The surface id lets stage 1 update the same surface.
+    """
+    action_id = action.get("name", "unknown")
     context = action.get("context", {})
+    surface_id = action.get("surfaceId")
+    on_surface = f" on surface `{surface_id}`" if surface_id else ""
     return (
-        f"{UI_ACTION_PREFIX} action `{name}` with context {json.dumps(context)}."
-        " Reply with an updated interface or a confirmation."
+        f"{UI_ACTION_PREFIX} action `{action_id}`{on_surface} with context"
+        f" {json.dumps(context, ensure_ascii=False)}. Reply with an updated"
+        " interface for the same surface or a confirmation."
     )
 
 

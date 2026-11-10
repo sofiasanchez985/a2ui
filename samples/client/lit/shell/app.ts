@@ -817,10 +817,14 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
 
     this._lastMessages = messages;
 
-    // this._processor.clearSurfaces();
-    // Why? Shouldn't `deleteSurface` be sent from the agent to the client?
-    for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
-      this._processor.model.deleteSurface(surfaceId);
+    // Most demo agents send a fresh surface every turn, so the shell clears
+    // the old ones first. Agents that update surfaces across turns (by
+    // reusing a surface id or sending `deleteSurface` themselves) opt out
+    // with `clearSurfacesOnResponse: false`.
+    if (this.config.clearSurfacesOnResponse ?? true) {
+      for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
+        this._processor.model.deleteSurface(surfaceId);
+      }
     }
 
     this._processor.processMessages(messages);

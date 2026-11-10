@@ -95,9 +95,9 @@ def test_backend_display_name_maps_bundled_backends(
     assert backend_display_name(DeterministicMockBackend()) == "mock"
     assert (
         backend_display_name(
-            JevHttpBackend("https://api.typesafe.ai/v1/systemone", model="jev-latest")
+            JevHttpBackend("https://api.typesafe.ai/v1/systemone", model="jev-v0")
         )
-        == "jev (jev-latest)"
+        == "jev (jev-v0)"
     )
     assert (
         backend_display_name(
@@ -111,7 +111,7 @@ def test_backend_display_name_maps_bundled_backends(
 
     monkeypatch.setenv("JEV_API_KEY", "vcp_test_key")
     jev_b = build_named_backend("jev")
-    assert backend_display_name(jev_b) == "jev (jev)"
+    assert backend_display_name(jev_b) == "jev"
     gev_b = build_named_backend("gev")
     assert backend_display_name(gev_b) == "gev (vertex/decision-gemma)"
 
@@ -121,7 +121,16 @@ def test_backend_display_name_maps_bundled_backends(
     assert backend_display_name(Custom()) == "Custom"  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("version", ["0.9", "1.0"])
+@pytest.mark.asyncio
+async def test_render_decision_rejects_v09_clients(renderers: Renderers) -> None:
+    result = await renderers.render_decision(
+        RESORT_BLOCK, surface_id="turn-1", version="0.9"
+    )
+    assert not result.ok
+    assert result.error is not None and "v1.0 only" in result.error
+
+
+@pytest.mark.parametrize("version", ["1.0"])
 @pytest.mark.asyncio
 async def test_render_decision_produces_a_surface_without_llm_calls(
     renderers: Renderers, version: str
@@ -277,8 +286,10 @@ async def test_render_decision_login_form_forwards_mutable_paths() -> None:
             "gate:actions": {"yes": 0.95, "no": 0.05},
         }
     )
-    form_renderers = Renderers(versions=["0.9"], backend=backend)
-    for mutable_paths in (["/email", "/password", "/rememberMe"], []):
+    form_renderers = Renderers(versions=["1.0"], backend=backend)
+    # Only blocks that list their editable pointers get a form; nothing is
+    # promoted to mutable behind the block's back.
+    for mutable_paths in (["/email", "/password", "/rememberMe"],):
         login_block = DecisionBlock.from_mapping({
             "intent": "Render a login form with email, password, and sign in button",
             "payload": {
@@ -286,15 +297,15 @@ async def test_render_decision_login_form_forwards_mutable_paths() -> None:
                 "email": "alex.smith@example.com",
                 "password": "",
                 "rememberMe": False,
-                "actions": ["Sign In"],
             },
+            "actions": {"sign_in": "Sign In"},
             "mutablePaths": mutable_paths,
         })
         res = await form_renderers.render_decision(
-            login_block, surface_id="turn-login", version="0.9"
+            login_block, surface_id="turn-login", version="1.0"
         )
         assert res.ok, res.error
-        validate_payload([BasicCatalog("0.9")], messages_of(res.parts))
+        validate_payload([BasicCatalog("1.0")], messages_of(res.parts))
         assert res.metrics is not None
         assert res.metrics.archetype == "form"
         assert res.metrics.stage == "archetype"
@@ -306,6 +317,17 @@ async def test_render_decision_login_form_forwards_mutable_paths() -> None:
         assert "decision " in res.metrics.footer()
         assert res.trace_lines[0].startswith("**Path**: decision model · archetype")
         assert "**Decision time**:" in res.trace_lines[0]
+
+    read_only = await form_renderers.render_decision(
+        DecisionBlock.from_mapping({
+            "intent": "Render a login form",
+            "payload": {"title": "Welcome Back", "email": "alex.smith@example.com"},
+        }),
+        surface_id="turn-login-ro",
+        version="1.0",
+    )
+    assert read_only.ok, read_only.error
+    assert read_only.metrics is not None and read_only.metrics.archetype != "form"
 
 
 @pytest.mark.asyncio

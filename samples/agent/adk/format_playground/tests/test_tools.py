@@ -27,6 +27,7 @@ from a2ui.inference_formats.decision import (
     SynthesisStage,
 )
 from tools import (
+    TOOL_ACTIONS,
     TOOL_INTENTS,
     TOOL_MUTABLE_PATHS,
     TOOLS,
@@ -50,6 +51,7 @@ def test_all_tools_have_intents_and_mutable_paths() -> None:
         name = getattr(tool, "__name__", "")
         assert name in TOOL_INTENTS
         assert name in TOOL_MUTABLE_PATHS
+        assert name in TOOL_ACTIONS
         assert TOOL_INTENTS[name]
 
 
@@ -88,7 +90,11 @@ async def test_tool_result_synthesizes_to_archetype(tool_fn, kwargs, answers) ->
     mutable_paths = TOOL_MUTABLE_PATHS[name]
 
     output = await synthesizer.synthesize(
-        intent, result, surface_id="test", mutable_paths=mutable_paths
+        intent,
+        result,
+        surface_id="test",
+        mutable_paths=mutable_paths,
+        actions=TOOL_ACTIONS[name],
     )
     assert output.stage is SynthesisStage.ARCHETYPE
     assert output.messages

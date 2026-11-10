@@ -36,4 +36,10 @@ export interface AppConfig {
   serverUrl?: string;
   /** Custom CSSStyleSheet overrides for components */
   cssOverrides?: CSSStyleSheet;
+  /**
+   * Whether to delete every rendered surface before processing an agent
+   * response (default `true`). Set it to `false` for agents that keep
+   * surfaces across turns, so a reused surface id updates in place.
+   */
+  clearSurfacesOnResponse?: boolean;
 }
