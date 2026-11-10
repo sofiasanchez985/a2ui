@@ -150,6 +150,15 @@ jobs:
           # under specification/<version>/catalogs/ so that catalog $id URLs
           # (e.g. https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json)
           # keep resolving.
+          mkdir -p docs/public/specification/v0_9/catalogs/basic
+          cp catalogs/basic/v0_9/catalog.json docs/public/specification/v0_9/catalogs/basic/
+          cp -R catalogs/basic/v0_9/examples docs/public/specification/v0_9/catalogs/basic/
+          mkdir -p docs/public/specification/v0_9/catalogs/minimal
+          cp catalogs/minimal/v0_9/catalog.json docs/public/specification/v0_9/catalogs/minimal/
+          cp -R catalogs/minimal/v0_9/examples docs/public/specification/v0_9/catalogs/minimal/
+          mkdir -p docs/public/specification/v0_9_1/catalogs/basic
+          cp catalogs/basic/v0_9_1/catalog.json docs/public/specification/v0_9_1/catalogs/basic/
+          cp -R catalogs/basic/v0_9_1/examples docs/public/specification/v0_9_1/catalogs/basic/
           mkdir -p docs/public/specification/v1_0/catalogs/basic
           cp catalogs/basic/v1/catalog.json docs/public/specification/v1_0/catalogs/basic/
           cp -R catalogs/basic/v1/examples docs/public/specification/v1_0/catalogs/basic/

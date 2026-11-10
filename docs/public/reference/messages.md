@@ -793,7 +793,7 @@ Message ordering must satisfy the following requirements:
     Validate against:
 
     - **[server_to_client.json](../../../specification/v0_9_1/json/server_to_client.json)**: Message envelope schema.
-    - **[catalogs/basic/catalog.json](../../../specification/v0_9_1/catalogs/basic/catalog.json)**: Component schemas.
+    - **[catalogs/basic/catalog.json](../../../catalogs/basic/v0_9_1/catalog.json)**: Component schemas.
 
 ## Further Reading
 

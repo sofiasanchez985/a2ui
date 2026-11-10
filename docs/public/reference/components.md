@@ -10,7 +10,7 @@ This page showcases all A2UI components with examples and usage patterns.
 >
 > === "v0.9.1"
 >
->     [:material-code-json: Basic Catalog Definition (JSON Schema)](../../../specification/v0_9_1/catalogs/basic/catalog.json)
+>     [:material-code-json: Basic Catalog Definition (JSON Schema)](../../../catalogs/basic/v0_9_1/catalog.json)
 
 ---
 
@@ -563,7 +563,7 @@ yarn start gallery
 >
 > === "v0.9.1"
 >
->     [:material-code-json: Basic Catalog Definition (JSON Schema)](../../../specification/v0_9_1/catalogs/basic/catalog.json)
+>     [:material-code-json: Basic Catalog Definition (JSON Schema)](../../../catalogs/basic/v0_9_1/catalog.json)
 
 - **[Defining Your Own Catalog](../guides/defining-your-own-catalog.md)**: Build your own components
 - **[Theming Guide](../guides/theming.md)**: Style components to match your brand

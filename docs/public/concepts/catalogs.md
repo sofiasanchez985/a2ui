@@ -94,7 +94,7 @@ Whether you are building a simple prototype or a complex production application,
 
 ### The Basic Catalog
 
-To help developers get started quickly, the A2UI team maintains the Basic Catalog ([v1.0](../../../catalogs/basic/v1/catalog.json), [v0.9.1](../../../specification/v0_9_1/catalogs/basic/catalog.json)).
+To help developers get started quickly, the A2UI team maintains the Basic Catalog ([v1.0](../../../catalogs/basic/v1/catalog.json), [v0.9.1](../../../catalogs/basic/v0_9_1/catalog.json)).
 
 This is a pre-defined catalog file that contains a basic set of general-purpose components (Buttons, Inputs, Cards) and functions. It is not a special "type" of catalog; it is simply a version of a catalog that we have already written and have open source renderers for.
 
