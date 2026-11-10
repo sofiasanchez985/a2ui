@@ -465,6 +465,8 @@ class DecisionSynthesizer:
         fallback_dsl: str | None = None,
         operation: SurfaceOperation = SurfaceOperation.CREATE,
         surface_sends_data_model: bool = False,
+        labels: Mapping[str, str] | None = None,
+        region: str | None = None,
     ) -> SynthesisOutput:
         """Synthesizes validated A2UI messages for one decision block.
 
@@ -489,6 +491,10 @@ class DecisionSynthesizer:
             surface_sends_data_model: Whether the existing surface was created
                 with `sendDataModel`; read only for the `UPDATE_ROOT`
                 escalation rule.
+            labels: Display labels keyed by JSON Pointer, overriding the
+                humanized keys. Accepted but not yet applied.
+            region: Id of one planned block to re-plan on an existing surface.
+                Not implemented yet; must be None.
 
         Returns:
             The synthesis result, stamped with the backend's kind and model
@@ -499,7 +505,10 @@ class DecisionSynthesizer:
                 fails brief validation.
             TypeError: If the payload is neither an object nor an array.
             DecisionBackendError: If the backend times out or fails.
+            NotImplementedError: If `region` is set.
         """
+        if region is not None:
+            raise NotImplementedError("Region updates are not implemented yet.")
         request = _SurfaceRequest(
             surface_id=(
                 surface_id if surface_id is not None else self.config.default_surface_id
