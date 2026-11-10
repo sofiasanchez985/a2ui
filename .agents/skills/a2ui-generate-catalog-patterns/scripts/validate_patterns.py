@@ -230,7 +230,7 @@ def _format_failure_message(
         else f"component '{component_id}'"
     )
     return (
-        f"{file_label}: pattern '{pattern}', {comp_desc}, property '{prop}' —"
+        f"{file_label}: pattern '{pattern}', {comp_desc}, property '{prop}':"
         f" {rule} (see patterns_authoring_guide.md#{anchor})"
     )
 
