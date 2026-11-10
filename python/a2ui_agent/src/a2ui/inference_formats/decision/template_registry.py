@@ -27,7 +27,7 @@ from a2ui.core import A2uiValidationError
 from a2ui.core.schema import AgentToRendererMessage
 from a2ui.parser.messages import to_message_dicts, to_message_models
 
-from .models import SynthesisOutput
+from .models import LayoutPlan, SynthesisOutput
 
 
 def _normalize_wire_version(protocol_version: str) -> str:
@@ -190,6 +190,15 @@ def _parse_required_pointers(template_id: str, raw_pointers: Any) -> tuple[str, 
             )
         required_pointers.append(ptr)
     return tuple(required_pointers)
+
+
+def _plan_pointers(plan: LayoutPlan) -> tuple[str, ...]:
+    """Every absolute pointer a plan binds, in first-use order, without repeats."""
+    page = plan.page
+    found = [*page.title.pointers(), *page.subtitle.pointers(), *page.mark.pointers()]
+    for block in plan.blocks:
+        found.extend(block.bindings.pointers())
+    return tuple(dict.fromkeys(found))
 
 
 @dataclass(frozen=True)
@@ -406,6 +415,60 @@ class TemplateRegistry:
             protocol_version=envelopes.protocol_version or "v0.9",
             components=tuple(copy.deepcopy(dict(c)) for c in envelopes.components),
             required_pointers=validated_pointers,
+            is_mutable=is_mutable,
+        )
+        self.register(template)
+        return template
+
+    def promote_plan(
+        self,
+        template_id: str,
+        description: str,
+        plan: LayoutPlan,
+        components: Sequence[Mapping[str, Any]],
+        *,
+        surface_id: str = "main",
+        catalog_id: str | None = None,
+        protocol_version: str = "v1.0",
+        is_mutable: bool = False,
+    ) -> SurfaceTemplate:
+        """Promotes a cached layout plan and its components into a template.
+
+        The template requires every pointer the plan binds, so it matches only
+        payloads that can fill the same slots. A reviewer can then edit the
+        template file instead of relying on the model to plan the surface again.
+
+        Args:
+            template_id: Id for the new template.
+            description: What the template shows; used by the template question.
+            plan: The plan that produced `components`.
+            components: The A2UI components the plan expanded to.
+            surface_id: Default surface id for rendering the template.
+            catalog_id: Catalog the components belong to.
+            protocol_version: A2UI protocol version of the components.
+            is_mutable: Whether the template's data is user-editable.
+
+        Returns:
+            The registered template.
+
+        Raises:
+            A2uiValidationError: If the id, description, or components are
+                invalid.
+        """
+        if not isinstance(template_id, str) or not template_id.strip():
+            raise A2uiValidationError("Template ID must be a non-empty string.")
+        if not isinstance(description, str) or not description.strip():
+            raise A2uiValidationError(
+                f"Template '{template_id}' must define a non-empty 'description'."
+            )
+        template = SurfaceTemplate(
+            template_id=template_id,
+            description=description,
+            surface_id=surface_id,
+            catalog_id=catalog_id,
+            protocol_version=protocol_version,
+            components=tuple(copy.deepcopy(dict(c)) for c in components),
+            required_pointers=_plan_pointers(plan),
             is_mutable=is_mutable,
         )
         self.register(template)

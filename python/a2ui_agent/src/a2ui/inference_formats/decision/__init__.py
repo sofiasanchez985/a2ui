@@ -52,6 +52,7 @@ from .models import (
     LayoutPlan,
     PageBindings,
     PatternCapabilities,
+    PlanCacheKey,
     PlannedBlock,
     PlanOutcome,
     PlanReason,
@@ -65,6 +66,7 @@ from .models import (
     SynthesisOutput,
     SynthesisStage,
     coerce_decision_payload,
+    plan_shape_signature,
 )
 from .payload_inspector import (
     PointerSummary,
@@ -104,6 +106,7 @@ __all__ = [
     "LayoutPlan",
     "PageBindings",
     "PatternCapabilities",
+    "PlanCacheKey",
     "PlanOutcome",
     "PlanReason",
     "PlannedBlock",
@@ -126,4 +129,5 @@ __all__ = [
     "create_decision_backend",
     "humanize_key",
     "inspect_payload_pointers",
+    "plan_shape_signature",
 ]
