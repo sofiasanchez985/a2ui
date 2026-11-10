@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-import {Type} from '@angular/core';
-import {Catalog, ComponentApi, FunctionImplementation} from '@a2ui/web_core/v0_9';
+import {Injector, Type} from '@angular/core';
+import {Catalog, ComponentApi, ComponentContext, FunctionImplementation} from '@a2ui/web_core/v0_9';
 import {
   WebComponentImplementation,
   isWebComponentImplementation,
@@ -45,6 +45,20 @@ export interface AngularComponentImplementation extends ComponentApi {
    * that accepts `props`, `surfaceId`, and `dataContextPath` as inputs.
    */
   readonly component: Type<CatalogComponentInstance>;
+
+  /**
+   * Called once when a universal Web Component rendering this entry first connects to the DOM,
+   * with the element, its context, and the injector of the enclosing `ComponentHostComponent`.
+   *
+   * Lets hosts decorate elements they do not own (for example, to add analytics attributes)
+   * without subclassing them. Only universal elements trigger it, so it applies only when
+   * `RendererConfiguration.useUniversalComponents` is enabled.
+   */
+  readonly onElementConnected?: (
+    element: HTMLElement,
+    context: ComponentContext,
+    injector: Injector,
+  ) => void;
 }
 
 /**

@@ -27,6 +27,7 @@ export const BOUNDARY_RESTRICTED = {
 
 export const BOUNDARY_ALLOWLIST = [
   'src/catalog/angular_wc_host.ts',
+  'src/catalog/types.ts',
   'src/core/component-binder.service.ts',
   'src/core/component-host.component.ts',
   'src/v0_9/catalog/basic/button.component.ts',
