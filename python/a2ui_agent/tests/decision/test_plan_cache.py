@@ -30,7 +30,7 @@ from a2ui.inference_formats.decision import (
     DecisionFormat,
     DecisionSynthesizer,
     LayoutPlan,
-    MergedPatternLibrary,
+    PlanCache,
     PlanCacheKey,
     SurfaceOperation,
 )
@@ -262,11 +262,7 @@ async def test_hit_is_rejected_when_surface_components_changed() -> None:
 @pytest.mark.asyncio
 async def test_lru_bound_evicts_oldest_entry_per_state() -> None:
     backend = mock_backend(**HOST_SCRIPTED)
-    default_synth = DecisionSynthesizer([CATALOG], backend)
-    plan_cache_cls = type(default_synth.plan_cache)
-    synth = DecisionSynthesizer(
-        [CATALOG], backend, plan_cache=plan_cache_cls(max_entries=2)
-    )
+    synth = DecisionSynthesizer([CATALOG], backend, plan_cache=PlanCache(max_entries=2))
     state = RendererState([CATALOG])
 
     for sid in ("s1", "s2", "s3"):

@@ -45,7 +45,6 @@ from .models import (
     AuthoredCopy,
     DecisionAnswer,
     DecisionBatch,
-    DecisionDistribution,
     DecisionQuestion,
     DecisionRecord,
     FallbackSource,
@@ -55,7 +54,6 @@ from .models import (
     PlanCacheKey,
     PlannedBlock,
     PlanOutcome,
-    PlanReason,
     QuestionKind,
     SlotBinding,
     SlotKind,
@@ -329,24 +327,6 @@ def _without_excluded(
     )
 
 
-def _find_block(plan: LayoutPlan | None, block_id: str) -> PlannedBlock | None:
-    if plan is None:
-        return None
-    for block in plan.blocks:
-        if block.block_id == block_id:
-            return block
-    return None
-
-
-def _claimed_by_other_blocks(plan: LayoutPlan, block_id: str) -> set[str]:
-    return {
-        ptr
-        for block in plan.blocks
-        if block.block_id != block_id
-        for ptr in block.bindings.pointers()
-    }
-
-
 def _with_labels(
     pointers: Sequence[PointerSummary], labels: Mapping[str, str] | None
 ) -> tuple[PointerSummary, ...]:
@@ -355,32 +335,6 @@ def _with_labels(
         return tuple(pointers)
     return tuple(
         replace(p, label=labels[p.path]) if p.path in labels else p for p in pointers
-    )
-
-
-def _pinned_plan_answer(
-    question: DecisionQuestion, plan: LayoutPlan, block_id: str
-) -> DecisionAnswer:
-    """Builds a synthetic `DecisionAnswer` pinning `plan`'s non-target choices."""
-    cands = question.candidates()
-    probs = {c: 0.0 for c in cands}
-    active_ids = set(plan.block_ids()) | {block_id}
-    if question.id == "family" and plan.family in probs:
-        probs[plan.family] = 1.0
-    elif question.id == f"archetype:{plan.family}" and plan.archetype in probs:
-        probs[plan.archetype] = 1.0
-    elif question.id.startswith("gate:"):
-        gated_id = question.id.split(":", 1)[1]
-        winner = "yes" if gated_id in active_ids else "no"
-        probs[winner if winner in probs else cands[0]] = 1.0
-    else:
-        fallback = "none" if "none" in probs else cands[0]
-        probs[fallback] = 1.0
-    expected = 1.0 if question.kind is QuestionKind.SCORE else None
-    return DecisionAnswer(
-        question_id=question.id,
-        distribution=DecisionDistribution(probabilities=probs),
-        expected=expected,
     )
 
 
@@ -996,94 +950,18 @@ class DecisionSynthesizer:
         request: _SurfaceRequest,
     ) -> tuple[PlannedBlock, tuple[DecisionRecord, ...], tuple[DecisionAnswer, ...]]:
         """Plans a single block via `planner.build_block_batch` and `read_block`."""
-        try:
-            batch, p_state = self._invoke_build_block_batch(
-                plan, block_id, pointers, intent=intent, data=data, request=request
-            )
-            answers = await self._backend_answer(batch)
-            block = self.planner.read_block(p_state, answers)
-            return block, tuple(p_state.trace), tuple(p_state.answers_by_id.values())
-        except NotImplementedError:
-            return await self._fallback_plan_region_block(
-                plan, block_id, intent, data, pointers, request
-            )
-
-    def _invoke_build_block_batch(
-        self,
-        plan: LayoutPlan,
-        block_id: str,
-        pointers: Sequence[PointerSummary],
-        *,
-        intent: str,
-        data: Mapping[str, Any],
-        request: _SurfaceRequest,
-    ) -> tuple[DecisionBatch, PlannerState]:
-        params = inspect.signature(self.planner.build_block_batch).parameters
-        optional: dict[str, Any] = {
-            "intent": intent,
-            "labels": request.labels or None,
-            "payload": data,
-            "actions": request.actions,
-            "brief": request.brief,
-        }
-        accepted = {k: v for k, v in optional.items() if k in params}
-        return self.planner.build_block_batch(plan, block_id, pointers, **accepted)
-
-    async def _fallback_plan_region_block(
-        self,
-        plan: LayoutPlan,
-        block_id: str,
-        intent: str,
-        data: Mapping[str, Any],
-        pointers: Sequence[PointerSummary],
-        request: _SurfaceRequest,
-    ) -> tuple[PlannedBlock, tuple[DecisionRecord, ...], tuple[DecisionAnswer, ...]]:
-        """Plans one block via `build_batch` and `read` when `build_block_batch` is a stub."""
-        arch = self.archetypes.archetype(plan.archetype)
-        full_batch, p_state = self.planner.build_batch(
-            intent,
+        batch, p_state = self.planner.build_block_batch(
+            plan,
+            block_id,
             pointers,
-            eligible=(arch,),
-            brief=request.brief,
-            payload=data,
-            copy=request.copy,
-            actions=request.actions,
-            labels=request.labels or None,
-        )
-        block_prefixes = (f"anatomy:{block_id}.", f"instance:{block_id}.", "salience:")
-        block_questions = tuple(
-            q
-            for q in full_batch.questions
-            if q.id == f"gate:{block_id}" or q.id.startswith(block_prefixes)
-        )
-        block_batch = DecisionBatch(
-            shared_context=full_batch.shared_context,
-            questions=block_questions,
-        )
-        block_answers = await self._backend_answer(block_batch)
-        by_id = {ans.question_id: ans for ans in block_answers}
-        full_answers = [
-            by_id[q.id] if q.id in by_id else _pinned_plan_answer(q, plan, block_id)
-            for q in full_batch.questions
-        ]
-        outcome = self.planner.read(p_state, full_answers)
-        found = _find_block(outcome.plan, block_id)
-        if found is not None:
-            return found, tuple(p_state.trace), block_answers
-        spec = self.archetypes.block(block_id)
-        bindings = self.planner.bind_slots(
-            spec,
-            pointers,
-            _claimed_by_other_blocks(plan, block_id),
-            payload=data,
             intent=intent,
+            labels=request.labels or None,
+            payload=data,
             actions=request.actions,
         )
-        return (
-            PlannedBlock(block_id=block_id, pattern=spec.pattern, bindings=bindings),
-            tuple(p_state.trace),
-            block_answers,
-        )
+        answers = await self._backend_answer(batch)
+        block = self.planner.read_block(p_state, answers)
+        return block, tuple(p_state.trace), tuple(p_state.answers_by_id.values())
 
     async def _backend_answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
         """Calls `self.backend.answer` and records elapsed decision latency."""
@@ -1382,6 +1260,7 @@ class DecisionSynthesizer:
                 copy=request.copy,
                 templates=templates,
                 actions=request.actions,
+                labels=request.labels or None,
             )
             stage1_answers = await self._backend_answer(stage1_batch)
             stage2_batch = planner.build_stage2_batch(state, stage1_answers)
@@ -1403,29 +1282,7 @@ class DecisionSynthesizer:
                 labels=request.labels or None,
             )
             answers = await self._backend_answer(batch)
-        outcome = planner.read(state, answers)
-        return self._maybe_upgrade_no_fit(outcome, state), state
-
-    def _maybe_upgrade_no_fit(
-        self, outcome: PlanOutcome, state: PlannerState
-    ) -> PlanOutcome:
-        """Upgrades `NO_FAMILY` to `NO_FIT` when `none` won at or above `thresholds.noFit`."""
-        if outcome.reason is not PlanReason.NO_FAMILY:
-            return outcome
-        fam_ans = state.answers_by_id.get("family")
-        if fam_ans is None:
-            return outcome
-        chosen, prob = fam_ans.top()
-        no_fit_thresh = float(self.archetypes.thresholds.get("noFit", 0.5))
-        if chosen != "none" or prob < no_fit_thresh:
-            return outcome
-        if state.trace and state.trace[-1].question.id == "family":
-            state.trace[-1] = replace(
-                state.trace[-1], threshold=no_fit_thresh, outcome="no_fit"
-            )
-        return PlanOutcome(
-            plan=None, reason=PlanReason.NO_FIT, fit_score=outcome.fit_score
-        )
+        return planner.read(state, answers), state
 
     def _block_prefix_and_owner(
         self, block_id: str, pattern: str

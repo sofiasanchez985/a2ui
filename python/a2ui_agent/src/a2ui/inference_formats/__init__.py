@@ -30,6 +30,8 @@ from .decision import DecisionParser
 from .decision import DecisionPromptGenerator
 from .decision import DecisionRenderTool
 from .decision import DecisionSynthesizer
+from .decision import PlanCache
+from .decision import PlanCacheKey
 from .decision import SurfaceOperation
 from .decision import SynthesisConfig
 from .decision import SynthesisOutput
@@ -66,6 +68,8 @@ __all__ = [
     "DecisionPromptGenerator",
     "DecisionRenderTool",
     "DecisionSynthesizer",
+    "PlanCache",
+    "PlanCacheKey",
     "SurfaceOperation",
     "SynthesisConfig",
     "SynthesisOutput",
