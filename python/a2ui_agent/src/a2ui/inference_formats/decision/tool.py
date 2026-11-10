@@ -20,7 +20,7 @@ describe tools with a JSON Schema and call them with a dict of arguments.
 write the schema, decode stringified payloads, or bridge sync and async
 itself::
 
-    tool = DecisionRenderTool.create(catalogs)
+    tool = DecisionRenderTool.create(catalogs, backend=create_decision_backend())
     declaration = {"name": tool.name, "description": tool.description,
                    "parameters": tool.parameters_json_schema()}
     output = await tool.run_async(call_arguments)
@@ -29,7 +29,6 @@ itself::
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from typing import Any
 
 from a2ui.core import CatalogApi
@@ -41,7 +40,9 @@ from .catalog_graph import CatalogDecisionGraph
 from .decision_block import DecisionBlock
 from .models import (
     BRIEF_ITEM_PATTERN,
+    ActionStyle,
     MAX_BRIEF_SECTIONS,
+    SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
 )
@@ -55,6 +56,49 @@ _DEFAULT_DESCRIPTION = (
     " (intent) and the data to show (payload). A local decision model picks"
     " the components; do not describe components yourself."
 )
+
+
+_ACTIONS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Optional buttons, as a map from action id (the event name the agent"
+        " receives) to a label, or to an options object."
+    ),
+    "additionalProperties": {
+        "anyOf": [
+            {"type": "string"},
+            {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "description": (
+                            "JSON Pointer of a collection; the action repeats"
+                            " on each item."
+                        ),
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Item field that identifies the item.",
+                    },
+                    "context": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Event context: name to JSON Pointer.",
+                    },
+                    "style": {
+                        "type": "string",
+                        "enum": [s.value for s in ActionStyle],
+                    },
+                },
+                "required": ["label"],
+                "additionalProperties": False,
+            },
+        ]
+    },
+}
+"""JSON Schema of the `actions` map, matching `ActionSpec.from_block_value`."""
 
 
 class DecisionRenderTool:
@@ -98,12 +142,11 @@ class DecisionRenderTool:
         cls,
         catalogs: Sequence[CatalogApi] | CatalogDecisionGraph,
         *,
-        backend: DecisionBackend | None = None,
+        backend: DecisionBackend,
         config: SynthesisConfig | None = None,
         registry: TemplateRegistry | None = None,
         archetypes: ArchetypeGrammar | None = None,
         patterns: PatternLibrary | MergedPatternLibrary | None = None,
-        fallback_card: bool = True,
         fallback_fn: FallbackCallback | None = None,
         name: str = _DEFAULT_TOOL_NAME,
         description: str = _DEFAULT_DESCRIPTION,
@@ -112,19 +155,15 @@ class DecisionRenderTool:
     ) -> DecisionRenderTool:
         """Builds a tool and its synthesizer in one call.
 
-        `fallback_card` defaults to True: a tool call that renders nothing is
-        an error from the model's point of view, so an abstention renders a
-        deterministic card unless the call supplied `fallbackDsl`.
-
         Args:
             catalogs: The active catalogs, or a prebuilt `CatalogDecisionGraph`.
-            backend: Decision backend; defaults to `create_decision_backend()`.
+            backend: Decision backend. Required; build one with
+                `create_decision_backend()` to read the environment.
             config: Synthesis thresholds and limits.
-            registry: Surface templates offered through the `template` field.
+            registry: Surface templates the model may choose for matching payloads.
             archetypes: Layout archetype grammar.
             patterns: Catalog pattern library.
-            fallback_card: Render a deterministic card on abstention.
-            fallback_fn: Custom fallback tried before the card.
+            fallback_fn: Custom fallback called when the model abstains.
             name: Tool name advertised to the model.
             description: Tool description advertised to the model.
             surface_id: Surface used when a call names none; None defers to
@@ -138,7 +177,6 @@ class DecisionRenderTool:
             config=config,
             archetypes=archetypes,
             patterns=patterns,
-            fallback_card=fallback_card,
             fallback_fn=fallback_fn,
         )
         return cls(
@@ -155,15 +193,6 @@ class DecisionRenderTool:
         `payload` accepts an object, an array, or a JSON-encoded string of
         either, since models often stringify nested arguments.
         """
-        template_ids = [
-            t.template_id for t in self.synthesizer.registry.list_templates()
-        ]
-        template_schema: dict[str, Any] = {
-            "type": "string",
-            "description": "Id of a registered surface template to render directly.",
-        }
-        if template_ids:
-            template_schema["enum"] = template_ids
         return {
             "type": "object",
             "properties": {
@@ -191,7 +220,22 @@ class DecisionRenderTool:
                     "type": "string",
                     "description": "Surface to create or update.",
                 },
-                "template": template_schema,
+                "replace": {
+                    "type": "boolean",
+                    "description": (
+                        "Delete the surface and create it again instead of"
+                        " updating it in place. Defaults to false."
+                    ),
+                },
+                "actions": _ACTIONS_SCHEMA,
+                "exclude": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional JSON Pointers in `payload` the interface must"
+                        " not show, such as internal ids."
+                    ),
+                },
                 "fallbackDsl": {
                     "type": "string",
                     "description": (
@@ -241,7 +285,10 @@ class DecisionRenderTool:
         self, args: Mapping[str, Any]
     ) -> tuple[DecisionBlock, dict[str, Any]]:
         block = DecisionBlock.from_mapping(args)
-        return block, block.to_synthesis_kwargs(default_surface_id=self._surface_id)
+        kwargs = block.to_synthesis_kwargs(default_surface_id=self._surface_id)
+        if block.replace:
+            kwargs["operation"] = SurfaceOperation.REPLACE
+        return block, kwargs
 
     def format_result(
         self,
@@ -273,29 +320,6 @@ class DecisionRenderTool:
             ]
         return result
 
-    def _enrich_output(
-        self, output: SynthesisOutput, *, include_trace: bool
-    ) -> SynthesisOutput:
-        """Attaches `layoutPlan` and optional `trace` to `output.component_tree_spec`."""
-        if output.layout_plan is None and not include_trace:
-            return output
-        spec = dict(output.component_tree_spec or {})
-        if output.layout_plan is not None:
-            spec["layoutPlan"] = {
-                "archetype": output.layout_plan.archetype,
-                "blocks": list(output.layout_plan.block_ids()),
-            }
-        if include_trace:
-            spec["trace"] = [
-                {
-                    "questionId": r.question.id,
-                    "outcome": r.outcome,
-                    "threshold": r.threshold,
-                }
-                for r in output.trace
-            ]
-        return replace(output, component_tree_spec=spec)
-
     async def run_async(
         self, args: Mapping[str, Any], *, include_trace: bool | None = None
     ) -> SynthesisOutput:
@@ -304,28 +328,26 @@ class DecisionRenderTool:
         Args:
             args: The tool-call arguments, with the field names from
                 `parameters_json_schema` (snake_case spellings are accepted).
-            include_trace: When True, includes `trace` in `component_tree_spec`.
+            include_trace: Accepted for compatibility; the trace is always on
+                the returned output, and `format_result` decides whether to
+                serialize it.
 
         Raises:
             ValueError: If `intent` is missing, `payload` is an invalid JSON
-                string, `template` is unknown, or `layout` is invalid.
+                string or `layout` is invalid.
             TypeError: If `payload` is neither an object nor an array.
         """
+        del include_trace
         block, kwargs = self._synthesis_kwargs(args)
-        output = await self.synthesizer.synthesize(
-            block.intent, block.payload, **kwargs
-        )
-        with_trace = self.include_trace if include_trace is None else include_trace
-        return self._enrich_output(output, include_trace=with_trace)
+        return await self.synthesizer.synthesize(block.intent, block.payload, **kwargs)
 
     def run_sync(
         self, args: Mapping[str, Any], *, include_trace: bool | None = None
     ) -> SynthesisOutput:
         """Renders one tool call from synchronous code. See `run_async`."""
+        del include_trace
         block, kwargs = self._synthesis_kwargs(args)
-        output = self.synthesizer.synthesize_sync(block.intent, block.payload, **kwargs)
-        with_trace = self.include_trace if include_trace is None else include_trace
-        return self._enrich_output(output, include_trace=with_trace)
+        return self.synthesizer.synthesize_sync(block.intent, block.payload, **kwargs)
 
 
 __all__ = ["DecisionRenderTool"]

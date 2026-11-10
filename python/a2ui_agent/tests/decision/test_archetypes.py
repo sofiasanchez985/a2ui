@@ -79,14 +79,15 @@ def _raw_grammar() -> dict[str, Any]:
 def _minimal_grammar() -> dict[str, Any]:
     """The smallest grammar that passes schema validation and lint."""
     return {
-        "version": "1",
+        "grammarVersion": "1",
         "thresholds": {
             "family": 0.4,
             "archetype": 0.4,
             "expected": 0.5,
             "optional": 0.75,
             "instance": 0.5,
-            "reask_below": 0.75,
+            "template": 0.75,
+            "templateMutable": 0.85,
             "actionGateFloor": 0.7,
             "actionGateCap": 0.95,
         },
@@ -169,7 +170,9 @@ def test_default_grammar_round_trips_the_bundled_asset() -> None:
     assert len({a.family for a in grammar.archetypes}) == 6
     assert grammar.thresholds["actionGateFloor"] == pytest.approx(0.70)
     assert grammar.thresholds["actionGateCap"] == pytest.approx(0.95)
-    assert grammar.threshold("reask_below") == pytest.approx(0.75)
+    assert grammar.threshold("template") == pytest.approx(0.75)
+    assert grammar.threshold("templateMutable") == pytest.approx(0.85)
+    assert "reask_below" not in grammar.thresholds
     assert len(grammar.rules) == 11
     assert len(grammar.lint) == 5
 
@@ -461,14 +464,19 @@ def test_grammar_threshold_relations_are_linted() -> None:
     raw["thresholds"]["expected"] = 0.8
     with pytest.raises(GrammarError, match="expected must be <= optional"):
         ArchetypeGrammar.from_json(raw)
+    raw = _minimal_grammar()
+    raw["thresholds"]["template"] = 0.9
+    with pytest.raises(GrammarError, match="template must be <= templateMutable"):
+        ArchetypeGrammar.from_json(raw)
 
 
 def test_requirement_and_block_marks_are_enums_that_compare_to_wire_strings() -> None:
     from a2ui.inference_formats.decision.models import Requirement
 
     ref = BlockRef.parse("prose!")
+    req_obj: object = ref.requirement
     assert ref.requirement is Requirement.REQUIRED
-    assert ref.requirement == "required"
+    assert req_obj == "required"
     assert ref.mark == "prose!"
     assert {ref.requirement} == {"required"}
 

@@ -27,19 +27,21 @@ from typing import Any
 from a2ui.core.schema import AgentToRendererMessage
 from a2ui.parser.messages import to_message_dicts
 
-from .models import LayoutBrief, coerce_decision_payload
+from .models import ActionSpec, LayoutBrief, coerce_decision_payload
 
 # Wire field names, with the snake_case spellings also accepted on input.
 _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "intent": ("intent",),
     "payload": ("payload", "data"),
     "surface_id": ("surfaceId", "surface_id"),
-    "template_id": ("template", "templateId", "template_id"),
     "fallback_dsl": ("fallbackDsl", "fallback_dsl"),
     "layout": ("layout",),
     "mutable_paths": ("mutablePaths", "mutable_paths"),
     "title": ("title",),
     "summary": ("summary",),
+    "actions": ("actions",),
+    "exclude": ("exclude",),
+    "replace": ("replace",),
 }
 
 
@@ -93,6 +95,64 @@ def _parse_mutable_paths(raw: Any) -> tuple[str, ...]:
     return tuple(paths)
 
 
+def _parse_exclude(raw: Any) -> tuple[str, ...]:
+    """Validates an optional ``exclude`` sequence of ``/``-prefixed JSON pointers."""
+    if raw is None:
+        return ()
+    if (
+        not isinstance(raw, Sequence)
+        or isinstance(raw, (str, bytes, bytearray))
+        or not all(isinstance(item, str) for item in raw)
+    ):
+        raise TypeError(
+            "Decision block field 'exclude' must be a list of JSON pointer strings."
+        )
+    paths: list[str] = []
+    for item in raw:
+        stripped = item.strip()
+        if not stripped.startswith("/") or stripped == "/":
+            raise ValueError(
+                "Decision block field 'exclude' entries must be JSON Pointers"
+                f" starting with '/', got {item!r}."
+            )
+        paths.append(stripped)
+    return tuple(paths)
+
+
+def _parse_one_action(action_id: Any, value: Any) -> ActionSpec:
+    """Validates and parses one ``(action_id, value)`` entry of the ``actions`` map."""
+    if not isinstance(action_id, str):
+        raise TypeError(
+            "Decision block field 'actions' requires string action ids,"
+            f" got {type(action_id).__name__}."
+        )
+    if isinstance(value, Mapping) and value.get("key") is not None:
+        raw_key = value["key"]
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ValueError(f"Action {action_id!r}: key must be a non-empty string.")
+    return ActionSpec.from_block_value(action_id, value)
+
+
+def _parse_actions(raw: Any) -> tuple[ActionSpec, ...]:
+    """Reads the ``actions`` map (action id to label or options) in order."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "Decision block field 'actions' must be an object mapping action ids"
+            " to labels or option objects."
+        )
+    return tuple(_parse_one_action(k, v) for k, v in raw.items())
+
+
+def _parse_replace(raw: Any) -> bool:
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise TypeError("Decision block field 'replace' must be a boolean.")
+    return raw
+
+
 @dataclass(frozen=True)
 class DecisionBlock:
     """One decision request: what to show and the data to show it with.
@@ -102,38 +162,52 @@ class DecisionBlock:
         payload: The data to bind, as an object or array (a JSON string is
             decoded by `from_mapping`).
         surface_id: Target surface, or None for the synthesizer default.
-        template_id: A registered template to render directly, if any.
         fallback_dsl: A2UI Express rendered when the model abstains, if any.
         layout: Raw ``role:key,key`` brief items pinning roles to payload
             pointers; empty when the block gave none. The synthesizer parses
             and validates them against its grammar.
         mutable_paths: JSON Pointers in `payload` that the user may edit.
+        title: Optional authored surface title.
+        summary: Optional authored surface summary.
+        actions: The actions the surface offers, in the order the block
+            listed them.
+        exclude: JSON Pointers in `payload` the surface must not show.
+        replace: When True, the surface is deleted and created again instead
+            of updated in place.
     """
 
     intent: str
     payload: Mapping[str, Any] | Sequence[Any]
     surface_id: str | None = None
-    template_id: str | None = None
     fallback_dsl: str | None = None
     layout: tuple[str, ...] = ()
     mutable_paths: tuple[str, ...] = ()
     title: str | None = None
     summary: str | None = None
+    actions: tuple[ActionSpec, ...] = ()
+    exclude: tuple[str, ...] = ()
+    replace: bool = False
 
     @classmethod
     def from_mapping(cls, source: Mapping[str, Any]) -> DecisionBlock:
         """Reads a block from a parsed JSON object.
 
-        Accepts the camelCase wire names (`surfaceId`, `template`,
-        `fallbackDsl`, `layout`, `mutablePaths`, `title`, `summary`) and their
-        snake_case spellings.
+        Accepts the camelCase wire names (`surfaceId`, `fallbackDsl`,
+        `layout`, `mutablePaths`, `title`, `summary`, `actions`, `exclude`,
+        `replace`) and their snake_case spellings.
 
         Raises:
-            ValueError: If `intent` is missing or blank, or `payload` is a
-                string that is not valid JSON.
+            ValueError: If `intent` is missing or blank, `payload` is a
+                string that is not valid JSON, or an action or `exclude`
+                pointer is malformed.
             TypeError: If `payload` is missing or is neither an object nor an
                 array, or an optional field has the wrong type.
         """
+        if not isinstance(source, Mapping):
+            raise TypeError(
+                "Decision block must be a JSON object (Mapping),"
+                f" got {type(source).__name__}."
+            )
         intent = _first_present(source, _FIELD_ALIASES["intent"])
         if not isinstance(intent, str) or not intent.strip():
             raise ValueError("Decision block requires a non-empty string 'intent'.")
@@ -162,12 +236,14 @@ class DecisionBlock:
             intent=intent.strip(),
             payload=payload,
             surface_id=_optional_str("surface_id"),
-            template_id=_optional_str("template_id"),
             fallback_dsl=_optional_str("fallback_dsl"),
             layout=layout,
             mutable_paths=mutable_paths,
             title=_optional_str("title"),
             summary=_optional_str("summary"),
+            actions=_parse_actions(_first_present(source, _FIELD_ALIASES["actions"])),
+            exclude=_parse_exclude(_first_present(source, _FIELD_ALIASES["exclude"])),
+            replace=_parse_replace(_first_present(source, _FIELD_ALIASES["replace"])),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -175,8 +251,6 @@ class DecisionBlock:
         out: dict[str, Any] = {"intent": self.intent, "payload": self.payload}
         if self.surface_id is not None:
             out["surfaceId"] = self.surface_id
-        if self.template_id is not None:
-            out["template"] = self.template_id
         if self.fallback_dsl is not None:
             out["fallbackDsl"] = self.fallback_dsl
         if self.layout:
@@ -187,15 +261,28 @@ class DecisionBlock:
             out["title"] = self.title
         if self.summary is not None:
             out["summary"] = self.summary
+        if self.actions:
+            out["actions"] = {a.id: _action_to_json(a) for a in self.actions}
+        if self.exclude:
+            out["exclude"] = list(self.exclude)
+        if self.replace:
+            out["replace"] = True
         return out
 
     def to_synthesis_kwargs(
         self, *, default_surface_id: str | None = None
     ) -> dict[str, Any]:
-        """Builds keyword arguments for `DecisionSynthesizer.synthesize`."""
+        """Builds keyword arguments for `DecisionSynthesizer.synthesize`.
+
+        Keys: `actions`, `exclude`, `mutable_paths`, `fallback_dsl`, `layout`,
+        `title`, `summary`, and `surface_id` when one is known. `replace` is
+        not a synthesis argument: the caller turns it into the
+        `SurfaceOperation` it passes as `operation`.
+        """
         kwargs: dict[str, Any] = {
+            "actions": self.actions,
+            "exclude": self.exclude,
             "mutable_paths": self.mutable_paths,
-            "template_id": self.template_id,
             "fallback_dsl": self.fallback_dsl,
             "layout": self.layout or None,
             "title": self.title,
@@ -205,6 +292,22 @@ class DecisionBlock:
         if surface_id is not None:
             kwargs["surface_id"] = surface_id
         return kwargs
+
+
+def _action_to_json(action: ActionSpec) -> str | dict[str, Any]:
+    """Serializes an action as its label, or an options object when it has more."""
+    options: dict[str, Any] = {}
+    if action.scope is not None:
+        options["scope"] = action.scope
+    if action.key is not None:
+        options["key"] = action.key
+    if action.context:
+        options["context"] = dict(action.context)
+    if action.style is not None:
+        options["style"] = str(action.style)
+    if not options:
+        return action.label
+    return {"label": action.label, **options}
 
 
 def _surface_id_in(msg: Mapping[str, Any]) -> str | None:

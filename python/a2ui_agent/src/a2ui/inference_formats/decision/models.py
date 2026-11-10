@@ -49,13 +49,12 @@ class _WireEnum(str, Enum):
 
 
 class DecisionTask(_WireEnum):
-    """Kind of choice a `DecisionQuery` asks a decision backend to make.
+    """Kind of choice a `DecisionQuestion` asks, named by its id prefix.
 
     Members compare equal to their string values, so backends and tests that
     match on the literal strings keep working.
     """
 
-    TEMPLATE_SELECT = "template_select"
     FAMILY = "family"
     ARCHETYPE = "archetype"
     BLOCK_GATE = "block_gate"
@@ -76,17 +75,6 @@ class QuestionKind(_WireEnum):
     CHOICE = "choice"
     BOOLEAN = "boolean"
     SCORE = "score"
-
-
-class VarietyMode(_WireEnum):
-    """How the layout planner samples choices from question distributions.
-
-    `ARGMAX` picks the highest-probability option deterministically.
-    `NEAR_TOP` samples among options within `variety_margin` of the top.
-    """
-
-    ARGMAX = "argmax"
-    NEAR_TOP = "near_top"
 
 
 class SemanticType(_WireEnum):
@@ -214,11 +202,37 @@ class DecisionWireFormat(_WireEnum):
 
 
 class FallbackSource(_WireEnum):
-    """Which fallback produced a `SynthesisOutput` after the model abstained."""
+    """Which link of the fallback chain produced a `SynthesisOutput`.
+
+    The chain runs in order: the block's `fallbackDsl`, then the host
+    callback, then a single `facts` pattern rendering of the payload.
+    """
 
     DSL = "fallback_dsl"
     CALLBACK = "fallback_fn"
-    CARD = "fallback_card"
+    FACTS = "fallback_facts"
+
+
+class ActionStyle(_WireEnum):
+    """Presentational emphasis of an action button."""
+
+    PRIMARY = "primary"
+    SECONDARY = "secondary"
+    DESTRUCTIVE = "destructive"
+
+
+class SurfaceOperation(_WireEnum):
+    """How synthesized messages change the client's surface.
+
+    `CREATE` sends `createSurface` for a surface the client does not have.
+    `UPDATE_ROOT` replaces the root of an existing surface in place with
+    `updateComponents` and `updateDataModel`. `REPLACE` sends `deleteSurface`
+    and then creates the surface again.
+    """
+
+    CREATE = "create"
+    UPDATE_ROOT = "update_root"
+    REPLACE = "replace"
 
 
 class DecisionBackendType(_WireEnum):
@@ -325,20 +339,6 @@ class ComponentNodeSpec:
             if slot.name == base_name or slot.name == name:
                 return slot
         return None
-
-
-@dataclass(frozen=True, eq=True)
-class DecisionQuery:
-    """Query payload sent to a local decision-model backend."""
-
-    task: DecisionTask | str
-    prompt: str
-    candidates: tuple[str, ...]
-    context: dict[str, Any] = field(default_factory=dict, hash=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "candidates", tuple(self.candidates))
-        object.__setattr__(self, "context", dict(self.context))
 
 
 @dataclass(frozen=True, eq=True)
@@ -616,6 +616,8 @@ class LayoutPlan:
     urgency: float = 0.0
     confidence: float = 0.0
     actions_allowed: bool = False
+    template_id: str | None = None
+    """The registered template chosen by the batch's template question, if any."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
@@ -771,88 +773,175 @@ class AuthoredCopy:
         return bool(self.title or self.summary)
 
 
+_ACTION_OPTION_KEYS = frozenset({"label", "scope", "key", "context", "style"})
+
+
+def _action_pointer(action_id: str, name: str, value: Any) -> str:
+    """Validates one JSON Pointer used in an action's options."""
+    if not isinstance(value, str) or not value.startswith("/"):
+        raise A2uiValidationError(
+            f"Action {action_id!r}: {name} must be a JSON Pointer starting with"
+            f" '/', got {value!r}."
+        )
+    return value
+
+
+def _action_context(action_id: str, raw: Any) -> dict[str, str]:
+    """Validates an action's ``context`` map of names to JSON Pointers."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise A2uiValidationError(
+            f"Action {action_id!r}: context must be an object, got {raw!r}."
+        )
+    return {
+        str(name): _action_pointer(action_id, f"context[{name!r}]", pointer)
+        for name, pointer in raw.items()
+    }
+
+
+def _action_style(action_id: str, raw: Any) -> ActionStyle | None:
+    """Parses an action's optional ``style`` into an `ActionStyle`."""
+    if raw is None:
+        return None
+    try:
+        return ActionStyle(raw)
+    except ValueError:
+        choices = ", ".join(repr(s.value) for s in ActionStyle)
+        raise A2uiValidationError(
+            f"Action {action_id!r}: style must be one of {choices}, got {raw!r}."
+        ) from None
+
+
+@dataclass(frozen=True)
+class ActionSpec:
+    """One action the model declared in the decision block's ``actions`` map.
+
+    Attributes:
+        id: Event name the agent receives when the action fires.
+        label: Button text; presentational only.
+        scope: JSON Pointer of the collection the action repeats over, for
+            per-item actions.
+        key: Item field used as the item's identity within `scope`. When
+            None, the expander uses ``id`` if the items have one.
+        context: Event context, as names mapped to JSON Pointers.
+        style: Optional presentational emphasis.
+    """
+
+    id: str
+    label: str
+    scope: str | None = None
+    key: str | None = None
+    context: Mapping[str, str] = field(default_factory=dict, hash=False)
+    style: ActionStyle | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise A2uiValidationError("Action id must be a non-empty string.")
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise A2uiValidationError(
+                f"Action {self.id!r}: label must be a non-empty string."
+            )
+        object.__setattr__(self, "context", dict(self.context))
+
+    @classmethod
+    def from_block_value(
+        cls, action_id: str, value: str | Mapping[str, Any]
+    ) -> ActionSpec:
+        """Builds an `ActionSpec` from one entry of the block's ``actions`` map.
+
+        Args:
+            action_id: The map key, used as the event name.
+            value: Either the label string, or an options object with
+                ``label`` (required) and optional ``scope``, ``key``,
+                ``context``, and ``style``.
+
+        Raises:
+            A2uiValidationError: If the id or label is empty, the value is
+                neither a string nor an object, an option key is unknown, or
+                an option value is malformed.
+        """
+        if isinstance(value, str):
+            return cls(id=action_id, label=value)
+        if not isinstance(value, Mapping):
+            raise A2uiValidationError(
+                f"Action {action_id!r}: value must be a label string or an"
+                f" options object, got {type(value).__name__}."
+            )
+        unknown = sorted(set(value) - _ACTION_OPTION_KEYS)
+        if unknown:
+            raise A2uiValidationError(
+                f"Action {action_id!r}: unknown option keys {unknown}; allowed"
+                f" keys are {sorted(_ACTION_OPTION_KEYS)}."
+            )
+        scope = value.get("scope")
+        key = value.get("key")
+        return cls(
+            id=action_id,
+            label=value.get("label", ""),
+            scope=None if scope is None else _action_pointer(action_id, "scope", scope),
+            key=None if key is None else str(key),
+            context=_action_context(action_id, value.get("context")),
+            style=_action_style(action_id, value.get("style")),
+        )
+
+
+class DecisionBackendError(Exception):
+    """A decision backend failed to answer: a timeout, transport, or HTTP error.
+
+    The format surfaces it as a compilation error; no fallback runs for it.
+
+    Attributes:
+        backend_kind: `DecisionBackend.backend_kind` of the failing backend.
+        model_id: `DecisionBackend.model_id` of the failing backend.
+        cause: The underlying exception, when there is one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        backend_kind: str,
+        model_id: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.backend_kind = backend_kind
+        self.model_id = model_id
+        self.cause = cause
+
+
 def _validate_unit_interval(name: str, value: float) -> None:
-    """Validates that a threshold or margin parameter lies in [0.0, 1.0]."""
+    """Validates that a threshold or dial parameter lies in [0.0, 1.0]."""
     if not (0.0 <= value <= 1.0):
         raise ValueError(f"{name} must be in [0.0, 1.0], got {value}.")
 
 
 @dataclass(frozen=True)
 class SynthesisConfig:
-    """Thresholds and structural limits governing decision-model UI synthesis."""
+    """Host-level settings for decision-model UI synthesis.
 
-    template_confidence_threshold: float = 0.75
-    mutable_confidence_threshold: float = 0.85
-    abstain_threshold: float = 0.40
-    uncalibrated_min_logit_margin: float = 1.50
-    max_tree_depth: int = 3
-    max_children_per_container: int = 8
+    Confidence thresholds live in the archetype grammar, not here.
+    """
+
     default_surface_id: str = "default_surface"
+    """Surface id used when the decision block does not name one."""
     max_pairs: int = 400
     """Budget of (question, candidate) pairs for one batch.
 
     Past it the planner stops adding optional question groups and falls back
     to heuristics for them.
     """
-    threshold_overrides: Mapping[str, float] = field(default_factory=dict, hash=False)
-    """Per-key overrides of `ArchetypeGrammar.thresholds`.
-
-    Keys are the grammar's own names (``family``, ``archetype``, ``expected``,
-    ``optional``, ``instance``, ``reask_below``, ``actionGateFloor``,
-    ``actionGateCap``). The grammar is the single source of truth for the
-    defaults; set a key here to tune one without editing the grammar file.
-    """
-    variety: VarietyMode = VarietyMode.ARGMAX
-    """How choices are sampled from question distributions (ARGMAX or NEAR_TOP)."""
-    variety_margin: float = 0.15
-    """In NEAR_TOP mode, options within this margin of top probability are sampled."""
-    two_stage_batching: bool | None = None
-    """Splits planning into Stage 1 (family/archetype) and Stage 2 (winning archetype blocks).
-
-    When None (default), enabled automatically for step-0 backends
-    (`StepZeroLogprobBackend`) and disabled for single-round-trip remote/mock
-    backends (`JevHttpBackend`, `DeterministicMockBackend`).
-    """
+    conservativeness: float = 0.5
+    """Scales the action gate between the grammar's `actionGateFloor` (0.0)
+    and `actionGateCap` (1.0); higher values refuse actions more often."""
 
     def __post_init__(self) -> None:
-        _validate_unit_interval(
-            "template_confidence_threshold", self.template_confidence_threshold
-        )
-        _validate_unit_interval(
-            "mutable_confidence_threshold", self.mutable_confidence_threshold
-        )
-        _validate_unit_interval("abstain_threshold", self.abstain_threshold)
-        if not (0.0 < self.variety_margin <= 1.0):
-            raise ValueError(
-                f"variety_margin must be in (0.0, 1.0], got {self.variety_margin}."
-            )
-        if self.mutable_confidence_threshold < self.template_confidence_threshold:
-            raise ValueError(
-                "mutable_confidence_threshold must be >= template_confidence_threshold."
-            )
-        if self.template_confidence_threshold < self.abstain_threshold:
-            raise ValueError(
-                "template_confidence_threshold must be >= abstain_threshold."
-            )
-        if self.uncalibrated_min_logit_margin < 0.0:
-            raise ValueError("uncalibrated_min_logit_margin must be non-negative.")
-        if self.max_tree_depth < 1:
-            raise ValueError("max_tree_depth must be >= 1.")
-        if self.max_children_per_container < 1:
-            raise ValueError("max_children_per_container must be >= 1.")
         if not self.default_surface_id or not self.default_surface_id.strip():
             raise ValueError("default_surface_id must be a non-empty string.")
-        self._validate_archetype_fields()
-
-    def _validate_archetype_fields(self) -> None:
-        """Validates the archetype planner budget and threshold overrides."""
         if self.max_pairs < 1:
-            raise ValueError("max_pairs must be >= 1.")
-        overrides = {str(k): float(v) for k, v in self.threshold_overrides.items()}
-        object.__setattr__(self, "threshold_overrides", overrides)
-        for name, value in overrides.items():
-            _validate_unit_interval(f"threshold_overrides[{name!r}]", value)
-        validate_threshold_relations(overrides, "threshold_overrides")
+            raise ValueError(f"max_pairs must be >= 1, got {self.max_pairs}.")
+        _validate_unit_interval("conservativeness", self.conservativeness)
 
 
 def validate_threshold_relations(thresholds: Mapping[str, float], owner: str) -> None:
@@ -879,12 +968,19 @@ class SynthesisOutput:
     confidence: float
     entropy: float
     selected_template_id: str | None = None
-    component_tree_spec: dict[str, Any] | None = None
     fallback_source: FallbackSource | None = None
     """Which fallback produced `messages` after the model abstained.
 
     None when the model did not abstain or no fallback applied.
     """
+    fallback_reason: str | None = None
+    """Free-text reason the fallback chain ran, for logs and traces."""
+    backend_kind: str = ""
+    """`DecisionBackend.backend_kind` of the backend that answered."""
+    model_id: str = ""
+    """`DecisionBackend.model_id` of the backend that answered."""
+    operation: SurfaceOperation = SurfaceOperation.CREATE
+    """How `messages` change the client's surface."""
     layout_plan: LayoutPlan | None = None
     """The archetype plan behind `messages` when `stage` is `ARCHETYPE`."""
     trace: tuple[DecisionRecord, ...] = ()
@@ -892,7 +988,7 @@ class SynthesisOutput:
     decision_latency_ms: float = 0.0
     """Wall-clock milliseconds spent waiting on the decision model backend."""
     decision_calls: int = 0
-    """Number of backend `predict` or `answer` calls made during synthesis."""
+    """Number of backend `answer` calls made during synthesis."""
     decision_answers: tuple[DecisionAnswer, ...] = ()
     """The batch answers that produced the layout plan, in question order."""
 
@@ -914,25 +1010,3 @@ class SynthesisOutput:
         return ExpressDecompiler(catalogs).decompile(
             self.messages, use_keyword_args=use_keyword_args
         )
-
-
-@dataclass(frozen=True)
-class CalibrationPoint:
-    """Coverage, precision, and fallback metrics at a single confidence threshold."""
-
-    threshold: float
-    coverage: float
-    precision: float
-    fallback_rate: float
-
-
-@dataclass(frozen=True)
-class CalibrationResult:
-    """Recommended confidence thresholds and Pareto frontier from calibration."""
-
-    recommended_template_threshold: float
-    recommended_mutable_threshold: float
-    recommended_abstain_threshold: float
-    achieved_precision: float
-    achieved_coverage: float
-    pareto_points: tuple[CalibrationPoint, ...]

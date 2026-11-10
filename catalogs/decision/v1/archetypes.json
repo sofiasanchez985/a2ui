@@ -1,13 +1,14 @@
 {
   "$schema": "https://a2ui.org/specification/v1_0/decision/archetype_definition.json",
-  "version": "1",
+  "grammarVersion": "1",
   "thresholds": {
     "family": 0.4,
     "archetype": 0.4,
     "expected": 0.5,
     "optional": 0.75,
     "instance": 0.5,
-    "reask_below": 0.75,
+    "template": 0.75,
+    "templateMutable": 0.85,
     "actionGateFloor": 0.7,
     "actionGateCap": 0.95
   },
@@ -1029,6 +1030,10 @@
           "fields": {
             "label": {
               "from": ["string", "key"],
+              "required": true
+            },
+            "action": {
+              "from": ["action"],
               "required": true
             }
           }

@@ -17,12 +17,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from a2ui.core import A2uiValidationError
 from a2ui.inference_formats.decision import (
+    SurfaceTemplate,
     SynthesisConfig,
     inspect_payload_pointers,
 )
@@ -47,6 +48,9 @@ from a2ui.inference_formats.decision.layout_planner import (
     apply_urgency_terse,
 )
 from a2ui.inference_formats.decision.models import (
+    ActionSpec,
+    ActionStyle,
+    AuthoredCopy,
     BlockBindings,
     DecisionAnswer,
     DecisionDistribution,
@@ -84,6 +88,17 @@ class StubCapabilities:
         return (name, variant) not in self.disabled
 
 
+_TRANSFER_FIXTURE = LayoutFixture(
+    name="transfer_clean",
+    intent=TRANSFER.intent,
+    payload={k: v for k, v in TRANSFER.payload.items() if k != "actions"},
+)
+_TRANSFER_ACTIONS: tuple[ActionSpec, ...] = (
+    ActionSpec(id="send", label="Send"),
+    ActionSpec(id="cancel", label="Cancel"),
+)
+
+
 def _run_fixture(
     fixture: LayoutFixture,
     scripted: Mapping[str, ScriptedValue],
@@ -91,6 +106,8 @@ def _run_fixture(
     config: SynthesisConfig | None = None,
     brief: LayoutBrief | None = None,
     capabilities: PatternCapabilities | None = None,
+    templates: Sequence[SurfaceTemplate] = (),
+    actions: Sequence[ActionSpec] = (),
 ) -> tuple[
     LayoutPlanner,
     PlannerState,
@@ -110,6 +127,8 @@ def _run_fixture(
         pointers=pointers,
         brief=brief,
         payload=fixture.payload,
+        templates=templates,
+        actions=actions,
     )
     sa = ScriptedAnswers(answers=scripted)
     answers = asyncio.run(sa.backend().answer(batch))
@@ -248,9 +267,9 @@ def test_transfer_confirm_action_gate_blocks_at_080_commits_at_090() -> None:
         "gate:prose": 0.45,
         "gate:facts": 0.85,
         "gate:actions": 0.90,
-        "instance:actions.primary:/actions": ("Send", 0.90),
-        "instance:actions.destructive:0": 0.80,
-        "instance:actions.destructive:1": 0.10,
+        "instance:actions.primary:buttons": ("send", 0.90),
+        "instance:actions.destructive:send": 0.80,
+        "instance:actions.destructive:cancel": 0.10,
         "salience:/amount": 2.9,
         "salience:/recipient": 2.6,
         "salience:/fee": 1.9,
@@ -258,13 +277,17 @@ def test_transfer_confirm_action_gate_blocks_at_080_commits_at_090() -> None:
     }
 
     _, _, _, blocked, _ = _run_fixture(
-        TRANSFER, {**base_scripted, "archetype:act": ("confirm", 0.80)}
+        _TRANSFER_FIXTURE,
+        {**base_scripted, "archetype:act": ("confirm", 0.80)},
+        actions=_TRANSFER_ACTIONS,
     )
     assert blocked.reason == "action_gate"
     assert blocked.plan is None
 
     _, _, _, committed, _ = _run_fixture(
-        TRANSFER, {**base_scripted, "archetype:act": ("confirm", 0.90)}
+        _TRANSFER_FIXTURE,
+        {**base_scripted, "archetype:act": ("confirm", 0.90)},
+        actions=_TRANSFER_ACTIONS,
     )
     assert committed.reason == "planned"
     assert committed.plan is not None
@@ -289,9 +312,10 @@ def test_transfer_confirm_action_gate_blocks_at_080_commits_at_090() -> None:
     buttons = actions.bindings.get("buttons")
     assert buttons is not None
     assert [it["label"].literal for it in buttons.items] == ["Cancel", "Send"]
-    assert actions.instances["Send"]["primary"] == "false"
-    assert actions.instances["Send"]["destructive"] == "true"
-    assert actions.instances["Cancel"]["primary"] == "false"
+    assert [it["action"].literal for it in buttons.items] == ["cancel", "send"]
+    assert actions.instances["send"]["primary"] == "false"
+    assert actions.instances["send"]["destructive"] == "true"
+    assert actions.instances["cancel"]["primary"] == "false"
 
 
 def test_settings_worked_example_and_action_gate_degradation() -> None:
@@ -469,35 +493,6 @@ def test_layout_brief_pins_and_warns_on_unused_block() -> None:
     )
 
 
-def test_needs_reask_identifies_low_confidence_depended_questions() -> None:
-    """`needs_reask` returns depended-on questions with winning prob < `reask_below`."""
-    planner, state, _, outcome, _ = _run_fixture(
-        HOST,
-        {
-            "family": ("monitor", 0.55),
-            "stakes": 0.5,
-            "urgency": 0.5,
-            "archetype:monitor": ("dashboard", 0.62),
-            "archetype:orient": ("feed", 0.45),
-            "gate:banner": 0.78,
-            "gate:headline": 0.85,
-            "gate:facts": 0.82,
-            "instance:banner.tone:/status": ("warning", 0.60),
-            "salience:/cpu": 2.8,
-            "salience:/status": 2.2,
-            "salience:/host": 1.9,
-        },
-    )
-    assert outcome.reason == "planned"
-    assert outcome.plan is not None
-    reask = planner.needs_reask(outcome.plan, state)
-    reask_ids = [q.id for q in reask]
-    assert "family" in reask_ids
-    assert "archetype:monitor" in reask_ids
-    assert "instance:banner.tone:/status" in reask_ids
-    assert "archetype:orient" not in reask_ids
-
-
 def test_answer_validation_rejects_missing_or_unknown_ids() -> None:
     """`read` raises `A2uiValidationError` on missing or unknown question ids."""
     grammar = ArchetypeGrammar.default()
@@ -596,111 +591,122 @@ def test_individual_rule_functions_transform_plans() -> None:
     assert all(b.block_id != "outcome" for b in p11.blocks)
 
 
-def test_lint_components_catches_all_six_structural_violations() -> None:
-    """`lint_components` reports all six structural violations and honors `raise_on_error`."""
+def test_lint_components_catches_structural_and_plan_level_violations() -> None:
+    """`lint_components` catches structural and plan-level violations with zero catalog names."""
+    bad_plan = LayoutPlan(
+        family="act",
+        archetype="confirm",
+        page=PageBindings(title=SlotBinding(literal="   ")),
+        blocks=(
+            PlannedBlock(
+                block_id="collection_a",
+                pattern="collection",
+                variant_knobs={"layout": "reel"},
+            ),
+            PlannedBlock(
+                block_id="collection_b",
+                pattern="collection",
+                variant_knobs={"layout": "reel"},
+            ),
+            PlannedBlock(
+                block_id="actions",
+                pattern="actions",
+                bindings=BlockBindings(
+                    slots={
+                        "buttons": SlotBinding(
+                            items=(
+                                {
+                                    "action": SlotBinding(literal="go"),
+                                    "label": SlotBinding(literal="Go"),
+                                },
+                                {
+                                    "action": SlotBinding(literal="send"),
+                                    "label": SlotBinding(literal="Send"),
+                                },
+                            )
+                        )
+                    }
+                ),
+                instances={
+                    "go": {"primary": "true"},
+                    "send": {"primary": "true"},
+                },
+            ),
+        ),
+    )
     bad_components: list[dict[str, Any]] = [
         {
             "id": "root",
-            "component": "Column",
+            "component": "CustomStack",
             "children": [
-                "empty_col",
+                "empty_box",
                 "missing_id",
-                "body_txt",
-                "h1_txt",
-                "btn1",
-                "btn2",
-                "reel1",
-                "reel2",
                 "dup1",
                 "dup2",
             ],
         },
-        {"id": "empty_col", "component": "Column", "children": []},
-        {
-            "id": "body_txt",
-            "component": "Text",
-            "text": {"path": "/a"},
-            "variant": "body",
-        },
-        {
-            "id": "h1_txt",
-            "component": "Text",
-            "text": "Heading",
-            "variant": "h1",
-        },
-        {
-            "id": "btn1",
-            "component": "Button",
-            "label": "Go",
-            "variant": "primary",
-        },
-        {
-            "id": "btn2",
-            "component": "Button",
-            "label": "Send",
-            "variant": "primary",
-        },
-        {
-            "id": "reel1",
-            "component": "List",
-            "children": ["body_txt"],
-            "direction": "horizontal",
-        },
-        {
-            "id": "reel2",
-            "component": "List",
-            "children": ["h1_txt"],
-            "direction": "horizontal",
-        },
-        {"id": "dup1", "component": "Text", "text": {"path": "/shared"}},
-        {"id": "dup2", "component": "Text", "text": {"@path": "/shared"}},
+        {"id": "empty_box", "component": "CustomBox", "children": []},
+        {"id": "dup1", "component": "CustomLeaf", "value": {"@path": "/shared"}},
+        {"id": "dup2", "component": "CustomLeaf", "value": {"@path": "/shared"}},
     ]
 
-    findings: tuple[LintFinding, ...] = lint_components(bad_components)
+    findings: tuple[LintFinding, ...] = lint_components(bad_components, plan=bad_plan)
     codes = {f.code for f in findings}
     assert codes == {
         "empty_container",
         "missing_component",
         "multiple_primary_buttons",
         "duplicate_pointer_binding",
-        "heading_after_body",
+        "empty_authored_text",
         "multiple_reels",
     }
 
     with pytest.raises(A2uiValidationError, match="Layout component lint failed"):
-        lint_components(bad_components, raise_on_error=True)
+        lint_components(bad_components, plan=bad_plan, raise_on_error=True)
 
     valid_components: list[dict[str, Any]] = [
         {
             "id": "root",
-            "component": "Column",
-            "children": ["h1_txt", "body_txt", "btn1"],
+            "component": "CustomStack",
+            "children": ["title_leaf", "body_leaf", "act_leaf"],
         },
         {
-            "id": "h1_txt",
-            "component": "Text",
-            "text": {"path": "/title"},
-            "variant": "h1",
+            "id": "title_leaf",
+            "component": "CustomLeaf",
+            "text": {"@path": "/title"},
         },
         {
-            "id": "body_txt",
-            "component": "Text",
-            "text": {"path": "/body"},
-            "variant": "body",
+            "id": "body_leaf",
+            "component": "CustomLeaf",
+            "text": {"@path": "/body"},
         },
         {
-            "id": "btn1",
-            "component": "Button",
-            "label": "OK",
+            "id": "act_leaf",
+            "component": "CustomTrigger",
             "variant": "primary",
+            "action": {"event": {"name": "ok"}},
         },
     ]
     assert lint_components(valid_components, raise_on_error=True) == ()
 
+    # Explicit `child_slot_keys` from `CatalogDecisionGraph` flags custom slot names
+    explicit_slot_findings = lint_components(
+        [{
+            "id": "root",
+            "component": "CustomOverlay",
+            "opener": "missing_opener",
+            "pane": "",
+        }],
+        child_slot_keys=("opener", "pane"),
+    )
+    assert {f.code for f in explicit_slot_findings} == {
+        "empty_container",
+        "missing_component",
+    }
+
 
 def test_threshold_boundary_cases_050_075_and_0875() -> None:
     """Tests exact boundary behavior at 0.50 (expected), 0.75 (optional), and 0.875 (action gate)."""
-    # 1. Expected block (`prose+` on detail) at 0.49 vs 0.50, and optional block (`collection?`) at 0.74 vs 0.75.
     base_resort: dict[str, ScriptedValue] = {
         "family": ("inspect", 0.80),
         "stakes": 0.2,
@@ -741,12 +747,16 @@ def test_threshold_boundary_cases_050_075_and_0875() -> None:
         "salience:/recipient": 2.6,
     }
     _, _, _, gate_below, _ = _run_fixture(
-        TRANSFER, {**base_transfer, "archetype:act": ("confirm", 0.874)}
+        _TRANSFER_FIXTURE,
+        {**base_transfer, "archetype:act": ("confirm", 0.874)},
+        actions=_TRANSFER_ACTIONS,
     )
     assert gate_below.reason == "action_gate"
 
     _, _, _, gate_exact, _ = _run_fixture(
-        TRANSFER, {**base_transfer, "archetype:act": ("confirm", 0.875)}
+        _TRANSFER_FIXTURE,
+        {**base_transfer, "archetype:act": ("confirm", 0.875)},
+        actions=_TRANSFER_ACTIONS,
     )
     assert gate_exact.reason == "planned"
     assert gate_exact.plan is not None
@@ -827,44 +837,216 @@ def test_leading_all_or_none_degrades_sparse_collection_pictures() -> None:
     assert steps_slot.items[1]["title"].pointer == "/steps/1/title"
 
 
-def test_threshold_overrides_take_precedence_over_grammar_thresholds() -> None:
-    """`SynthesisConfig.threshold_overrides` wins per key; other keys stay on the grammar."""
+def test_grammar_thresholds_and_conservativeness_scaling() -> None:
+    """`LayoutPlanner.threshold` reads grammar thresholds and `conservativeness` scales action gate."""
     grammar = ArchetypeGrammar.default()
-    planner = LayoutPlanner(
-        grammar, SynthesisConfig(threshold_overrides={"optional": 0.9})
-    )
-    assert planner.threshold("optional") == pytest.approx(0.9)
-    assert planner.threshold("expected") == pytest.approx(grammar.threshold("expected"))
-    assert planner.threshold("actionGateCap") == pytest.approx(
-        grammar.threshold("actionGateCap")
-    )
+    planner = LayoutPlanner(grammar, SynthesisConfig())
+    assert planner.threshold("template") == pytest.approx(0.75)
+    assert planner.threshold("templateMutable") == pytest.approx(0.85)
+    assert planner.threshold("actionGateFloor") == pytest.approx(0.70)
+    assert planner.threshold("actionGateCap") == pytest.approx(0.95)
     with pytest.raises(KeyError):
         planner.threshold("not_a_threshold")
+    with pytest.raises(KeyError):
+        planner.threshold("reask_below")
 
-    # Raising `optional` to 0.9 drops the 0.85 collection gate that passed at 0.75.
-    scripted: dict[str, ScriptedValue] = {
-        "family": ("inspect", 0.80),
-        "stakes": 0.2,
-        "urgency": 0.1,
-        "archetype:inspect": ("detail", 0.85),
-        "gate:headline": 0.80,
-        "gate:prose": 0.90,
-        "gate:collection": 0.85,
-        "salience:/rating": 2.4,
-        "salience:/priceFrom": 2.6,
+    base_transfer: dict[str, ScriptedValue] = {
+        "family": ("act", 0.85),
+        "stakes": 2.1,
+        "urgency": 0.6,
+        "gate:facts": 0.85,
+        "gate:actions": 0.90,
+        "salience:/amount": 2.9,
+        "salience:/recipient": 2.6,
     }
-    _, _, _, default_outcome, _ = _run_fixture(RESORT, scripted)
-    assert default_outcome.plan is not None
-    assert "collection" in default_outcome.plan.block_ids()
-    _, _, _, strict_outcome, _ = _run_fixture(
-        RESORT,
-        scripted,
-        config=SynthesisConfig(threshold_overrides={"optional": 0.9}),
+
+    # conservativeness=0.0 -> gate drops to actionGateFloor (0.70), so 0.71 passes!
+    _, _, _, permissive, _ = _run_fixture(
+        _TRANSFER_FIXTURE,
+        {**base_transfer, "archetype:act": ("confirm", 0.71)},
+        config=SynthesisConfig(conservativeness=0.0),
+        actions=_TRANSFER_ACTIONS,
     )
-    assert strict_outcome.plan is not None
-    assert "collection" not in strict_outcome.plan.block_ids()
-    assert strict_outcome.reason is PlanReason.PLANNED
-    assert strict_outcome.reason == "planned"
+    assert permissive.reason is PlanReason.PLANNED
+    assert permissive.plan is not None
+    assert permissive.plan.actions_allowed is True
+
+    # conservativeness=1.0 -> gate rises to actionGateCap (0.95), so 0.94 is blocked and 0.95 passes!
+    _, _, _, strict_blocked, _ = _run_fixture(
+        _TRANSFER_FIXTURE,
+        {**base_transfer, "archetype:act": ("confirm", 0.94)},
+        config=SynthesisConfig(conservativeness=1.0),
+        actions=_TRANSFER_ACTIONS,
+    )
+    assert strict_blocked.reason is PlanReason.ACTION_GATE
+
+    _, _, _, strict_passed, _ = _run_fixture(
+        _TRANSFER_FIXTURE,
+        {**base_transfer, "archetype:act": ("confirm", 0.95)},
+        config=SynthesisConfig(conservativeness=1.0),
+        actions=_TRANSFER_ACTIONS,
+    )
+    assert strict_passed.reason is PlanReason.PLANNED
+
+
+def test_template_question_only_when_matching_and_respects_mutable_threshold() -> None:
+    """`template` question appears iff templates match and reads against `template` / `templateMutable`."""
+    resort_tpl = SurfaceTemplate(
+        template_id="resort_card",
+        description="Fixed resort overview card.",
+        surface_id="resort",
+        catalog_id=None,
+        protocol_version="1.0",
+        components=({"id": "root", "component": "Text", "text": "Resort"},),
+        required_pointers=("/name", "/rating"),
+    )
+    unmatched_tpl = SurfaceTemplate(
+        template_id="flight_card",
+        description="Flight boarding pass.",
+        surface_id="flight",
+        catalog_id=None,
+        protocol_version="1.0",
+        components=({"id": "root", "component": "Text", "text": "Flight"},),
+        required_pointers=("/flightNumber",),
+    )
+
+    # Non-matching template -> no `template` question in batch
+    _, no_tpl_state, _, _, no_tpl_sa = _run_fixture(
+        RESORT,
+        {
+            "family": ("inspect", 0.80),
+            "archetype:inspect": ("detail", 0.85),
+            "gate:headline": 0.85,
+            "gate:prose": 0.85,
+        },
+        templates=(unmatched_tpl,),
+    )
+    assert "template" not in no_tpl_sa.asked
+    assert [q.id for q in no_tpl_state.batch.questions][0] == "family"
+
+    # Matching template -> `template` is FIRST question with `("resort_card", "compose")`
+    _, match_state, _, win_outcome, _ = _run_fixture(
+        RESORT,
+        {"template": ("resort_card", 0.75)},
+        templates=(resort_tpl, unmatched_tpl),
+    )
+    first_q = match_state.batch.questions[0]
+    assert first_q.id == "template"
+    assert first_q.options == ("resort_card", "compose")
+    assert win_outcome.plan is not None
+    assert win_outcome.plan.template_id == "resort_card"
+
+    # Below 0.75 (`template` threshold) -> falls back to composing an archetype plan
+    _, _, _, compose_outcome, _ = _run_fixture(
+        RESORT,
+        {
+            "template": ("resort_card", 0.74),
+            "family": ("inspect", 0.80),
+            "archetype:inspect": ("detail", 0.85),
+            "gate:headline": 0.85,
+            "gate:prose": 0.85,
+        },
+        templates=(resort_tpl,),
+    )
+    assert compose_outcome.plan is not None
+    assert compose_outcome.plan.template_id is None
+    assert compose_outcome.plan.archetype == "detail"
+
+    # Mutable payload uses `templateMutable` (0.85): 0.80 composes, 0.85 picks template!
+    settings_tpl = SurfaceTemplate(
+        template_id="settings_sheet",
+        description="Podcast settings sheet.",
+        surface_id="settings",
+        catalog_id=None,
+        protocol_version="1.0",
+        components=({"id": "root", "component": "Text", "text": "Settings"},),
+        required_pointers=("/playback/speed",),
+    )
+    _, _, _, mut_below, _ = _run_fixture(
+        SETTINGS,
+        {
+            "template": ("settings_sheet", 0.80),
+            "family": ("input", 0.85),
+            "archetype:input": ("settings", 0.85),
+            "gate:groups": 0.90,
+        },
+        templates=(settings_tpl,),
+    )
+    assert mut_below.plan is not None
+    assert mut_below.plan.template_id is None
+
+    # Two-stage batch short-circuits Stage 2 when template clears `templateMutable` (0.85)
+    planner = LayoutPlanner()
+    s_ptrs = inspect_payload_pointers(
+        SETTINGS.payload, mutable_paths=SETTINGS.mutable_paths
+    )
+    s1_batch, s_state = planner.build_stage1_batch(
+        SETTINGS.intent,
+        s_ptrs,
+        payload=SETTINGS.payload,
+        templates=(settings_tpl,),
+    )
+    s1_ans = asyncio.run(
+        ScriptedAnswers({"template": ("settings_sheet", 0.86)})
+        .backend()
+        .answer(s1_batch)
+    )
+    s2_batch = planner.build_stage2_batch(s_state, s1_ans)
+    assert s2_batch.questions == ()
+    mut_win = planner.read(s_state, s1_ans)
+    assert mut_win.plan is not None
+    assert mut_win.plan.template_id == "settings_sheet"
+
+
+def test_action_style_and_scoped_collection_item_actions() -> None:
+    """`ActionSpec.style` pins primary/destructive flags and `scope` attaches item buttons."""
+    # 1. Explicit PRIMARY and DESTRUCTIVE styles skip redundant instance questions
+    styled_actions = (
+        ActionSpec(id="delete_acct", label="Delete", style=ActionStyle.DESTRUCTIVE),
+        ActionSpec(id="keep_acct", label="Keep", style=ActionStyle.PRIMARY),
+    )
+    _, _, _, styled_out, styled_sa = _run_fixture(
+        _TRANSFER_FIXTURE,
+        {
+            "family": ("act", 0.90),
+            "stakes": 1.0,
+            "urgency": 0.2,
+            "archetype:act": ("confirm", 0.90),
+            "gate:facts": 0.85,
+            "gate:actions": 0.90,
+        },
+        actions=styled_actions,
+    )
+    assert "instance:actions.primary:buttons" not in styled_sa.asked
+    assert "instance:actions.destructive:delete_acct" not in styled_sa.asked
+    assert "instance:actions.destructive:keep_acct" in styled_sa.asked
+    assert styled_out.plan is not None
+    act_block = next(b for b in styled_out.plan.blocks if b.block_id == "actions")
+    assert act_block.instances["keep_acct"]["primary"] == "true"
+    assert act_block.instances["delete_acct"]["destructive"] == "true"
+
+    # 2. Scoped item action attaches to `collection` and sets `trailing='button'`
+    scoped = (ActionSpec(id="view_photo", label="Open photo", scope="/photos"),)
+    _, _, _, col_out, col_sa = _run_fixture(
+        RESORT,
+        {
+            "family": ("inspect", 0.85),
+            "stakes": 0.2,
+            "urgency": 0.1,
+            "archetype:inspect": ("detail", 0.85),
+            "gate:headline": 0.80,
+            "gate:collection": 0.90,
+        },
+        actions=scoped,
+    )
+    assert "anatomy:collection.trailing" not in col_sa.asked
+    assert col_out.plan is not None
+    col_block = next(b for b in col_out.plan.blocks if b.block_id == "collection")
+    assert col_block.variant_knobs.get("trailing") == "button"
+    assert col_block.variant_knobs.get("trailing.label") == "Open photo"
+    items_slot = col_block.bindings.get("items")
+    assert items_slot is not None
+    assert items_slot.fields["action"].literal == "view_photo"
 
 
 def test_decision_suite_gap_fixes_orphan_recovery_3_field_items_redirect_and_primitive_arrays() -> (
@@ -898,7 +1080,9 @@ def test_decision_suite_gap_fixes_orphan_recovery_3_field_items_redirect_and_pri
     assert article_outcome.plan is not None
     assert "facts" in article_outcome.plan.block_ids()
     facts_block = next(b for b in article_outcome.plan.blocks if b.block_id == "facts")
-    fact_ptrs = [it["value"].pointer for it in facts_block.bindings.get("rows").items]
+    rows_slot = facts_block.bindings.get("rows")
+    assert rows_slot is not None
+    fact_ptrs = [it["value"].pointer for it in rows_slot.items]
     assert "/author" in fact_ptrs
 
     # Gap B: 3-field collection items (`name`, `elevation`, `openRuns` and `title`, `snippet`, `url`)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the batched question types and the predict-to-answer adapter."""
+"""Unit tests for the decision model types and the batched question API."""
 
 from __future__ import annotations
 
@@ -20,14 +20,18 @@ import pytest
 
 from a2ui.core import A2uiValidationError
 from a2ui.inference_formats.decision import (
+    ActionSpec,
+    ActionStyle,
     ComponentSlot,
     DecisionBackend,
+    DecisionBackendError,
     DecisionDistribution,
-    DecisionQuery,
     DecisionTask,
     DeterministicMockBackend,
+    FallbackSource,
     JevHttpBackend,
     StepZeroLogprobBackend,
+    SurfaceOperation,
     SynthesisConfig,
     SynthesisOutput,
     SynthesisStage,
@@ -61,7 +65,7 @@ from a2ui.inference_formats.decision.payload_inspector import (
     split_pointer,
 )
 
-from .layout_fixtures import FIXTURES, HOST, RESORT, ScriptedAnswers
+from .layout_fixtures import FIXTURES, HOST, RESORT, ScriptedAnswers, mock_backend
 
 _LEVELS = ("none", "small", "medium", "large")
 
@@ -236,12 +240,12 @@ async def test_mock_backend_heuristic_answers_every_kind() -> None:
 
 @pytest.mark.asyncio
 async def test_allow_none_adds_and_removes_the_none_option() -> None:
-    seen: list[DecisionQuery] = []
+    seen: list[DecisionQuestion] = []
 
-    def scorer(query: DecisionQuery) -> DecisionDistribution:
-        seen.append(query)
-        n = len(query.candidates)
-        return DecisionDistribution({c: 1.0 / n for c in query.candidates})
+    def scorer(question: DecisionQuestion) -> DecisionDistribution:
+        seen.append(question)
+        candidates = question.candidates()
+        return DecisionDistribution({c: 1.0 / len(candidates) for c in candidates})
 
     backend = DeterministicMockBackend(scorer=scorer)
     with_none, without = await backend.answer(
@@ -250,42 +254,16 @@ async def test_allow_none_adds_and_removes_the_none_option() -> None:
             questions=(_choice("a"), _choice("b", allow_none=False)),
         )
     )
-    assert seen[0].candidates == ("browse", "inspect", "none")
-    assert seen[1].candidates == ("browse", "inspect")
+    assert seen[0].candidates() == ("browse", "inspect", "none")
+    assert seen[1].candidates() == ("browse", "inspect")
     assert "none" in with_none.distribution.probabilities
     assert "none" not in without.distribution.probabilities
 
 
-@pytest.mark.asyncio
-async def test_predict_query_carries_question_context() -> None:
-    seen: list[DecisionQuery] = []
-
-    def scorer(query: DecisionQuery) -> DecisionDistribution:
-        seen.append(query)
-        return DecisionDistribution({c: 1.0 for c in query.candidates[:1]})
-
-    backend = DeterministicMockBackend(scorer=scorer)
-    await backend.answer(
-        DecisionBatch(
-            shared_context={"intent": "Show it", "pointers": ["/a"]},
-            questions=(_choice(), _boolean()),
-        )
-    )
-    choice_query, boolean_query = seen
-    assert choice_query.task is DecisionTask.FAMILY
-    assert choice_query.prompt == "What is the person here to do?"
-    assert choice_query.context["intent"] == "Show it"
-    assert choice_query.context["question_id"] == "family"
-    assert choice_query.context["question_kind"] == "choice"
-    assert choice_query.context["candidate_descriptions"] == {
-        "browse": "Look through things.",
-        "inspect": "Understand one thing.",
-    }
-    assert boolean_query.task is DecisionTask.BLOCK_GATE
-    assert boolean_query.context["candidate_descriptions"] == {
-        "yes": "Results, products, records.",
-        "no": "This is about one thing.",
-    }
+def test_question_task_names_the_id_prefix() -> None:
+    assert _choice().task is DecisionTask.FAMILY
+    assert _boolean().task is DecisionTask.BLOCK_GATE
+    assert _choice("template:pick").task == "template"
 
 
 def test_answer_from_distribution_handles_empty_mass() -> None:
@@ -366,41 +344,36 @@ def test_layout_fixtures_are_the_worked_examples() -> None:
 # --- SynthesisConfig / SynthesisOutput / SynthesisStage ---------------------------
 
 
-def test_synthesis_config_defaults_for_archetypes() -> None:
+def test_synthesis_config_has_three_validated_fields() -> None:
     config = SynthesisConfig()
-    assert config.max_pairs == 400
-    assert config.threshold_overrides == {}
-    tuned = SynthesisConfig(
-        threshold_overrides={"actionGateFloor": 0.8, "actionGateCap": 0.8}
+    assert (config.default_surface_id, config.max_pairs, config.conservativeness) == (
+        "default_surface",
+        400,
+        0.5,
     )
-    assert tuned.threshold_overrides["actionGateFloor"] == pytest.approx(0.8)
-    SynthesisConfig(threshold_overrides={"expected": 0.6, "optional": 0.6})
+    SynthesisConfig(conservativeness=0.0)
+    SynthesisConfig(conservativeness=1.0)
 
 
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"max_pairs": 0}, "max_pairs"),
-        ({"threshold_overrides": {"actionGateFloor": -0.1}}, "actionGateFloor"),
-        ({"threshold_overrides": {"actionGateCap": 1.1}}, "actionGateCap"),
-        (
-            {"threshold_overrides": {"actionGateFloor": 0.9, "actionGateCap": 0.8}},
-            "actionGateFloor must be <=",
-        ),
-        ({"threshold_overrides": {"expected": 1.5}}, "expected"),
-        ({"threshold_overrides": {"optional": -1.0}}, "optional"),
-        (
-            {"threshold_overrides": {"expected": 0.8, "optional": 0.7}},
-            "expected must be <=",
-        ),
-        ({"threshold_overrides": {"reask_below": 2.0}}, "reask_below"),
+        ({"default_surface_id": " "}, "default_surface_id"),
+        ({"conservativeness": -0.01}, "conservativeness"),
+        ({"conservativeness": 1.5}, "conservativeness"),
     ],
 )
-def test_synthesis_config_rejects_bad_archetype_fields(
-    kwargs: dict[str, float], message: str
+def test_synthesis_config_rejects_bad_fields(
+    kwargs: dict[str, object], message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        SynthesisConfig(**kwargs)
+        SynthesisConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_synthesis_config_drops_removed_knobs() -> None:
+    with pytest.raises(TypeError):
+        SynthesisConfig(threshold_overrides={})  # type: ignore[call-arg]
 
 
 def test_synthesis_output_new_fields_default() -> None:
@@ -409,6 +382,9 @@ def test_synthesis_output_new_fields_default() -> None:
     )
     assert output.layout_plan is None
     assert output.trace == ()
+    assert (output.backend_kind, output.model_id) == ("", "")
+    assert output.fallback_reason is None
+    assert output.operation is SurfaceOperation.CREATE
     assert SynthesisStage.ARCHETYPE.value == "archetype"
     plan = LayoutPlan(archetype="detail", family="inspect", blocks=())
     traced = SynthesisOutput(
@@ -634,3 +610,91 @@ def test_inspector_populates_key_and_parent() -> None:
     assert nested["/playback/speed"].parent == "/playback"
     assert nested["/playback/speed"].key == "speed"
     assert nested["/playback/speed"].mutable_hint
+
+
+@pytest.mark.asyncio
+async def test_mock_backend_fixture_scripts_question_ids() -> None:
+    backend = mock_backend(**{"family": "inspect", "gate:collection": 0.85})
+    family, gate = await backend.answer(
+        DecisionBatch(shared_context={}, questions=(_choice(), _boolean()))
+    )
+    assert family.top() == ("inspect", pytest.approx(0.9))
+    assert gate.yes == pytest.approx(0.85)
+    assert backend.batches[0].questions[0].id == "family"
+
+
+# --- Actions, fallbacks, operations, and backend errors -------------------------
+
+
+def test_action_spec_from_label_string() -> None:
+    spec = ActionSpec.from_block_value("send", "Send money")
+    assert spec == ActionSpec(id="send", label="Send money")
+    assert spec.scope is None and spec.key is None and spec.style is None
+    assert spec.context == {}
+
+
+def test_action_spec_from_options_object() -> None:
+    spec = ActionSpec.from_block_value(
+        "archive",
+        {
+            "label": "Archive",
+            "scope": "/messages",
+            "key": "messageId",
+            "context": {"folder": "/folder"},
+            "style": "destructive",
+        },
+    )
+    assert spec.id == "archive"
+    assert spec.label == "Archive"
+    assert spec.scope == "/messages"
+    assert spec.key == "messageId"
+    assert spec.context == {"folder": "/folder"}
+    assert spec.style is ActionStyle.DESTRUCTIVE
+
+
+@pytest.mark.parametrize(
+    ("action_id", "value", "message"),
+    [
+        ("", "Send", "non-empty"),
+        ("  ", "Send", "non-empty"),
+        ("send", "", "label"),
+        ("send", {"scope": "/items"}, "label"),
+        ("send", 3, "label string or an options object"),
+        ("send", {"label": "Send", "colour": "red"}, "unknown option keys"),
+        ("send", {"label": "Send", "scope": "items"}, "JSON Pointer"),
+        ("send", {"label": "Send", "context": ["/a"]}, "context must be an object"),
+        ("send", {"label": "Send", "context": {"a": "a"}}, "JSON Pointer"),
+        ("send", {"label": "Send", "style": "loud"}, "style must be one of"),
+    ],
+)
+def test_action_spec_rejects_malformed_values(
+    action_id: str, value: object, message: str
+) -> None:
+    with pytest.raises(A2uiValidationError, match=message):
+        ActionSpec.from_block_value(action_id, value)  # type: ignore[arg-type]
+
+
+def test_fallback_source_uses_facts_instead_of_card() -> None:
+    assert FallbackSource.FACTS == "fallback_facts"
+    assert [s.name for s in FallbackSource] == ["DSL", "CALLBACK", "FACTS"]
+
+
+def test_layout_plan_records_template_and_operations_are_wire_strings() -> None:
+    plan = LayoutPlan(archetype="detail", family="inspect", blocks=())
+    assert plan.template_id is None
+    chosen = LayoutPlan(
+        archetype="detail", family="inspect", blocks=(), template_id="ticker"
+    )
+    assert chosen.template_id == "ticker"
+    assert [str(op) for op in SurfaceOperation] == ["create", "update_root", "replace"]
+
+
+def test_decision_backend_error_carries_backend_and_cause() -> None:
+    cause = TimeoutError("slow")
+    error = DecisionBackendError(
+        "timed out", backend_kind="jev", model_id="jev-v0", cause=cause
+    )
+    assert isinstance(error, Exception)
+    assert str(error) == "timed out"
+    assert (error.backend_kind, error.model_id, error.cause) == ("jev", "jev-v0", cause)
+    assert DecisionBackendError("x", backend_kind="mock", model_id="m").cause is None
