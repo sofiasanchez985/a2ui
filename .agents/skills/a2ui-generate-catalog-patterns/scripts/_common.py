@@ -87,11 +87,13 @@ def load_catalog(
     )
 
 
-def load_pattern_library(path: str | Path) -> PatternLibrary:
+def load_pattern_library(
+    path: str | Path, *, grammar: ArchetypeGrammar | None = None
+) -> PatternLibrary:
     """Loads and validates a `patterns.json` file or directory."""
     resolved = Path(path).resolve()
     try:
-        return PatternLibrary.from_file(resolved)
+        return PatternLibrary.from_file(resolved, grammar=grammar)
     except (
         PatternError,
         A2uiError,
@@ -99,7 +101,10 @@ def load_pattern_library(path: str | Path) -> PatternLibrary:
         json.JSONDecodeError,
         ValueError,
     ) as exc:
-        raise ToolError(f"Invalid patterns file at {resolved}: {exc}") from exc
+        raise ToolError(
+            f"Invalid patterns file at {resolved}: {exc} (see"
+            " patterns_authoring_guide.md#top-level-file-structure)"
+        ) from exc
 
 
 def load_template_registry(path: str | Path) -> TemplateRegistry:

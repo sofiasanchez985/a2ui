@@ -278,8 +278,8 @@ _ENTRY_FIELD_VARIANT: dict[str, Any] = {
 
 DESIGN_SYSTEM_PATTERNS: dict[str, Any] = {
     "$schema": "https://a2ui.org/specification/v1_0/decision/pattern_definition.json",
-    "catalogIds": [DESIGN_SYSTEM_CATALOG_ID],
-    "version": "1",
+    "catalogId": DESIGN_SYSTEM_CATALOG_ID,
+    "grammarVersion": "1",
     "patterns": {
         "page": {
             "slots": ["title", "subtitle", "mark", "blocks"],
@@ -475,7 +475,10 @@ DESIGN_SYSTEM_PATTERNS: dict[str, Any] = {
                     "id": "action_trigger",
                     "component": "Trigger",
                     "label": {"$slot": "label"},
-                    "onPress": {"$event": "label"},
+                    "onPress": {
+                        "$event": "action",
+                        "context": {"$actionContext": True},
+                    },
                 },
             ],
         },

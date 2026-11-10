@@ -60,6 +60,23 @@ from synthetic_bindings import (
 )
 
 _CRITERIA_PATTERN_RE = re.compile(r"\bpattern:([a-z_]+)(?::([A-Za-z0-9_]+))?\b")
+_REQUIRED_PROP_RE = re.compile(r"'([^']+)' is a required property")
+_ADDITIONAL_PROP_RE = re.compile(r"Additional properties are not allowed \('([^']+)'")
+_NON_ACTION_EVENT_SLOTS: frozenset[str] = frozenset({
+    "label",
+    "sendLabel",
+    "title",
+    "headline",
+    "subtitle",
+    "text",
+    "body",
+    "caption",
+    "supporting",
+    "detail",
+    "value",
+    "picture",
+    "icon",
+})
 
 
 @dataclass(frozen=True)
@@ -195,6 +212,269 @@ def _first_line(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _format_failure_message(
+    *,
+    file_path: Path | None,
+    pattern: str,
+    component_id: str,
+    component_type: str | None = None,
+    prop: str,
+    rule: str,
+    anchor: str,
+) -> str:
+    """Formats an actionable failure message naming file, pattern, component, property, rule, and guide link."""
+    file_label = file_path.name if file_path is not None else "patterns.json"
+    comp_desc = (
+        f"component '{component_id}' ({component_type})"
+        if component_type
+        else f"component '{component_id}'"
+    )
+    return (
+        f"{file_label}: pattern '{pattern}', {comp_desc}, property '{prop}':"
+        f" {rule} (see patterns_authoring_guide.md#{anchor})"
+    )
+
+
+def _infer_prop_from_message(msg: str) -> str:
+    """Infers a component property name from a schema validation message."""
+    req_match = _REQUIRED_PROP_RE.search(msg)
+    if req_match is not None:
+        return req_match.group(1)
+    add_match = _ADDITIONAL_PROP_RE.search(msg)
+    if add_match is not None:
+        return add_match.group(1)
+    return "component"
+
+
+def _resolve_template_component(
+    expanded_id: str,
+    comp_type: str | None,
+    cat_pattern: CatalogPattern | None,
+    block_id: str | None,
+    knobs: Mapping[str, str],
+) -> tuple[str, str | None]:
+    """Maps an expanded component ID back to its template ID and type in `patterns.json`."""
+    if cat_pattern is None:
+        return (expanded_id, comp_type)
+    variant = cat_pattern.select_variant(knobs)
+    root_aliases = {variant.root, "root"}
+    if block_id is not None:
+        root_aliases.add(f"{block_id}_root")
+    for tpl in variant.components:
+        tpl_id = str(tpl.get("id", ""))
+        tpl_type = str(tpl.get("component", "")) or comp_type
+        if tpl_id == variant.root and expanded_id in root_aliases:
+            return (tpl_id, tpl_type)
+        if block_id is not None and (
+            expanded_id == f"{block_id}_{tpl_id}"
+            or expanded_id.startswith(f"{block_id}_{tpl_id}_")
+        ):
+            return (tpl_id, tpl_type)
+        if expanded_id == tpl_id or expanded_id.startswith(f"{tpl_id}_"):
+            return (tpl_id, tpl_type)
+    return (expanded_id, comp_type)
+
+
+def _extract_schema_failure_target(
+    exc: Exception,
+    components: Sequence[Mapping[str, Any]],
+    cat_pattern: CatalogPattern | None,
+    block_id: str | None,
+    knobs: Mapping[str, str],
+) -> tuple[str, str | None, str]:
+    """Extracts `(template_component_id, component_type, property_name)` from a schema error."""
+    msg = _first_line(exc)
+    exc_path = getattr(exc, "path", None)
+    expanded_id = (
+        cat_pattern.select_variant(knobs).root if cat_pattern is not None else "<root>"
+    )
+    comp_type: str | None = None
+    prop = _infer_prop_from_message(msg)
+
+    if isinstance(exc_path, str) and exc_path.startswith("/components/"):
+        parts = exc_path.strip("/").split("/")
+        if len(parts) >= 2 and parts[1].isdigit():
+            idx = int(parts[1])
+            if 0 <= idx < len(components):
+                comp = components[idx]
+                expanded_id = str(comp.get("id", expanded_id))
+                comp_type = str(comp.get("component", "")) or None
+        if len(parts) >= 3:
+            prop = ".".join(parts[2:])
+
+    tpl_id, tpl_type = _resolve_template_component(
+        expanded_id, comp_type, cat_pattern, block_id, knobs
+    )
+    return (tpl_id, tpl_type, prop)
+
+
+def _is_valid_event_target(target: Any) -> bool:
+    """Returns whether `target` is a valid `$event` action slot binding."""
+    if isinstance(target, str):
+        return bool(target.strip()) and target not in _NON_ACTION_EVENT_SLOTS
+    if isinstance(target, Mapping):
+        action_slot = target.get("$action")
+        return (
+            len(target) == 1
+            and isinstance(action_slot, str)
+            and bool(action_slot.strip())
+            and action_slot not in _NON_ACTION_EVENT_SLOTS
+        )
+    return False
+
+
+def _check_event_context(ctx_val: Any, *, ctx_prop: str) -> tuple[str, str] | None:
+    """Validates the `context` sub-object of an `$event` directive."""
+    if ctx_val is None:
+        return None
+    if not isinstance(ctx_val, Mapping):
+        return (
+            ctx_prop,
+            "$event 'context' must be an object or {'$actionContext': True}",
+        )
+    if "$actionContext" in ctx_val and dict(ctx_val) != {"$actionContext": True}:
+        return (
+            ctx_prop,
+            (
+                "$actionContext must be {'$actionContext': True} as"
+                " the entire 'context' mapping"
+            ),
+        )
+    if any(v == "$item" for v in ctx_val.values()):
+        return (
+            ctx_prop,
+            (
+                "legacy '$item' context shorthand is not supported;"
+                " use {'$actionContext': True}"
+            ),
+        )
+    return None
+
+
+def _check_event_mapping(
+    node: Mapping[str, Any], *, prop_path: str
+) -> tuple[str, str] | None:
+    """Validates an `$event` or `$actionContext` directive mapping."""
+    if "$event" in node:
+        target = node["$event"]
+        if not _is_valid_event_target(target):
+            return (
+                prop_path,
+                (
+                    "$event must bind an action slot ('action' or"
+                    f" {{'$action': 'action'}}) rather than {target!r}"
+                ),
+            )
+        if "context" in node:
+            return _check_event_context(
+                node["context"], ctx_prop=f"{prop_path}.context"
+            )
+        return None
+    if "$actionContext" in node:
+        return (
+            prop_path,
+            (
+                "$actionContext is only valid as 'context':"
+                " {'$actionContext': True} inside an $event directive"
+            ),
+        )
+    return None
+
+
+def _walk_property_directives(value: Any, *, prop_path: str) -> list[tuple[str, str]]:
+    """Recursively checks a component property value for invalid `$event` or `$actionContext` directives."""
+    if isinstance(value, Mapping):
+        finding = _check_event_mapping(value, prop_path=prop_path)
+        if finding is not None:
+            return [finding]
+        if "$event" in value:
+            return []
+        out: list[tuple[str, str]] = []
+        for k, v in value.items():
+            out.extend(_walk_property_directives(v, prop_path=f"{prop_path}.{k}"))
+        return out
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        out = []
+        for item in value:
+            out.extend(_walk_property_directives(item, prop_path=prop_path))
+        return out
+    return []
+
+
+def _validate_component_template_directives(
+    comp_tpl: Mapping[str, Any],
+    *,
+    pattern_name: str,
+    block_id: str | None,
+    knobs: Mapping[str, str],
+    patterns_path: Path | None,
+    default_id: str,
+) -> list[ExpansionFailure]:
+    """Validates `$event` and `$actionContext` directives on one component template dict."""
+    comp_id = str(comp_tpl.get("id", default_id))
+    comp_type = str(comp_tpl.get("component", "")) or None
+    failures: list[ExpansionFailure] = []
+    for prop_name, prop_val in comp_tpl.items():
+        if prop_name in ("id", "component"):
+            continue
+        for failed_prop, rule in _walk_property_directives(
+            prop_val, prop_path=prop_name
+        ):
+            failures.append(
+                ExpansionFailure(
+                    pattern=pattern_name,
+                    block_id=block_id,
+                    knobs=dict(knobs),
+                    stage="lint",
+                    message=_format_failure_message(
+                        file_path=patterns_path,
+                        pattern=pattern_name,
+                        component_id=comp_id,
+                        component_type=comp_type,
+                        prop=failed_prop,
+                        rule=rule,
+                        anchor="action-events-and-action-context",
+                    ),
+                )
+            )
+    return failures
+
+
+def _validate_pattern_directives(
+    cat_pattern: CatalogPattern,
+    *,
+    block_id: str | None,
+    patterns_path: Path | None,
+) -> list[ExpansionFailure]:
+    """Validates `$event` and `$actionContext` directives across all variants and fieldVariants of `cat_pattern`."""
+    failures: list[ExpansionFailure] = []
+    for variant in cat_pattern.variants:
+        variant_knobs = {k: v[0] for k, v in variant.when.items() if v}
+        for comp_tpl in variant.components:
+            failures.extend(
+                _validate_component_template_directives(
+                    comp_tpl,
+                    pattern_name=cat_pattern.name,
+                    block_id=block_id,
+                    knobs=variant_knobs,
+                    patterns_path=patterns_path,
+                    default_id=variant.root,
+                )
+            )
+    for fv_name, fv_tpl in cat_pattern.field_variants.items():
+        failures.extend(
+            _validate_component_template_directives(
+                fv_tpl,
+                pattern_name=cat_pattern.name,
+                block_id=block_id,
+                knobs={},
+                patterns_path=patterns_path,
+                default_id=f"fieldVariants.{fv_name}",
+            )
+        )
+    return failures
+
+
 def _check_expanded_surface(
     pattern_name: str,
     block_id: str | None,
@@ -202,18 +482,39 @@ def _check_expanded_surface(
     components: Sequence[Mapping[str, Any]],
     payload: Mapping[str, Any],
     graph: CatalogDecisionGraph,
+    *,
+    cat_pattern: CatalogPattern | None = None,
+    patterns_path: Path | None = None,
 ) -> list[ExpansionFailure]:
     """Runs `lint_components` and `validate_payload` on an expanded component list."""
     failures: list[ExpansionFailure] = []
+    default_root = (
+        cat_pattern.select_variant(knobs).root if cat_pattern is not None else "<root>"
+    )
     for finding in lint_components(components, plan=None):
         if finding.severity == "error":
+            tpl_id, tpl_type = _resolve_template_component(
+                finding.component_id or default_root,
+                None,
+                cat_pattern,
+                block_id,
+                knobs,
+            )
             failures.append(
                 ExpansionFailure(
                     pattern=pattern_name,
                     block_id=block_id,
                     knobs=dict(knobs),
                     stage="lint",
-                    message=f"{finding.code}: {finding.message}",
+                    message=_format_failure_message(
+                        file_path=patterns_path,
+                        pattern=pattern_name,
+                        component_id=tpl_id,
+                        component_type=tpl_type,
+                        prop="children",
+                        rule=f"{finding.code}: {finding.message}",
+                        anchor="container-topology-and-lint-rules",
+                    ),
                 )
             )
     try:
@@ -223,13 +524,24 @@ def _check_expanded_surface(
         models = to_message_models(raw_msgs)
         validate_payload(graph.catalogs, models)
     except (A2uiError, ValueError, TypeError) as exc:
+        tpl_id, tpl_type, prop = _extract_schema_failure_target(
+            exc, components, cat_pattern, block_id, knobs
+        )
         failures.append(
             ExpansionFailure(
                 pattern=pattern_name,
                 block_id=block_id,
                 knobs=dict(knobs),
                 stage="schema",
-                message=_first_line(exc),
+                message=_format_failure_message(
+                    file_path=patterns_path,
+                    pattern=pattern_name,
+                    component_id=tpl_id,
+                    component_type=tpl_type,
+                    prop=prop,
+                    rule=_first_line(exc),
+                    anchor="component-schema-and-required-properties",
+                ),
             )
         )
     return failures
@@ -257,6 +569,8 @@ def dry_run_block(
     library: PatternLibrary,
     block: BlockSpec,
     graph: CatalogDecisionGraph,
+    *,
+    patterns_path: Path | None = None,
 ) -> tuple[int, list[ExpansionFailure], list[str]]:
     """Dry-runs `block` across all knob combinations of its resolved pattern."""
     resolved = resolve_fallback_pattern(block, library)
@@ -277,14 +591,16 @@ def dry_run_block(
     bindings = synthetic_block_bindings(block)
     instances = synthetic_instances(block, bindings)
     payload = synthetic_payload(block)
-    failures: list[ExpansionFailure] = []
+    failures: list[ExpansionFailure] = _validate_pattern_directives(
+        cat_pattern, block_id=block.id, patterns_path=patterns_path
+    )
     runs = 0
 
     for knobs in combos:
         merged_knobs = {**knobs, **resolved.knobs}
         runs += 1
         try:
-            expanded = expander.expand_block(
+            expansion = expander.expand_block(
                 block.id,
                 block.pattern,
                 bindings,
@@ -292,14 +608,23 @@ def dry_run_block(
                 instances,
                 block.id,
             )
+            expanded = expansion.components
         except (PatternError, A2uiError, KeyError, ValueError) as exc:
+            variant_root = cat_pattern.select_variant(merged_knobs).root
             failures.append(
                 ExpansionFailure(
                     pattern=cat_pattern.name,
                     block_id=block.id,
                     knobs=merged_knobs,
                     stage="expand",
-                    message=_first_line(exc),
+                    message=_format_failure_message(
+                        file_path=patterns_path,
+                        pattern=cat_pattern.name,
+                        component_id=variant_root,
+                        prop="root",
+                        rule=_first_line(exc),
+                        anchor="pattern-expansion-directives",
+                    ),
                 )
             )
             continue
@@ -311,6 +636,8 @@ def dry_run_block(
                 expanded,
                 payload,
                 graph,
+                cat_pattern=cat_pattern,
+                patterns_path=patterns_path,
             )
         )
     return (runs, failures, warnings)
@@ -330,9 +657,10 @@ def _expand_seed_block_for_page(
         bindings = synthetic_block_bindings(block)
         instances = synthetic_instances(block, bindings)
         try:
-            comps = expander.expand_block(
+            expansion = expander.expand_block(
                 block.id, block.pattern, bindings, {}, instances, block.id
             )
+            comps = expansion.components
             if comps:
                 return (
                     comps,
@@ -349,6 +677,8 @@ def dry_run_page(
     grammar: ArchetypeGrammar,
     library: PatternLibrary,
     graph: CatalogDecisionGraph,
+    *,
+    patterns_path: Path | None = None,
 ) -> tuple[int, list[ExpansionFailure], list[str]]:
     """Dry-runs the `page` pattern paired with one expanded seed block."""
     page_pattern = library.get("page")
@@ -361,7 +691,14 @@ def dry_run_page(
                     block_id=None,
                     knobs={},
                     stage="expand",
-                    message="Pattern 'page' is required in patterns.json.",
+                    message=_format_failure_message(
+                        file_path=patterns_path,
+                        pattern="page",
+                        component_id="<root>",
+                        prop="patterns.page",
+                        rule="Pattern 'page' is required in patterns.json.",
+                        anchor="top-level-file-structure",
+                    ),
                 )
             ],
             [],
@@ -376,28 +713,48 @@ def dry_run_page(
         warnings.append(f"Pattern 'page' knob combinations truncated at {len(combos)}.")
 
     page_bindings = synthetic_page_bindings()
-    failures: list[ExpansionFailure] = []
+    failures: list[ExpansionFailure] = _validate_pattern_directives(
+        page_pattern, block_id=None, patterns_path=patterns_path
+    )
     runs = 0
     for knobs in combos:
         runs += 1
         try:
-            page_comps = expander.expand_page(
+            page_expansion = expander.expand_page(
                 page_bindings, block_roots=block_roots, knobs=knobs
             )
+            page_comps = page_expansion.components
         except (PatternError, A2uiError, KeyError, ValueError) as exc:
+            variant_root = page_pattern.select_variant(knobs).root
             failures.append(
                 ExpansionFailure(
                     pattern="page",
                     block_id=None,
                     knobs=dict(knobs),
                     stage="expand",
-                    message=_first_line(exc),
+                    message=_format_failure_message(
+                        file_path=patterns_path,
+                        pattern="page",
+                        component_id=variant_root,
+                        prop="root",
+                        rule=_first_line(exc),
+                        anchor="pattern-expansion-directives",
+                    ),
                 )
             )
             continue
         combined = [*page_comps, *seed_comps]
         failures.extend(
-            _check_expanded_surface("page", None, knobs, combined, payload, graph)
+            _check_expanded_surface(
+                "page",
+                None,
+                knobs,
+                combined,
+                payload,
+                graph,
+                cat_pattern=page_pattern,
+                patterns_path=patterns_path,
+            )
         )
     return (runs, failures, warnings)
 
@@ -622,7 +979,12 @@ def _resolve_sidecar_paths(
     return (p_path, t_path)
 
 
-def _evaluate_pattern_library(loaded: LoadedCatalog, library: PatternLibrary) -> tuple[
+def _evaluate_pattern_library(
+    loaded: LoadedCatalog,
+    library: PatternLibrary,
+    *,
+    patterns_path: Path | None = None,
+) -> tuple[
     int,
     list[ExpansionFailure],
     list[str],
@@ -634,10 +996,20 @@ def _evaluate_pattern_library(loaded: LoadedCatalog, library: PatternLibrary) ->
     unknown = _unknown_pattern_names(loaded.grammar, library)
     expander = PatternExpander(library, loaded.graph, grammar=loaded.grammar)
     expansions_run, failures, warnings = dry_run_page(
-        expander, loaded.grammar, library, loaded.graph
+        expander,
+        loaded.grammar,
+        library,
+        loaded.graph,
+        patterns_path=patterns_path,
     )
     for block in loaded.grammar.blocks.values():
-        b_runs, b_fails, b_warns = dry_run_block(expander, library, block, loaded.graph)
+        b_runs, b_fails, b_warns = dry_run_block(
+            expander,
+            library,
+            block,
+            loaded.graph,
+            patterns_path=patterns_path,
+        )
         expansions_run += b_runs
         failures.extend(b_fails)
         warnings.extend(b_warns)
@@ -715,11 +1087,18 @@ def validate_catalog_artifacts(
 
     library: PatternLibrary | None = None
     if p_path is not None:
-        library = load_pattern_library(p_path)
-        if loaded.catalog.catalog_id not in library.catalog_ids:
+        library = load_pattern_library(p_path, grammar=loaded.grammar)
+        if library.catalog_id != loaded.catalog.catalog_id:
             raise ToolError(
-                f"Patterns file {p_path} catalogIds {list(library.catalog_ids)} does"
-                f" not contain catalogId '{loaded.catalog.catalog_id}'."
+                f"Patterns file {p_path} catalogId '{library.catalog_id}' does"
+                f" not match catalog '{loaded.catalog.catalog_id}' (see"
+                " patterns_authoring_guide.md#top-level-file-structure)."
+            )
+        if library.grammar_version != loaded.grammar.version:
+            raise ToolError(
+                f"Patterns file {p_path} grammarVersion '{library.grammar_version}'"
+                f" does not match grammar version '{loaded.grammar.version}' (see"
+                " patterns_authoring_guide.md#top-level-file-structure)."
             )
 
     registry = load_template_registry(t_path) if t_path is not None else None
@@ -738,7 +1117,7 @@ def validate_catalog_artifacts(
             unknown,
             blocks_cov,
             archs_cov,
-        ) = _evaluate_pattern_library(loaded, library)
+        ) = _evaluate_pattern_library(loaded, library, patterns_path=p_path)
 
     sample_reports, sample_ptr_paths, union_eligible = _evaluate_sample_payloads(
         loaded, samples, library, registry
@@ -751,9 +1130,16 @@ def validate_catalog_artifacts(
                 block_id=None,
                 knobs={},
                 stage="payload",
-                message=(
-                    "Zero archetypes are eligible across all sample payloads in"
-                    " --payload."
+                message=_format_failure_message(
+                    file_path=resolved_payload_path,
+                    pattern="<payload>",
+                    component_id="<none>",
+                    prop="samples",
+                    rule=(
+                        "Zero archetypes are eligible across all sample payloads in"
+                        " --payload."
+                    ),
+                    anchor="sample-payloads",
                 ),
             )
         )
