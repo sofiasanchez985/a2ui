@@ -468,3 +468,11 @@ async def test_backend_errors_propagate_without_any_fallback() -> None:
         )
     assert info.value.backend_kind == "jev"
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_empty_fallback_fn_result_passes_to_the_facts_link() -> None:
+    out = await _synth(ABSTAIN, fallback_fn=lambda *args: []).synthesize(
+        HOST.intent, HOST.payload
+    )
+    assert out.fallback_source is FallbackSource.FACTS

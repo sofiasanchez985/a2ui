@@ -599,6 +599,7 @@ class DecisionSynthesizer:
                 f" {known or 'none'}."
             )
         components = [copy_lib.deepcopy(dict(c)) for c in template.components]
+        self._stamp_multi_catalog_id(components, template.catalog_id)
         messages = self._build_validated_messages(
             request.surface_id, components, data, request.operation
         )
@@ -628,7 +629,8 @@ class DecisionSynthesizer:
 
         Order: the block's `fallback_dsl`, then the configured `fallback_fn`,
         then one `facts` pattern rendering of the payload from the active
-        pattern library. `fallback_source` names the link that produced the
+        pattern library. A link that yields no messages passes to the next.
+        `fallback_source` names the link that produced the
         messages and `fallback_reason` why the chain ran.
 
         Raises:
@@ -639,14 +641,16 @@ class DecisionSynthesizer:
             messages = self._compile_fallback_dsl(
                 fallback_dsl, data, request.surface_id
             )
-            return self._fallback_output(
-                abstained, messages, FallbackSource.DSL, reason, request
-            )
+            if messages:
+                return self._fallback_output(
+                    abstained, messages, FallbackSource.DSL, reason, request
+                )
         if self._fallback_fn is not None:
             messages = await self._run_fallback_fn(intent, data, request.surface_id)
-            return self._fallback_output(
-                abstained, messages, FallbackSource.CALLBACK, reason, request
-            )
+            if messages:
+                return self._fallback_output(
+                    abstained, messages, FallbackSource.CALLBACK, reason, request
+                )
         facts = self._facts_fallback(intent, data, pointers, request)
         if facts is not None:
             messages, operation = facts

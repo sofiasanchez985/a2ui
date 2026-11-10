@@ -224,7 +224,7 @@ class DecisionRenderTool:
                     "type": "boolean",
                     "description": (
                         "Delete the surface and create it again instead of"
-                        " creating it fresh. Defaults to false."
+                        " updating it in place. Defaults to false."
                     ),
                 },
                 "actions": _ACTIONS_SCHEMA,

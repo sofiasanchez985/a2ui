@@ -138,6 +138,8 @@ class DecisionParser(Parser):
                 surface_sends_data_model=sends_data_model,
                 **block.to_synthesis_kwargs(default_surface_id=default_id),
             )
+        except A2uiError:
+            raise
         except Exception as exc:
             raise _as_compilation_error(exc, format_content) from exc
         _require_messages(output, format_content)
@@ -271,6 +273,8 @@ class DecisionParser(Parser):
                     block.payload,
                     **block.to_synthesis_kwargs(default_surface_id=default_id),
                 )
+            except A2uiError:
+                raise
             except Exception as exc:
                 raise _as_compilation_error(exc, format_content) from exc
             _require_messages(output, format_content)
@@ -316,14 +320,12 @@ class DecisionParser(Parser):
 
 
 def _as_compilation_error(exc: Exception, format_content: str) -> A2uiError:
-    """Maps a synthesis failure to the error the parser raises.
+    """Maps a non-A2UI synthesis failure to the error the parser raises.
 
-    A2UI errors pass through. Bad block values become validation errors. A
+    Bad block values become validation errors. A
     `DecisionBackendError` (timeout or transport failure) becomes a
     compilation error naming the backend; no fallback runs for it.
     """
-    if isinstance(exc, A2uiError):
-        return exc
     if isinstance(exc, DecisionBackendError):
         return A2uiCompilationError(
             message=(
