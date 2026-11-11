@@ -386,14 +386,14 @@ async def test_jev_http_backend_answer_native_and_systemone() -> None:
     async with _json_client(sys1_handler) as client:
         jev_sys1 = JevHttpBackend(
             "https://api.example.com/v1/systemone",
-            model="vertex/decision-gemma",
+            model="jev-1.14.0",
             auth="secret-bearer-token",
             client=client,
         )
         sys1_answers = await jev_sys1.answer(batch)
 
     assert len(sys1_requests) == 1
-    assert sys1_requests[0]["model"] == "vertex/decision-gemma"
+    assert sys1_requests[0]["model"] == "jev-1.14.0"
     assert sys1_requests[0]["state"] == "User intent: Show overview"
     assert sys1_requests[0]["questions"]["gate:picture"]["type"] == "noul"
     assert sys1_requests[0]["questions"]["stakes"] == {
