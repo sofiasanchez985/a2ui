@@ -388,6 +388,8 @@ def _matches_primary_type(sem_type: str, target: str, ptr: PointerSummary) -> bo
         return ptr.value_type in {"string", "number", "boolean"}
     if target == "mutable":
         return ptr.mutable_hint and ptr.value_type in {"string", "number", "boolean"}
+    if target in {"string", "long_text"} and sem_type == "empty":
+        return ptr.mutable_hint and ptr.value_type == "string"
     return False
 
 
@@ -4066,6 +4068,24 @@ class LayoutPlanner:
                 return "feed", max(prob, feed_p)
         return chosen, prob
 
+    def _is_cumulative_no_fit(
+        self,
+        fam_ans: DecisionAnswer | None,
+        arch_ans: DecisionAnswer,
+        state: PlannerState,
+    ) -> bool:
+        """Checks whether cumulative two-stage `none` probability exceeds the no-fit limit."""
+        if self._brief_pinned_family(state.brief) is not None:
+            return False
+        fam_none = (
+            fam_ans.distribution.probabilities.get("none", 0.0)
+            if fam_ans is not None
+            else 0.0
+        )
+        arch_none = arch_ans.distribution.probabilities.get("none", 0.0)
+        combined_none = 1.0 - (1.0 - fam_none) * (1.0 - arch_none)
+        return arch_none >= 0.22 and combined_none >= 0.32
+
     def _read_archetype(
         self, state: PlannerState, family: str
     ) -> tuple[LayoutArchetype | None, float]:
@@ -4082,7 +4102,11 @@ class LayoutPlanner:
         )
         thresh = self.threshold("archetype")
         fam_ans = state.answers_by_id.get("family")
-        if chosen == "none" or prob < thresh:
+        if (
+            chosen == "none"
+            or prob < thresh
+            or self._is_cumulative_no_fit(fam_ans, arch_ans, state)
+        ):
             if fam_ans is not None and fam_ans.top()[0] != family and fam_archs:
                 return self._redirected_archetype(
                     arch_q, arch_ans, fam_ans, fam_archs, prob, thresh, state
