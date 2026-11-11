@@ -17,14 +17,14 @@ Every turn ends with a footer card naming the mode, the decision backend and its
 
 ## Running the agent
 
-Use [`run.sh`](run.sh) with a preset name (`mock`, `jev`, `gev`, `express`, `direct`, or `tool`):
+Use [`run.sh`](run.sh) with a preset name (`mock`, `jev`, `gemini`, `express`, `direct`, or `tool`):
 
 ```bash
 cd samples/agent/adk/format_playground
 export GEMINI_API_KEY=...
 
 ./run.sh mock       # deterministic offline heuristic (default)
-./run.sh gev        # starts local Gev server (vertex/decision-gemma) and connects to it
+./run.sh gemini     # Google Gemini Decisions API (/v1beta/decisions, gemini-decision-1)
 JEV_API_KEY=... ./run.sh jev   # remote TypeSafe Jev (/v1/systemone)
 ./run.sh express    # start in express render mode
 ./run.sh direct     # start in direct render mode
@@ -49,7 +49,8 @@ them. The resolved backend is shown in `/help` and in every footer.
 | Backend             | Setup                                                                            | What to expect                                                                                     |
 | :------------------ | :------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- |
 | `mock`              | Nothing. Runs offline.                                                           | A deterministic keyword heuristic. Layouts are plain; use it to check the wiring, not the quality. |
-| `jev` / `systemone` | `A2UI_DECISION_BACKEND=jev A2UI_DECISION_URL=https://... A2UI_DECISION_AUTH=adc` | Remote decision model over HTTP.                                                                   |
+| `jev` / `systemone` | `A2UI_DECISION_BACKEND=jev A2UI_DECISION_URL=https://... A2UI_DECISION_AUTH=adc` | Remote decision model over HTTP (`/v1/systemone`).                                                 |
+| `gemini`            | `A2UI_DECISION_BACKEND=gemini GEMINI_API_KEY=...`                                | Google Gemini Decisions API (`/v1beta/decisions`, model `gemini-decision-1`).                      |
 | `step0`             | `A2UI_DECISION_BACKEND=step0 A2UI_DECISION_URL=https://.../v1/completions`       | Step-0 single-token logprob scoring over an OpenAI-compatible completions endpoint.                |
 
 ## Running the client
@@ -80,7 +81,7 @@ the quickest way to try your own data shapes.
 | Command                                             | Effect                                                                                 |
 | :-------------------------------------------------- | :------------------------------------------------------------------------------------- |
 | `/mode decision` \| `express` \| `direct` \| `tool` | Picks how the next requests render.                                                    |
-| `/backend jev` \| `gev` \| `mock`                   | Switches the active decision model backend at runtime; a backend name is required.     |
+| `/backend jev` \| `gemini` \| `mock`                | Switches the active decision model backend at runtime; a backend name is required.     |
 | `/compare`                                          | Renders the next request through all three chat modes from the same data.              |
 | `/trace`                                            | Shows the planner's questions, answers, and thresholds for the last `decision` render. |
 | `/rate <mode> [comment]`                            | Records a preference vote for the last rendered turn.                                  |

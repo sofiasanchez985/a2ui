@@ -102,18 +102,19 @@ def test_backend_display_name_maps_bundled_backends(
     assert (
         backend_display_name(
             JevHttpBackend(
-                "http://127.0.0.1:8790/v1/systemone",
-                model="vertex/decision-gemma",
+                "https://generativelanguage.googleapis.com/v1beta/decisions",
+                model="gemini-decision-1",
             )
         )
-        == "gev (vertex/decision-gemma)"
+        == "gemini (gemini-decision-1)"
     )
 
     monkeypatch.setenv("JEV_API_KEY", "vcp_test_key")
     jev_b = build_named_backend("jev")
     assert backend_display_name(jev_b) == "jev"
-    gev_b = build_named_backend("gev")
-    assert backend_display_name(gev_b) == "gev (vertex/decision-gemma)"
+    monkeypatch.setenv("GEMINI_API_KEY", "gem_test_key")
+    gemini_b = build_named_backend("gemini")
+    assert backend_display_name(gemini_b) == "gemini (gemini-decision-1)"
 
     class Custom:
         pass

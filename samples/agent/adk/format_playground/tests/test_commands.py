@@ -32,7 +32,7 @@ from modes import PlaygroundSettings, RenderMode
         ("/mode tool", Command("mode", "tool")),
         ("/mode", Command("mode", None)),
         ("/backend jev", Command("backend", "jev")),
-        ("/backend gev", Command("backend", "gev")),
+        ("/backend gemini", Command("backend", "gemini")),
         ("/backend", Command("backend", None)),
         ("/compare", Command("compare")),
         ("/trace", Command("trace")),

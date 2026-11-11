@@ -45,9 +45,7 @@ from a2ui.inference_formats.decision import (
     DecisionFormatFactory,
     DecisionRecord,
     DecisionSynthesizer,
-    DecisionWireFormat,
     DeterministicMockBackend,
-    JevHttpBackend,
     QuestionKind,
     SynthesisConfig,
     SynthesisOutput,
@@ -79,15 +77,7 @@ _DECISION_ERRORS = (A2uiError, ValueError, TypeError, DecisionBackendError)
 
 def backend_display_name(backend: DecisionBackend) -> str:
     """The backend's `backend_kind`, plus its `model_id` when it is not a default."""
-    if isinstance(backend, JevHttpBackend):
-        url_lower = backend.endpoint_url.lower()
-        is_local_gev = backend.model_id.startswith("vertex/") or (
-            ("127.0.0.1" in url_lower or "localhost" in url_lower)
-            and url_lower.rstrip("/").endswith("/v1/systemone")
-        )
-        label = "gev" if is_local_gev else backend.backend_kind
-    else:
-        label = getattr(backend, "backend_kind", type(backend).__name__)
+    label = getattr(backend, "backend_kind", type(backend).__name__)
     model_id = getattr(backend, "model_id", "")
     if model_id and model_id not in ("default", label):
         return f"{label} ({model_id})"
@@ -95,19 +85,25 @@ def backend_display_name(backend: DecisionBackend) -> str:
 
 
 def build_named_backend(name: str) -> DecisionBackend:
-    """Constructs a named playground decision backend (`jev`, `gev`, `mock`)."""
+    """Constructs a named playground decision backend (`jev`, `gemini`, `mock`)."""
     clean = name.strip().lower()
     if clean == "mock":
         return DeterministicMockBackend()
-    if clean == "gev":
-        host = os.environ.get("GEV_HOST", "127.0.0.1")
-        port = os.environ.get("GEV_PORT", "8790")
-        url = os.environ.get("GEV_URL") or f"http://{host}:{port}/v1/systemone"
-        model = os.environ.get("GEV_MODEL") or "vertex/decision-gemma"
-        return JevHttpBackend(
-            url,
-            wire_format=DecisionWireFormat.SYSTEMONE,
-            model=model,
+    if clean == "gemini":
+        key = (
+            os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("A2UI_DECISION_AUTH")
+            or os.environ.get("A2UI_DECISION_TOKEN")
+        )
+        gemini_url = os.environ.get("GEMINI_DECISION_URL")
+        if not key and not gemini_url:
+            raise ValueError("GEMINI_API_KEY is not set in the environment or ~/.env.")
+        return create_decision_backend(
+            "gemini",
+            endpoint_url=gemini_url,
+            model=os.environ.get("GEMINI_DECISION_MODEL"),
+            auth=key,
         )
     if clean in ("jev", "systemone"):
         key = (
@@ -125,7 +121,7 @@ def build_named_backend(name: str) -> DecisionBackend:
             model=os.environ.get("JEV_MODEL"),
             auth=key,
         )
-    raise ValueError(f"Unknown decision backend `{name}`; choose jev, gev, or mock.")
+    raise ValueError(f"Unknown decision backend `{name}`; choose jev, gemini, or mock.")
 
 
 def stage2_user_text(block: DecisionBlock, surface_id: str) -> str:

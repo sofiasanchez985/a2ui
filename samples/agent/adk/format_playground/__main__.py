@@ -53,7 +53,7 @@ class MissingAPIKeyError(Exception):
     "--backend",
     default=None,
     help=(
-        "Decision backend ('mock', 'jev', 'systemone', 'step0');"
+        "Decision backend ('mock', 'jev', 'gemini', 'systemone', 'step0');"
         " overrides A2UI_DECISION_BACKEND."
     ),
 )
