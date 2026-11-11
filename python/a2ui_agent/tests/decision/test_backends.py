@@ -99,13 +99,13 @@ def _logprob_response(top: dict[str, float]) -> httpx.Response:
 
 
 def test_backends_satisfy_the_protocol_with_kind_model_and_capabilities() -> None:
-    jev = JevHttpBackend("http://jev.local/predict", model="jev-v0")
+    jev = JevHttpBackend("http://jev.local/predict", model="jev-1.14.0")
     step0 = StepZeroLogprobBackend("http://vllm.local/v1/completions", "gemma")
     mock = DeterministicMockBackend()
 
     for backend in (jev, step0, mock):
         assert isinstance(backend, DecisionBackend)
-    assert (jev.backend_kind, jev.model_id) == ("jev", "jev-v0")
+    assert (jev.backend_kind, jev.model_id) == ("jev", "jev-1.14.0")
     assert (step0.backend_kind, step0.model_id) == ("step0", "gemma")
     assert (mock.backend_kind, mock.model_id) == ("mock", "mock")
     assert jev.capabilities == BackendCapabilities(two_stage=False)
@@ -146,12 +146,12 @@ def test_http_backends_default_to_documented_timeout() -> None:
 # --- Calibration --------------------------------------------------------------
 
 
-def test_bundled_calibration_pins_jev_v0_temperature() -> None:
-    jev = JevHttpBackend("https://api.example.com/v1/systemone", model="jev-v0")
+def test_bundled_calibration_pins_jev_1_14_0_temperature() -> None:
+    jev = JevHttpBackend("https://api.example.com/v1/systemone", model="jev-1.14.0")
     assert jev.calibration == Calibration(temperature=1.0)
     other = JevHttpBackend("https://api.example.com/v1/systemone", model="jev-v9")
     assert other.calibration == Calibration()
-    step0 = StepZeroLogprobBackend("http://vllm.local/v1/completions", "jev-v0")
+    step0 = StepZeroLogprobBackend("http://vllm.local/v1/completions", "jev-1.14.0")
     assert step0.calibration == Calibration()
 
 
@@ -219,7 +219,7 @@ async def test_jev_backend_applies_calibration_to_answers() -> None:
     async with _json_client(handler) as client:
         backend = JevHttpBackend(
             "https://api.example.com/v1/systemone",
-            model="jev-v0",
+            model="jev-1.14.0",
             client=client,
             calibration=Calibration(temperature=4.0),
         )
@@ -855,12 +855,12 @@ def test_create_decision_backend_http_kinds(clean_env: pytest.MonkeyPatch) -> No
 def test_create_decision_backend_pins_hosted_models(
     clean_env: pytest.MonkeyPatch,
 ) -> None:
-    assert DEFAULT_TYPESAFE_MODEL == "jev-v0"
+    assert DEFAULT_TYPESAFE_MODEL == "jev-1.14.0"
     clean_env.setenv("JEV_API_KEY", "ts-test-key")
     typesafe = create_decision_backend("jev")
     assert isinstance(typesafe, JevHttpBackend)
     assert typesafe.endpoint_url == "https://api.typesafe.ai/v1/systemone"
-    assert typesafe.model_id == "jev-v0"
+    assert typesafe.model_id == "jev-1.14.0"
     assert typesafe.calibration.temperature == 1.0
 
     clean_env.setenv("JEV_API_KEY", "vcp_vercel_gateway_key")

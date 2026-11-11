@@ -100,7 +100,7 @@ synthesizer = DecisionSynthesizer(
 | Backend     | Setup                                                               | Characteristics                                         |
 | :---------- | :------------------------------------------------------------------ | :------------------------------------------------------ |
 | `systemone` | Set `A2UI_DECISION_URL` and `JEV_API_KEY` (or `A2UI_DECISION_AUTH`) | Hosted or local `/v1/systemone` decision API over HTTP. |
-| `jev`       | Set `JEV_API_KEY` or `TYPESAFE_API_KEY`, or `A2UI_DECISION_URL`     | TypeSafe Jev, pinned to `jev-v0` by default.            |
+| `jev`       | Set `JEV_API_KEY` or `TYPESAFE_API_KEY`, or `A2UI_DECISION_URL`     | TypeSafe Jev, pinned to `jev-1.14.0` by default.        |
 | `step0`     | Set `A2UI_DECISION_URL`                                             | Step-zero logprob scorer; asks questions in two stages. |
 | `mock`      | Set `A2UI_DECISION_BACKEND=mock`                                    | Deterministic offline backend for tests.                |
 
