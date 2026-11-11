@@ -29,7 +29,7 @@ from a2ui.parser.messages import to_message_dicts
 
 from .models import ActionSpec, LayoutBrief, coerce_decision_payload
 
-# Wire field names, with the snake_case spellings also accepted on input.
+# Wire field names, with the snake_case aliases also accepted on input.
 _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "intent": ("intent",),
     "payload": ("payload", "data"),
@@ -250,6 +250,10 @@ class DecisionBlock:
     labels: Mapping[str, str] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
+        if self.replace and self.region is not None:
+            raise ValueError(
+                "DecisionBlock cannot combine replace=True with a region update"
+            )
         object.__setattr__(self, "labels", dict(self.labels))
 
     @classmethod
@@ -258,7 +262,7 @@ class DecisionBlock:
 
         Accepts the camelCase wire names (`surfaceId`, `fallbackDsl`,
         `layout`, `mutablePaths`, `title`, `summary`, `actions`, `exclude`,
-        `replace`, `region`, `labels`) and their snake_case spellings.
+        `replace`, `region`, `labels`) and their snake_case aliases.
 
         Raises:
             ValueError: If `intent` is missing or blank, `payload` is a
