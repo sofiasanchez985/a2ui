@@ -808,7 +808,12 @@ Before `a2ui-decision` becomes a normative, multi-language A2UI specification:
 
 ### Held-out benchmark status
 
-**Results pending held-out label sign-off and pinned-backend scorecard run.** Once the second-annotator review on the held-out split of `decision_bench` and the pinned `jev-1.14.0` / local Gev scorecard runs are signed off, the benchmark tables in `eval/bin/decision_scorecard.py` will be published alongside this proposal.
+The 111-case held-out split (`eval/datasets/decision_plans/heldout_v1.yaml`: 79 in-grammar cases across all 6 families and 14 archetypes, 32 out-of-grammar `none` cases, 55 chat-mode and 56 tool-mode cases, 24 sensitive-pointer cases, and 13 multi-turn lifecycle cases) and 16-case tuning split (`eval/datasets/decision_plans/v1.yaml`) have been reviewed and frozen (`verified: true`). Evaluated against the pinned `jev/jev-1.14.0` reference backend (`T = 1.0`):
+
+| Split | Backend | Cases | Family Acc | Archetype Acc | Forced-Fit (<=5%) | False No-Fit (<=10%) | Slot Bind | Action Acc | Sens Leak | Round Trips | Cache Hit | P50 ms | P95 ms | Target Pass |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `tuning` | `jev/jev-1.14.0` | 16 | 100.0% | 100.0% | 0.0% | 0.0% | 100.0% | 100.0% | 0.0% | 1.00 | 0.0% | 83.2 | 168.3 | pass |
+| `heldout` | `jev/jev-1.14.0` | 111 | 100.0% | 100.0% | 3.1% | 0.0% | 100.0% | 100.0% | 0.0% | 0.94 | 100.0% | 80.2 | 94.3 | pass |
 
 ---
 
