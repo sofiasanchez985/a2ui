@@ -148,7 +148,7 @@ def test_http_backends_default_to_documented_timeout() -> None:
 
 def test_bundled_calibration_pins_jev_v0_temperature() -> None:
     jev = JevHttpBackend("https://api.example.com/v1/systemone", model="jev-v0")
-    assert jev.calibration == Calibration(temperature=4.0)
+    assert jev.calibration == Calibration(temperature=1.0)
     other = JevHttpBackend("https://api.example.com/v1/systemone", model="jev-v9")
     assert other.calibration == Calibration()
     step0 = StepZeroLogprobBackend("http://vllm.local/v1/completions", "jev-v0")
@@ -221,6 +221,7 @@ async def test_jev_backend_applies_calibration_to_answers() -> None:
             "https://api.example.com/v1/systemone",
             model="jev-v0",
             client=client,
+            calibration=Calibration(temperature=4.0),
         )
         (answer,) = await backend.answer(_batch(_choice("family", "browse", "inspect")))
 
@@ -860,7 +861,7 @@ def test_create_decision_backend_pins_hosted_models(
     assert isinstance(typesafe, JevHttpBackend)
     assert typesafe.endpoint_url == "https://api.typesafe.ai/v1/systemone"
     assert typesafe.model_id == "jev-v0"
-    assert typesafe.calibration.temperature == 4.0
+    assert typesafe.calibration.temperature == 1.0
 
     clean_env.setenv("JEV_API_KEY", "vcp_vercel_gateway_key")
     vercel = create_decision_backend("jev")

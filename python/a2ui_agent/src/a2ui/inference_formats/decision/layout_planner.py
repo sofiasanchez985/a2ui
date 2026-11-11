@@ -789,7 +789,14 @@ def _pick_best_element_key(
     """Selects the best matching relative key on `arr_ptr` for `field_spec`."""
     best_key: str | None = None
     best_score = min_score - 1
-    preferred_names = {p.lower() for p in (*field_spec.prefer, field_name)}
+    default_prefs = (
+        ("name", "title", "label", "headline")
+        if field_name in {"headline", "title", "label"} and not field_spec.prefer
+        else ()
+    )
+    preferred_names = {
+        p.lower() for p in (*field_spec.prefer, *default_prefs, field_name)
+    }
     for ek in arr_ptr.element_keys:
         if ek in used_keys or ek.lower() in {"actions", "action"}:
             continue
@@ -832,6 +839,57 @@ def _bind_element_field_pass(
             bound_fields[field_name] = SlotBinding(pointer="")
 
 
+def _bind_repeated_element_field(
+    arr_ptr: PointerSummary,
+    field_spec: SlotSpec,
+    used_keys: set[str],
+) -> tuple[dict[str, SlotBinding], ...]:
+    """Binds a repeated element field (such as `comparison.attributes`) to `{label, value}` pairs."""
+    excluded = {"id", "action", "actions"}
+    preferred_names = {p.lower() for p in field_spec.prefer}
+    candidates = [
+        ek
+        for ek in arr_ptr.element_keys
+        if ek not in used_keys
+        and ek.lower() not in excluded
+        and _score_element_key(
+            ek,
+            arr_ptr.element_semantic_types.get(ek, SemanticType.STRING),
+            field_spec,
+            preferred_names,
+        )
+        is not None
+    ]
+    if not candidates:
+        candidates = [
+            ek
+            for ek in arr_ptr.element_keys
+            if ek.lower() not in excluded
+            and _score_element_key(
+                ek,
+                arr_ptr.element_semantic_types.get(ek, SemanticType.STRING),
+                field_spec,
+                preferred_names,
+            )
+            is not None
+        ]
+    if field_spec.max is not None:
+        candidates = candidates[: field_spec.max]
+    used_keys.update(candidates)
+    return tuple(
+        {
+            "label": SlotBinding(literal=humanize_key(ek)),
+            "value": SlotBinding(
+                pointer=ek,
+                semantic_type=arr_ptr.element_semantic_types.get(
+                    ek, SemanticType.STRING
+                ),
+            ),
+        }
+        for ek in candidates
+    )
+
+
 def _bind_array_element_fields(
     arr_ptr: PointerSummary,
     fields: Mapping[str, SlotSpec],
@@ -839,13 +897,20 @@ def _bind_array_element_fields(
     """Binds relative per-element fields of a repeated array-backed slot."""
     bound_fields: dict[str, SlotBinding] = {}
     used_keys: set[str] = set()
-    req_fields = tuple((k, v) for k, v in fields.items() if v.required)
-    opt_fields = tuple((k, v) for k, v in fields.items() if not v.required)
+    req_fields = tuple((k, v) for k, v in fields.items() if v.required and not v.repeat)
+    opt_fields = tuple(
+        (k, v) for k, v in fields.items() if not v.required and not v.repeat
+    )
+    rep_fields = tuple((k, v) for k, v in fields.items() if v.repeat)
     _bind_element_field_pass(arr_ptr, req_fields, bound_fields, used_keys, min_score=0)
     for cutoff in (10, 0):
         _bind_element_field_pass(
             arr_ptr, opt_fields, bound_fields, used_keys, min_score=cutoff
         )
+    for field_name, field_spec in rep_fields:
+        items = _bind_repeated_element_field(arr_ptr, field_spec, used_keys)
+        if items:
+            bound_fields[field_name] = SlotBinding(items=items)
     return bound_fields
 
 

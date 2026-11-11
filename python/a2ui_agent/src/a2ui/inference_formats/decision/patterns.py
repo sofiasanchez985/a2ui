@@ -1598,6 +1598,7 @@ def _expand_single_repeat_item(
             item_fields=item_fields,
             item_index=orig_idx,
             item_pointer=elem_ptr,
+            in_template_repeat=scope.in_template_repeat,
             in_item_repeat=is_item_repeat,
             tracker=scope.tracker,
         )
@@ -1622,6 +1623,7 @@ def _expand_single_repeat_item(
         item_fields=item_fields,
         item_index=orig_idx,
         item_pointer=elem_ptr,
+        in_template_repeat=scope.in_template_repeat,
         in_item_repeat=is_item_repeat,
         tracker=scope.tracker,
     )
