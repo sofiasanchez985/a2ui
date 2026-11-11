@@ -411,12 +411,12 @@ class DecisionQuestion:
     allow_none: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("DecisionQuestion.id must be a non-empty string.")
         object.__setattr__(self, "kind", QuestionKind(self.kind))
         object.__setattr__(self, "options", tuple(self.options))
         object.__setattr__(self, "option_texts", tuple(self.option_texts))
         object.__setattr__(self, "context", dict(self.context))
-        if not isinstance(self.id, str) or not self.id:
-            raise ValueError("DecisionQuestion.id must be a non-empty string.")
         if self.option_texts and len(self.option_texts) != len(self.options):
             raise ValueError(
                 f"Question {self.id!r}: option_texts must be empty or match"

@@ -42,6 +42,7 @@ from a2ui.inference_formats.decision import (
 from a2ui_eval.decision_bench import (
     TEMPERATURE_GRID,
     CaseEvaluation,
+    CaseScore,
     PlanCase,
     brier_score,
     expected_calibration_error,
@@ -209,12 +210,13 @@ def _case_calibration_pairs(
 
 
 def _collect_calibration_pairs(
-    evaluations: Sequence[CaseEvaluation], cases: Sequence[PlanCase]
+    case_scores: Sequence[CaseScore],
 ) -> list[tuple[float, float]]:
     """Extracts `(probability, is_correct)` pairs across family, archetype, and gates."""
     pairs: list[tuple[float, float]] = []
-    for case, ev in zip(cases, evaluations):
-        pairs.extend(_case_calibration_pairs(case, ev))
+    for cs in case_scores:
+        if cs.evaluations:
+            pairs.extend(_case_calibration_pairs(cs.case, cs.evaluations[0]))
     return pairs
 
 
@@ -246,7 +248,7 @@ async def fit_backend_calibration(
 
     summary = await run_benchmark(synth, cases, repeat=1, fit_temp=False)
     evaluations = [cs.evaluations[0] for cs in summary.case_scores if cs.evaluations]
-    pairs = _collect_calibration_pairs(evaluations, cases)
+    pairs = _collect_calibration_pairs(summary.case_scores)
     fitted_t = fit_temperature(
         pairs, candidates=temperature_candidates or TEMPERATURE_GRID
     )

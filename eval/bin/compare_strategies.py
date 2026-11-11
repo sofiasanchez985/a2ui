@@ -20,8 +20,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 from typing import Any, Sequence
+
+BIN_DIR = Path(__file__).parent.resolve()
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
 
 from report_evals import extract_run_labels, load_log_data, strategy_summary
 

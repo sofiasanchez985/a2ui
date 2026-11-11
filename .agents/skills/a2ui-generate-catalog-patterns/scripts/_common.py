@@ -98,7 +98,6 @@ def load_pattern_library(
         PatternError,
         A2uiError,
         OSError,
-        json.JSONDecodeError,
         ValueError,
     ) as exc:
         raise ToolError(
@@ -115,7 +114,6 @@ def load_template_registry(path: str | Path) -> TemplateRegistry:
     except (
         A2uiError,
         OSError,
-        json.JSONDecodeError,
         ValueError,
         KeyError,
     ) as exc:

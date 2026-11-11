@@ -57,4 +57,4 @@ class DecisionAssetsBuildHook(BuildHookInterface):  # type: ignore[misc]
         for source, destination in _REPO_ASSETS.items():
             path = (root / source).resolve()
             if path.is_file():
-                build_data["force_include"][str(path)] = destination
+                build_data.setdefault("force_include", {})[str(path)] = destination

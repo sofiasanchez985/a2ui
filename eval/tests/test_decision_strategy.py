@@ -260,3 +260,47 @@ def test_build_decision_backend_jev_missing_key() -> None:
     with patch.dict(os.environ, {}, clear=True):
         with pytest.raises(ValueError, match="JEV_API_KEY"):
             build_decision_backend("jev")
+
+
+@pytest.mark.asyncio
+async def test_compile_decision_payload_closes_factory_if_create_format_raises() -> (
+    None
+):
+    closed = False
+
+    class _BoomFactory:
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        def create_format(self, catalogs: object) -> object:
+            del catalogs
+            raise RuntimeError("create_format boom")
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    state = _make_state(
+        metadata={"catalog": "catalogs/basic/v1/catalog.json"},
+        completion="<a2ui>{}</a2ui>",
+    )
+
+    async def noop_generate(st: object) -> object:
+        return st
+
+    with (
+        patch(
+            "a2ui_eval.strategies.decision.build_decision_backend",
+            return_value=scripted_backend(HOST_ANSWERS),
+        ),
+        patch(
+            "a2ui_eval.strategies.decision.DecisionFormatFactory",
+            _BoomFactory,
+        ),
+    ):
+        step = compile_decision_payload("1.0", decision_backend="mock")
+        with pytest.raises(RuntimeError, match="create_format boom"):
+            await step(state, noop_generate)  # type: ignore[arg-type]
+
+    assert closed is True
