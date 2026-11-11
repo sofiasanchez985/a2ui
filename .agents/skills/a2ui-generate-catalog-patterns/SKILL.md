@@ -126,7 +126,7 @@ from a2ui.inference_formats.decision import (
 catalog_dir = Path("<target_dir>")
 catalog = Catalog.from_json(json.loads((catalog_dir / "catalog.json").read_text()))
 graph = CatalogDecisionGraph([catalog])
-backend = create_decision_backend("gev")
+backend = create_decision_backend("gemini")
 
 # Load patterns.json when present (composable or hybrid catalogs):
 pattern_lib = MergedPatternLibrary([PatternLibrary.from_file(catalog_dir)])
