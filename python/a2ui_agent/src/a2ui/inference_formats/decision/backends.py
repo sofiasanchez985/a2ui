@@ -36,9 +36,12 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import threading
 import time
 from typing import Any, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
+import urllib.parse
 
 import httpx
 
@@ -766,11 +769,12 @@ def _get_adc_token_sync(timeout_seconds: float) -> str | None:
     except Exception:
         pass
 
+    gcloud_path = shutil.which("gcloud")
+    if not gcloud_path:
+        return None
     try:
-        import subprocess
-
         res = subprocess.run(
-            ["gcloud", "auth", "print-access-token"],
+            [gcloud_path, "auth", "print-access-token"],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -1296,7 +1300,10 @@ class StepZeroLogprobBackend(_HttpClientOwner):
 
     def _completion_payload(self, prompt: str, num_logprobs: int) -> dict[str, Any]:
         """Builds a one-token completion request for the configured endpoint."""
-        if not self._endpoint_url.rstrip("/").lower().endswith("/chat/completions"):
+        endpoint_path = (
+            urllib.parse.urlsplit(self._endpoint_url).path.rstrip("/").lower()
+        )
+        if not endpoint_path.endswith("/chat/completions"):
             return {
                 "model": self.model_id,
                 "prompt": prompt,
@@ -1624,7 +1631,7 @@ def _create_jev_backend(settings: _BackendSettings) -> JevHttpBackend:
         wire_format=(
             DecisionWireFormat.SYSTEMONE if systemone else DecisionWireFormat.JEV
         ),
-        model=(settings.model or default_model) if systemone else "default",
+        model=settings.model or (default_model if systemone else "default"),
         auth=settings.auth,
         timeout_seconds=settings.timeout_seconds,
         calibration=settings.calibration,
