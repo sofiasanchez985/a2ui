@@ -4159,6 +4159,14 @@ class LayoutPlanner:
             spec.id == "prose" and state.copy is not None and state.copy.summary
         )
 
+    def _gate_default_probability(
+        self, ref: BlockRef, ans: DecisionAnswer | None
+    ) -> float:
+        """Returns `ans.yes` or the default prior (`0.8` required/expected, `0.0` optional)."""
+        if ans is not None:
+            return ans.yes
+        return 0.8 if ref.requirement != "optional" else 0.0
+
     def _evaluate_single_block_gate(
         self,
         ref: BlockRef,
@@ -4176,19 +4184,12 @@ class LayoutPlanner:
         q_id = f"gate:{ref.id}"
         q_obj = q_map.get(q_id)
         ans = state.answers_by_id.get(q_id)
-        prob = (
-            ans.yes
-            if ans is not None
-            else (0.8 if ref.requirement != "optional" else 0.0)
-        )
+        prob = self._gate_default_probability(ref, ans)
         state.gate_probabilities[ref.id] = prob
         thresh = self.threshold(
             "optional" if ref.requirement == "optional" else "expected"
         )
-        has_surface_actions = ref.id == "actions" and any(
-            a.scope is None for a in state.actions
-        )
-        passed = prob >= thresh or has_surface_actions
+        passed = prob >= thresh or (ref.id == "actions" and bool(state.actions))
         outcome = (
             "required_override (disagreement)"
             if (ref.requirement == "required" and prob < thresh)
