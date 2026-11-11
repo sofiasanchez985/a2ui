@@ -152,10 +152,10 @@ def test_path_summary_and_decision_timing_across_stages() -> None:
         fallback="fallback_facts",
         fallback_reason="no_family",
         confidence=0.31,
-        model_id="jev-v0",
+        model_id="jev-1.14.0",
     )
     footer = fallback_m.footer()
-    assert footer.startswith("**decision** · jev (jev-v0) · 0 LLM calls")
+    assert footer.startswith("**decision** · jev (jev-1.14.0) · 0 LLM calls")
     assert footer.endswith(
         "path: fallback (fallback_facts) · decision model abstained: no_family"
     )
@@ -178,7 +178,7 @@ def test_footer_shows_model_id_and_non_create_operations() -> None:
     cached_with_fit = TurnMetrics(
         mode=RenderMode.DECISION,
         backend="jev",
-        model_id="jev-v0",
+        model_id="jev-1.14.0",
         llm_calls=0,
         latency_ms=0.5,
         decision_latency_ms=0.0,
@@ -191,7 +191,7 @@ def test_footer_shows_model_id_and_non_create_operations() -> None:
         block_count=3,
     )
     assert cached_with_fit.footer() == (
-        "**decision** · jev (jev-v0) · 0 LLM calls · decision 0.00 ms"
+        "**decision** · jev (jev-1.14.0) · 0 LLM calls · decision 0.00 ms"
         " · surface update_root · cache hit · fit 0.84"
         " · path: decision model · archetype dashboard (0.88) · 3 blocks"
     )

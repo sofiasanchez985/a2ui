@@ -95,7 +95,7 @@ bound (form fields, an item's id) back to stage 1, and forms round-trip.
 ## What the footer tells you
 
 ```text
-decision · jev (jev-v0) · 1 LLM call · decision 412 ms (total 1.8 s) · 412 in / 96 out tokens · surface update_root · path: decision model · archetype detail (0.82) · 4 blocks
+decision · jev (jev-1.14.0) · 1 LLM call · decision 412 ms (total 1.8 s) · 412 in / 96 out tokens · surface update_root · path: decision model · archetype detail (0.82) · 4 blocks
 express · llm · 2 LLM calls · 4.1 s · 5,210 in / 318 out tokens
 direct · llm · 2 LLM calls · 5.6 s · 12,044 in / 890 out tokens
 ```

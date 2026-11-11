@@ -95,9 +95,9 @@ def test_backend_display_name_maps_bundled_backends(
     assert backend_display_name(DeterministicMockBackend()) == "mock"
     assert (
         backend_display_name(
-            JevHttpBackend("https://api.typesafe.ai/v1/systemone", model="jev-v0")
+            JevHttpBackend("https://api.typesafe.ai/v1/systemone", model="jev-1.14.0")
         )
-        == "jev (jev-v0)"
+        == "jev (jev-1.14.0)"
     )
     assert (
         backend_display_name(
