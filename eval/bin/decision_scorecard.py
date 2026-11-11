@@ -372,8 +372,8 @@ async def run_scorecard(
     template_arm: bool = False,
     strict: bool = False,
 ) -> ScorecardReport:
-    """Builds and benchmarks every configured backend (plus `mock` baseline)."""
-    all_specs = ensure_mock_baseline(specs)
+    """Builds and benchmarks every configured backend."""
+    all_specs = list(specs) or ensure_mock_baseline(())
     rows_by_split: dict[str, list[ScorecardRow]] = {
         name: [] for name, _ in split_groups
     }
@@ -457,7 +457,7 @@ def _resolve_target_specs(args: argparse.Namespace) -> list[ScorecardTargetSpec]
                 p95_target_ms=args.p95_target_ms,
             )
         )
-    return ensure_mock_baseline(specs)
+    return specs or ensure_mock_baseline(())
 
 
 def serialize_scorecard_report(report: ScorecardReport) -> dict[str, Any]:

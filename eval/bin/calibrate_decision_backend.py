@@ -51,7 +51,7 @@ from a2ui_eval.decision_bench import (
     run_benchmark,
 )
 from a2ui_eval.decision_common import (
-    DECISION_BACKEND_NAMES,
+    DECISION_CLI_BACKEND_CHOICES,
     build_decision_backend,
 )
 from a2ui_eval.shared.utils import GIT_ROOT
@@ -317,8 +317,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         required=True,
-        choices=list(DECISION_BACKEND_NAMES),
-        help="Decision backend kind (mock, jev, systemone, or step0).",
+        choices=list(DECISION_CLI_BACKEND_CHOICES),
+        help="Decision backend kind (mock, jev, gev, systemone, or step0).",
     )
     parser.add_argument(
         "--model",

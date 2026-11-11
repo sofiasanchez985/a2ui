@@ -740,3 +740,30 @@ def test_decision_bench_cli_required_flags_and_heldout_unfrozen_notice(
     data = json.loads(json_out.read_text(encoding="utf-8"))
     assert set(data["splits"]) == {"tuning", "heldout"}
     assert data["splits"]["heldout"]["unverified_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_paraphrase_backend_and_recorder_use_server_reported_latency() -> None:
+    import asyncio
+
+    inner = scripted_backend(HOST_ANSWERS, model_id="mock-lat")
+    orig_answer = inner.answer
+
+    async def delayed_answer(batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
+        await asyncio.sleep(0.02)
+        return await orig_answer(batch)
+
+    inner.answer = delayed_answer  # type: ignore[method-assign]
+    inner.last_call_latency_ms = 1.5  # type: ignore[attr-defined]
+    wrapped = ParaphraseDecisionBackend(inner)
+    assert wrapped.last_call_latency_ms == pytest.approx(1.5)
+    case = PlanCase(
+        name="host_lat",
+        intent="Show CPU and host metrics",
+        payload=dict(HOST_DECISION_BLOCK.payload),
+        expected_family="monitor",
+        expected_archetypes=["dashboard"],
+    )
+    synth = DecisionSynthesizer([BasicCatalog("v1.0")], wrapped)
+    summary = await run_benchmark(synth, [case], repeat=1)
+    assert summary.p50_latency_ms == pytest.approx(1.5)

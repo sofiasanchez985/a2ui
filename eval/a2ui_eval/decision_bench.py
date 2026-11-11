@@ -1228,10 +1228,19 @@ class _BackendCallRecorder(DecisionBackend):
     def capabilities(self) -> BackendCapabilities:
         return self._inner.capabilities
 
+    @property
+    def last_call_latency_ms(self) -> float | None:
+        val = getattr(self._inner, "last_call_latency_ms", None)
+        return float(val) if isinstance(val, (int, float)) else None
+
     async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
         t0 = time.perf_counter()
         result = await self._inner.answer(batch)
-        self.latency_ms += (time.perf_counter() - t0) * 1000.0
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        reported = self.last_call_latency_ms
+        if reported is not None and 0.0 < reported < elapsed_ms:
+            elapsed_ms = reported
+        self.latency_ms += elapsed_ms
         self.calls += 1
         self.answers.extend(result)
         return result

@@ -199,6 +199,11 @@ class ParaphraseDecisionBackend(DecisionBackend):
     def capabilities(self) -> BackendCapabilities:
         return self._inner.capabilities
 
+    @property
+    def last_call_latency_ms(self) -> float | None:
+        val = getattr(self._inner, "last_call_latency_ms", None)
+        return float(val) if isinstance(val, (int, float)) else None
+
     async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
         rewritten = tuple(
             replace(q, prompt=rewrite_question_prompt(q.prompt))
