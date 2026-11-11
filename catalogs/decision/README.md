@@ -7,7 +7,9 @@
 > goal yet.
 
 This directory holds the data files behind the layout stage of the decision
-inference format. The format uses a small decision model (a hosted decision
+inference format (specified in
+[`docs/proposals/decision_inference_format.md`](../../docs/proposals/decision_inference_format.md)).
+The format uses a small decision model (a hosted decision
 service, a local decision server, or a logprob endpoint) to answer short questions about an
 intent and a data payload. The answers select a layout archetype, decide which
 blocks it shows, and bind payload pointers to the blocks' slots. The files here
@@ -82,7 +84,7 @@ element with the payload value filled into the question text), computed
 `measures`, the `slots` the block binds, and a `fallback` chain of patterns to
 try when the catalog lacks the first. A fallback entry is a pattern name or a
 `pattern:variant` form such as `collection:cards`; the same `name:variant`
-spelling is used by `requires` entries such as `pattern:collection:grid`.
+form is used by `requires` entries such as `pattern:collection:grid`.
 
 `rules` and `lint` are prose. The rules describe behavior the planner applies
 (one primary action, the action gate, pointer-once-per-region, and so on). The

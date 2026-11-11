@@ -838,7 +838,13 @@ def test_create_decision_backend_http_kinds(clean_env: pytest.MonkeyPatch) -> No
 
     native = create_decision_backend("jev", endpoint_url="http://localhost:8080/p")
     assert isinstance(native, JevHttpBackend)
-    assert native._wire_format == "jev"
+    assert (native._wire_format, native.model_id) == ("jev", "default")
+
+    native_custom = create_decision_backend(
+        "jev", endpoint_url="http://localhost:8080/p", model="custom-jev"
+    )
+    assert isinstance(native_custom, JevHttpBackend)
+    assert (native_custom._wire_format, native_custom.model_id) == ("jev", "custom-jev")
 
     for kind in ("systemone", "jev", "step0"):
         with pytest.raises(ValueError, match="requires an endpoint URL"):
@@ -893,3 +899,51 @@ def test_decision_synthesizer_from_env(clean_env: pytest.MonkeyPatch) -> None:
     })
     synth = DecisionSynthesizer.from_env([cat])
     assert isinstance(synth.backend, DeterministicMockBackend)
+
+
+def test_step_zero_completion_payload_handles_query_parameters() -> None:
+    chat_backend = StepZeroLogprobBackend(
+        "https://example.openai.azure.com/openai/deployments/gpt/chat/completions?api-version=2024-06-01",
+        "gpt",
+    )
+    chat_payload = chat_backend._completion_payload("Pick A or B", 5)
+    assert "messages" in chat_payload
+    assert "prompt" not in chat_payload
+
+    legacy_backend = StepZeroLogprobBackend(
+        "http://localhost:8000/v1/completions?target=/chat/completions",
+        "gpt",
+    )
+    legacy_payload = legacy_backend._completion_payload("Pick A or B", 5)
+    assert "prompt" in legacy_payload
+    assert "messages" not in legacy_payload
+
+
+def test_get_adc_token_sync_resolves_gcloud_via_which(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+    import google.auth
+    from a2ui.inference_formats.decision import backends
+
+    def fail_default(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError("no adc")
+
+    monkeypatch.setattr(google.auth, "default", fail_default)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="gcloud-tok\n", stderr="")
+
+    monkeypatch.setattr(backends.subprocess, "run", fake_run)
+    monkeypatch.setattr(backends.shutil, "which", lambda name: None)
+    assert backends._get_adc_token_sync(3.0) is None
+    assert calls == []
+
+    monkeypatch.setattr(backends.shutil, "which", lambda name: "/opt/bin/gcloud")
+    assert backends._get_adc_token_sync(3.0) == "gcloud-tok"
+    assert calls == [["/opt/bin/gcloud", "auth", "print-access-token"]]

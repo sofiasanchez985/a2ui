@@ -1418,3 +1418,114 @@ def test_region_expand_block_preserves_stable_component_ids_single_and_multi_cat
     assert all(
         c.get("catalogId") == domain_cat.catalog_id for c in multi_banner.components
     )
+
+
+def test_form_field_variants_all_emit_required_checks_with_at_call() -> None:
+    catalog = BasicCatalog("v1.0")
+    lib = MergedPatternLibrary.for_catalogs([catalog])
+    graph = CatalogDecisionGraph([catalog])
+    expander = PatternExpander(lib, graph)
+    controls = (
+        "shortText",
+        "longText",
+        "number",
+        "obscured",
+        "toggle",
+        "choice",
+        "multiChoice",
+        "range",
+        "date",
+    )
+    items = tuple(
+        {
+            "label": SlotBinding(literal=f"Field {idx}"),
+            "value": SlotBinding(pointer=f"/f{idx}"),
+            "options": SlotBinding(literal=[{"label": "Alpha", "value": "A"}]),
+            "min": SlotBinding(literal=0),
+            "max": SlotBinding(literal=100),
+            "control": SlotBinding(literal=ctrl),
+        }
+        for idx, ctrl in enumerate(controls)
+    )
+    instances = {str(idx): {"required": "true"} for idx in range(len(controls))}
+    exp = expander.expand_block(
+        "form",
+        "form",
+        BlockBindings(slots={"fields": SlotBinding(items=items)}),
+        instances=instances,
+    )
+    validate_payload([catalog], _wrap_surface(exp.components))
+    field_comps = [c for c in exp.components if c["id"] != "form_root"]
+    assert len(field_comps) == len(controls)
+    for comp in field_comps:
+        assert comp["checks"] == [{
+            "condition": {
+                "@call": "required",
+                "args": {"value": comp["value"]},
+            },
+            "message": "Required",
+        }]
+
+
+def test_stamp_function_calls_and_hatch_build_hook_empty_build_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+    from pathlib import Path
+    import sys
+    import types
+    from a2ui.inference_formats.decision.synthesizer import _stamp_function_calls
+
+    payload = {
+        "component": "TextField",
+        "label": "Name",
+        "count": 3,
+        "checks": [
+            {
+                "condition": {"@call": "required", "args": {"value": {"@path": "/n"}}},
+                "message": "Required",
+            },
+            {
+                "condition": {
+                    "@call": "email",
+                    "args": {"value": {"@path": "/n"}},
+                    "catalogId": "https://existing.example/cat",
+                }
+            },
+        ],
+    }
+    _stamp_function_calls(payload, "https://default.example/cat")
+    assert (
+        payload["checks"][0]["condition"]["catalogId"]  # type: ignore[index]
+        == "https://default.example/cat"
+    )
+    assert (
+        payload["checks"][1]["condition"]["catalogId"]  # type: ignore[index]
+        == "https://existing.example/cat"
+    )
+
+    fake_iface = types.ModuleType("hatchling.builders.hooks.plugin.interface")
+    fake_iface.BuildHookInterface = object  # type: ignore[attr-defined]
+    for mod_name in (
+        "hatchling",
+        "hatchling.builders",
+        "hatchling.builders.hooks",
+        "hatchling.builders.hooks.plugin",
+    ):
+        monkeypatch.setitem(sys.modules, mod_name, types.ModuleType(mod_name))
+    monkeypatch.setitem(
+        sys.modules, "hatchling.builders.hooks.plugin.interface", fake_iface
+    )
+
+    hook_path = Path(__file__).resolve().parents[2] / "hatch_build.py"
+    spec = importlib.util.spec_from_file_location("a2ui_agent_hatch_build", hook_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    hook = object.__new__(module.DecisionAssetsBuildHook)
+    hook.root = str(hook_path.parent)
+    build_data: dict[str, Any] = {}
+    hook.initialize("0.1.0", build_data)
+    assert "force_include" in build_data
+    assert len(build_data["force_include"]) == 4
