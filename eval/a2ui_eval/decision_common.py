@@ -38,6 +38,7 @@ from a2ui.inference_formats.decision import (
 DECISION_BACKEND_NAMES: tuple[str, ...] = (
     "mock",
     "jev",
+    "gemini",
     "systemone",
     "step0",
 )
@@ -45,7 +46,7 @@ DECISION_BACKEND_NAMES: tuple[str, ...] = (
 DECISION_CLI_BACKEND_CHOICES: tuple[str, ...] = (
     "mock",
     "jev",
-    "gev",
+    "gemini",
     "systemone",
     "step0",
 )
@@ -53,7 +54,7 @@ DECISION_CLI_BACKEND_CHOICES: tuple[str, ...] = (
 DEFAULT_P95_TARGETS_MS: dict[str, float] = {
     "systemone": 250.0,
     "jev": 250.0,
-    "gev": 500.0,
+    "gemini": 500.0,
     "step0": 1500.0,
     "mock": 25.0,
 }
@@ -229,12 +230,24 @@ class ParaphraseDecisionBackend(DecisionBackend):
 
 
 def _has_jev_credentials(endpoint_url: str | None) -> bool:
-    """Checks whether Jev/Gev credentials or an explicit endpoint URL exist."""
+    """Checks whether Jev credentials or an explicit endpoint URL exist."""
     if endpoint_url or os.environ.get("A2UI_DECISION_URL"):
         return True
     return bool(
         os.environ.get("JEV_API_KEY")
         or os.environ.get("TYPESAFE_API_KEY")
+        or os.environ.get("A2UI_DECISION_AUTH")
+        or os.environ.get("A2UI_DECISION_TOKEN")
+    )
+
+
+def _has_gemini_credentials(endpoint_url: str | None) -> bool:
+    """Checks whether Gemini Decisions API credentials or an explicit endpoint URL exist."""
+    if endpoint_url or os.environ.get("A2UI_DECISION_URL"):
+        return True
+    return bool(
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
         or os.environ.get("A2UI_DECISION_AUTH")
         or os.environ.get("A2UI_DECISION_TOKEN")
     )
@@ -268,15 +281,26 @@ def build_decision_backend(
         )
     if clean == "mock":
         return DeterministicMockBackend(model_id=model or "mock")
-    if clean in {"jev", "gev", "systemone"}:
+    if clean == "gemini":
+        if not _has_gemini_credentials(endpoint_url):
+            raise ValueError(
+                "GEMINI_API_KEY or GOOGLE_API_KEY must be set in the environment"
+                " to use the gemini decision backend"
+            )
+        return create_decision_backend(
+            "gemini",
+            endpoint_url=endpoint_url,
+            model=model,
+            calibration=calibration,
+        )
+    if clean in {"jev", "systemone"}:
         if not _has_jev_credentials(endpoint_url):
             raise ValueError(
                 "JEV_API_KEY or TYPESAFE_API_KEY must be set in the environment"
                 " to use the jev decision backend"
             )
-        target_kind = "jev" if clean == "gev" else clean
         return create_decision_backend(
-            target_kind,
+            clean,
             endpoint_url=endpoint_url,
             model=model,
             calibration=calibration,

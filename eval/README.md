@@ -91,7 +91,7 @@ uv run main.py --strategies decision --decision-backend mock
 
 The `decision` strategy evaluates the two-stage decision-model synthesis route on v1.0. In Stage 1, the model emits `intent`, `payload`, and optional `actions` maps, `exclude` pointers, `replace` flags, or layout hints in a `<a2ui>` block. In Stage 2, `DecisionSynthesizer` plans and expands the surface without an additional UI generation model call.
 
-- `--decision-backend`: `mock`, `jev`, `systemone`, or `step0` (required when running the `decision` strategy unless `A2UI_DECISION_BACKEND` is set).
+- `--decision-backend`: `mock`, `jev`, `gemini`, `systemone`, or `step0` (required when running the `decision` strategy unless `A2UI_DECISION_BACKEND` is set).
 
 The `subagent_tool` strategy gives the outer model one tool, `a2ui_specialist`, and a second model call writes the payload. `--subagent-format {direct_json,express}` picks the format the specialist writes in (default `direct_json`).
 
@@ -341,8 +341,9 @@ It reports:
 # Run the mock baseline on the held-out split with paraphrase and template-arm checks
 uv run ./bin/decision_bench.py --backend mock --model mock --split heldout --paraphrase --template-arm
 
-# Run hosted Jev across tuning and held-out splits (reports each split separately plus mock baseline)
+# Run hosted Jev or Google Gemini Decisions across tuning and held-out splits
 uv run ./bin/decision_bench.py --backend systemone --model jev-1.14.0 --split all --repeat 3
+uv run ./bin/decision_bench.py --backend gemini --model gemini-decision-1 --split all --repeat 3
 ```
 
 The benchmark reports:
