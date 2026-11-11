@@ -632,11 +632,11 @@ class DecisionBackend(Protocol):
 
 | Class | `backend_kind` | Default `model_id` | Wire contract and usage |
 | :--- | :--- | :--- | :--- |
-| `JevHttpBackend` (TypeSafe Jev or Local Gev) | `"jev"` | `DEFAULT_TYPESAFE_MODEL = "jev-v0"` | Speaks either the native Jev batch schema (`{"shared_context": {...}, "questions": [...]}`) or the `/v1/systemone` wire schema (`{"model": ..., "state": ..., "questions": {qid: {"type": ..., "instructions": ..., "criteria": ...}}}`). Auto-detects wire format from the URL path (`DecisionWireFormat.AUTO`), with `two_stage = False`. |
+| `JevHttpBackend` (TypeSafe Jev or Local Gev) | `"jev"` | `DEFAULT_TYPESAFE_MODEL = "jev-1.14.0"` | Speaks either the native Jev batch schema (`{"shared_context": {...}, "questions": [...]}`) or the `/v1/systemone` wire schema (`{"model": ..., "state": ..., "questions": {qid: {"type": ..., "instructions": ..., "criteria": ...}}}`). Auto-detects wire format from the URL path (`DecisionWireFormat.AUTO`), with `two_stage = False`. |
 | `StepZeroLogprobBackend` | `"step0"` | Caller-supplied (for example `"gemini-2.5-flash"`) | Prompts an OpenAI-compatible `/v1/chat/completions` endpoint to output a single choice token (`A` through `J`, supporting up to 10 options per question) with `max_tokens = 1` and `top_logprobs = 20` (`max_logprobs = 20`), converts token logprobs into a normalized distribution, and runs with `two_stage = True`. |
 | `DeterministicMockBackend` | `"mock"` | `"mock"` | Rule-based in-memory backend for unit tests, CI, and offline conformance checks. Requires no network access. |
 
-`create_decision_backend(kind=None, *, endpoint_url=None, model=None, auth=None, calibration=None, timeout_seconds=30.0)` constructs any of the backends (`"jev"`, `"step0"`, or `"mock"`) from explicit arguments or environment variables. Every backend model ID is pinned (such as `"jev-v0"`); floating aliases are not used.
+`create_decision_backend(kind=None, *, endpoint_url=None, model=None, auth=None, calibration=None, timeout_seconds=30.0)` constructs any of the backends (`"jev"`, `"step0"`, or `"mock"`) from explicit arguments or environment variables. Every backend model ID is pinned (such as `"jev-1.14.0"`); floating aliases are not used.
 
 ### Temperature calibration (`calibration_profiles.json`)
 
@@ -646,8 +646,8 @@ Bundled calibration profiles live in `python/a2ui_agent/src/a2ui/inference_forma
 
 ```json
 {
-  "jev/jev-v0": {
-    "temperature": 4.0
+  "jev/jev-1.14.0": {
+    "temperature": 1.0
   }
 }
 ```
@@ -764,7 +764,7 @@ Calling `await synthesizer.synthesize(intent, payload, ..., state=state)` (or `a
 | `messages` | `list[dict[str, Any]]` | Validated A2UI v1.0 protocol messages (`createSurface`, `updateComponents`, `updateDataModel`, `deleteSurface`). |
 | `operation` | `SurfaceOperation` | Lifecycle operation executed (`CREATE`, `UPDATE_ROOT`, or `REPLACE`). |
 | `backend_kind` | `str` | Backend identifier (`"jev"`, `"step0"`, or `"mock"`). |
-| `model_id` | `str` | Pinned model identifier used for scoring (such as `"jev-v0"`). |
+| `model_id` | `str` | Pinned model identifier used for scoring (such as `"jev-1.14.0"`). |
 | `decision_calls` | `int` | Number of `backend.answer` calls made during the turn (`0` on `PlanCache` hit, `1` for single-batch backends, `1` or `2` for two-stage backends). |
 | `decision_latency_ms` | `float` | Wall-clock time spent inside `backend.answer` calls in milliseconds. |
 | `cache_hit` | `bool` | `True` when `PlanCache` served a cached plan without calling the backend. |
@@ -808,7 +808,7 @@ Before `a2ui-decision` becomes a normative, multi-language A2UI specification:
 
 ### Held-out benchmark status
 
-**Results pending held-out label sign-off and pinned-backend scorecard run.** Once the second-annotator review on the held-out split of `decision_bench` and the pinned `jev-v0` / local Gev scorecard runs are signed off, the benchmark tables in `eval/bin/decision_scorecard.py` will be published alongside this proposal.
+**Results pending held-out label sign-off and pinned-backend scorecard run.** Once the second-annotator review on the held-out split of `decision_bench` and the pinned `jev-1.14.0` / local Gev scorecard runs are signed off, the benchmark tables in `eval/bin/decision_scorecard.py` will be published alongside this proposal.
 
 ---
 

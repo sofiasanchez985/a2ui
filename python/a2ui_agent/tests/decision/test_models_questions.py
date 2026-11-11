@@ -780,9 +780,13 @@ def test_layout_plan_records_template_and_operations_are_wire_strings() -> None:
 def test_decision_backend_error_carries_backend_and_cause() -> None:
     cause = TimeoutError("slow")
     error = DecisionBackendError(
-        "timed out", backend_kind="jev", model_id="jev-v0", cause=cause
+        "timed out", backend_kind="jev", model_id="jev-1.14.0", cause=cause
     )
     assert isinstance(error, Exception)
     assert str(error) == "timed out"
-    assert (error.backend_kind, error.model_id, error.cause) == ("jev", "jev-v0", cause)
+    assert (error.backend_kind, error.model_id, error.cause) == (
+        "jev",
+        "jev-1.14.0",
+        cause,
+    )
     assert DecisionBackendError("x", backend_kind="mock", model_id="m").cause is None

@@ -120,7 +120,7 @@ class _FailingBackend(DeterministicMockBackend):
 
     async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
         raise DecisionBackendError(
-            "request timed out after 30 s", backend_kind="jev", model_id="jev-v0"
+            "request timed out after 30 s", backend_kind="jev", model_id="jev-1.14.0"
         )
 
 
