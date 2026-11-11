@@ -1127,7 +1127,7 @@
             "value": [
               {
                 "condition": {
-                  "call": "required",
+                  "@call": "required",
                   "args": {
                     "value": {
                       "$slot": "value"
@@ -1147,7 +1147,25 @@
           "value": {
             "$slot": "value"
           },
-          "variant": "longText"
+          "variant": "longText",
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
+          }
         },
         "number": {
           "component": "TextField",
@@ -1157,7 +1175,25 @@
           "value": {
             "$slot": "value"
           },
-          "variant": "number"
+          "variant": "number",
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
+          }
         },
         "obscured": {
           "component": "TextField",
@@ -1167,7 +1203,25 @@
           "value": {
             "$slot": "value"
           },
-          "variant": "obscured"
+          "variant": "obscured",
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
+          }
         },
         "toggle": {
           "component": "CheckBox",
@@ -1176,6 +1230,24 @@
           },
           "value": {
             "$slot": "value"
+          },
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
           }
         },
         "choice": {
@@ -1190,6 +1262,24 @@
           },
           "value": {
             "$slot": "value"
+          },
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
           }
         },
         "multiChoice": {
@@ -1204,6 +1294,24 @@
           },
           "value": {
             "$slot": "value"
+          },
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
           }
         },
         "range": {
@@ -1219,6 +1327,24 @@
           },
           "max": {
             "$slot": "max"
+          },
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
           }
         },
         "date": {
@@ -1229,7 +1355,25 @@
           "value": {
             "$slot": "value"
           },
-          "enableDate": true
+          "enableDate": true,
+          "checks": {
+            "$ifInstance": {
+              "required": true
+            },
+            "value": [
+              {
+                "condition": {
+                  "@call": "required",
+                  "args": {
+                    "value": {
+                      "$slot": "value"
+                    }
+                  }
+                },
+                "message": "Required"
+              }
+            ]
+          }
         }
       }
     },
