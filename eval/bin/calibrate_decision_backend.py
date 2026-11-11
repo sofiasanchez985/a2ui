@@ -318,7 +318,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--backend",
         required=True,
         choices=list(DECISION_CLI_BACKEND_CHOICES),
-        help="Decision backend kind (mock, jev, gev, systemone, or step0).",
+        help="Decision backend kind (mock, jev, gemini, systemone, or step0).",
     )
     parser.add_argument(
         "--model",

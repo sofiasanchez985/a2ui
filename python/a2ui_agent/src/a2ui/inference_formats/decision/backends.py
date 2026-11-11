@@ -20,8 +20,8 @@ itself through `backend_kind` and a pinned `model_id`, declares its
 timeouts raise `DecisionBackendError`.
 
 Environment variables read by `create_decision_backend`:
-- `A2UI_DECISION_BACKEND`: Backend kind ('mock', 'jev', 'systemone', 'step0').
-  Required unless the kind is passed explicitly.
+- `A2UI_DECISION_BACKEND`: Backend kind ('mock', 'jev', 'gemini', 'systemone',
+  'step0'). Required unless the kind is passed explicitly.
 - `A2UI_DECISION_URL`: Default URL for remote backends.
 - `A2UI_DECISION_MODEL`: Default model identifier.
 """
@@ -68,6 +68,9 @@ access token with ``gcloud``)."""
 DEFAULT_TYPESAFE_MODEL = "jev-1.14.0"
 """Pinned TypeSafe model id; the bundled calibration was fitted on it."""
 
+DEFAULT_GEMINI_DECISION_MODEL = "gemini-decision-1"
+"""Pinned Google Gemini Decisions API model id."""
+
 _DEFAULT_VERCEL_TYPESAFE_MODEL = "jev"
 
 # Lifetime of a cached Application Default Credentials access token.
@@ -76,6 +79,9 @@ _ADC_TOKEN_TTL_SECONDS = 1800.0
 _DEFAULT_TYPESAFE_SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone"
 _DEFAULT_VERCEL_TYPESAFE_SYSTEMONE_URL = (
     "https://ai-gateway.vercel.sh/typesafe/v1/systemone"
+)
+_DEFAULT_GEMINI_DECISIONS_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/decisions"
 )
 
 _BUNDLED_CALIBRATION_PATH = Path(__file__).with_name("calibration_profiles.json")
@@ -230,7 +236,15 @@ def _extract_http_error_detail(response: httpx.Response) -> str | None:
     for key in ("error", "detail"):
         val = body.get(key)
         if isinstance(val, Mapping) and val.get("message"):
-            return str(val["message"])
+            msg = str(val["message"])
+            code = val.get("code")
+            if (
+                isinstance(code, str)
+                and code
+                and not msg.lower().startswith(f"{code.lower()}:")
+            ):
+                return f"{code}: {msg}"
+            return msg
         if isinstance(val, str) and val:
             return val
     return None
@@ -937,16 +951,20 @@ def _serialize_systemone_score_criteria(question: DecisionQuestion) -> list[str]
     return [str(lvl) for lvl in question.options]
 
 
-def _serialize_systemone_question(question: DecisionQuestion) -> dict[str, Any]:
-    """Serializes one `DecisionQuestion` into a `/v1/systemone` question spec."""
+def _serialize_systemone_question(
+    question: DecisionQuestion, *, gemini_decisions: bool = False
+) -> dict[str, Any]:
+    """Serializes one `DecisionQuestion` into a `/v1/systemone` or `/v1beta/decisions` question spec."""
     if question.kind is QuestionKind.BOOLEAN:
         spec: dict[str, Any] = {
             "type": "noul",
             "instructions": question.prompt,
         }
+        true_key = "true_description" if gemini_decisions else "true"
+        false_key = "false_description" if gemini_decisions else "false"
         criteria = {
             target: str(question.context[src])
-            for src, target in (("yes", "true"), ("no", "false"))
+            for src, target in (("yes", true_key), ("no", false_key))
             if question.context.get(src)
         }
         if criteria:
@@ -1054,7 +1072,7 @@ def _single_candidate_answer(question: DecisionQuestion) -> DecisionAnswer:
 
 
 class JevHttpBackend(_HttpClientOwner):
-    """HTTP backend for Jev decision endpoints (native or ``/v1/systemone``).
+    """HTTP backend for Jev and Gemini Decisions endpoints (native, ``/v1/systemone``, or ``/v1beta/decisions``).
 
     Sends a whole batch in one request. Supports `async with` to close the
     owned HTTP client on exit. ADC access tokens (``auth="adc"``) are cached
@@ -1073,30 +1091,40 @@ class JevHttpBackend(_HttpClientOwner):
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         calibration: Calibration | Path | None = None,
     ) -> None:
-        """Creates a Jev backend.
+        """Creates a Jev or Gemini Decisions HTTP backend.
 
         Args:
-            endpoint_url: The native Jev endpoint or a ``/v1/systemone`` URL.
-            wire_format: Request format; `AUTO` picks SystemOne when the URL
-                ends in ``/v1/systemone``.
-            model: Model id sent on ``/v1/systemone`` requests. The Vercel
-                gateway's ``"default"`` maps to its ``"jev"`` model.
-            auth: ``"adc"``, a bearer token, or a callable returning one.
+            endpoint_url: The native Jev endpoint, a ``/v1/systemone`` URL, or
+                a ``/v1beta/decisions`` URL.
+            wire_format: Request format; `AUTO` picks Gemini Decisions when
+                the URL ends in ``/v1beta/decisions``, SystemOne when it ends
+                in ``/v1/systemone``, and Jev otherwise.
+            model: Model id sent on ``/v1/systemone`` or ``/v1beta/decisions``
+                requests. The Vercel gateway's ``"default"`` maps to its
+                ``"jev"`` model, and ``/v1beta/decisions`` ``"default"`` maps
+                to `DEFAULT_GEMINI_DECISION_MODEL`.
+            auth: ``"adc"``, a bearer token or API key, or a callable
+                returning one.
             headers: Extra request headers.
             client: Caller-owned HTTP client; when omitted the backend owns
                 one per event loop.
             timeout_seconds: Deadline for each request, and for fetching an
                 ADC token with ``gcloud``.
             calibration: A `Calibration`, a profile file to load it from, or
-                None for the bundled profile of ``jev/<model>``.
+                None for the bundled profile of ``<backend_kind>/<model>``.
         """
         self._endpoint_url = endpoint_url
         self._wire_format = str(getattr(wire_format, "value", wire_format))
-        if "ai-gateway.vercel.sh/typesafe" in endpoint_url.lower() and (
-            model == "default"
-        ):
-            model = _DEFAULT_VERCEL_TYPESAFE_MODEL
-        self.backend_kind = DecisionBackendType.JEV.value
+        if self._is_gemini_decisions():
+            if model == "default":
+                model = DEFAULT_GEMINI_DECISION_MODEL
+            self.backend_kind = DecisionBackendType.GEMINI.value
+        else:
+            if "ai-gateway.vercel.sh/typesafe" in endpoint_url.lower() and (
+                model == "default"
+            ):
+                model = _DEFAULT_VERCEL_TYPESAFE_MODEL
+            self.backend_kind = DecisionBackendType.JEV.value
         self.model_id = model
         self.capabilities = BackendCapabilities()
         self.calibration = _resolve_calibration(
@@ -1138,6 +1166,13 @@ class JevHttpBackend(_HttpClientOwner):
             and self._endpoint_url.rstrip("/").endswith("/v1/systemone")
         )
 
+    def _is_gemini_decisions(self) -> bool:
+        """Returns whether this backend uses the Google Gemini Decisions API wire format."""
+        return self._wire_format == DecisionWireFormat.GEMINI_DECISIONS.value or (
+            self._wire_format == "auto"
+            and self._endpoint_url.rstrip("/").endswith("/v1beta/decisions")
+        )
+
     def _refresh_adc_token_sync(self) -> str | None:
         """Refreshes the cached ADC token under a thread lock."""
         with self._adc_lock:
@@ -1175,28 +1210,41 @@ class JevHttpBackend(_HttpClientOwner):
         return token_str if token_str else None
 
     async def _build_headers(self) -> dict[str, str]:
-        """Constructs headers including Authorization Bearer token if configured."""
+        """Constructs headers including Bearer or x-goog-api-key authentication."""
         headers = dict(self._headers or {})
         token = await self._resolve_auth_token()
-        if token and "Authorization" not in headers:
+        if not token:
+            return headers
+        lower_keys = {k.lower() for k in headers}
+        if self._is_gemini_decisions() and self._auth != "adc":
+            if "x-goog-api-key" not in lower_keys and "authorization" not in lower_keys:
+                headers["x-goog-api-key"] = token
+        elif "authorization" not in lower_keys:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
     async def _answer_systemone(
         self, batch: DecisionBatch
     ) -> tuple[DecisionAnswer, ...]:
-        """Sends `batch` as one `/v1/systemone` request, short-circuiting 1-option choices."""
-        wire_questions = {
-            q.id: _serialize_systemone_question(q)
-            for q in batch.questions
-            if not (q.kind is QuestionKind.CHOICE and len(q.candidates()) < 2)
-        }
+        """Sends `batch` as one `/v1/systemone` or `/v1beta/decisions` request, short-circuiting 1-option choices."""
+        is_gemini = self._is_gemini_decisions()
+        wire_questions: dict[str, dict[str, Any]] = {}
+        wire_id_by_index: dict[int, str] = {}
+        for idx, q in enumerate(batch.questions):
+            if q.kind is QuestionKind.CHOICE and len(q.candidates()) < 2:
+                continue
+            wire_id = f"q_{idx}" if is_gemini else q.id
+            wire_id_by_index[idx] = wire_id
+            wire_questions[wire_id] = _serialize_systemone_question(
+                q, gemini_decisions=is_gemini
+            )
         self._last_call_latency_ms = None
         data: Mapping[str, Any] = {}
         if wire_questions:
+            context_key = "input" if is_gemini else "state"
             payload = {
                 "model": self.model_id,
-                "state": _build_systemone_state(batch.shared_context),
+                context_key: _build_systemone_state(batch.shared_context),
                 "questions": wire_questions,
             }
             data = await self._post(
@@ -1208,11 +1256,14 @@ class JevHttpBackend(_HttpClientOwner):
         fallback_q = answers_map.get("q")
         fallback_entry = fallback_q if isinstance(fallback_q, Mapping) else {}
         results: list[DecisionAnswer] = []
-        for q in batch.questions:
+        for idx, q in enumerate(batch.questions):
             if q.kind is QuestionKind.CHOICE and len(q.candidates()) < 2:
                 results.append(_single_candidate_answer(q))
                 continue
-            raw_entry = answers_map.get(q.id)
+            wire_id = wire_id_by_index[idx]
+            raw_entry = answers_map.get(wire_id)
+            if not isinstance(raw_entry, Mapping) and wire_id != q.id:
+                raw_entry = answers_map.get(q.id)
             entry = raw_entry if isinstance(raw_entry, Mapping) else fallback_entry
             answer = _parse_systemone_question_answer(q, entry, data)
             results.append(_apply_calibration(q, answer, self.calibration))
@@ -1249,7 +1300,7 @@ class JevHttpBackend(_HttpClientOwner):
         """
         if not batch.questions:
             return ()
-        if self._is_systemone():
+        if self._is_systemone() or self._is_gemini_decisions():
             return await self._answer_systemone(batch)
         return await self._answer_native(batch)
 
@@ -1639,6 +1690,15 @@ def _default_jev_url_and_model(vendor_key: str | None) -> tuple[str | None, str]
 def _create_jev_backend(settings: _BackendSettings) -> JevHttpBackend:
     default_url, default_model = _default_jev_url_and_model(settings.vendor_key)
     endpoint = _require_url(settings.kind, settings.url or default_url)
+    if endpoint.rstrip("/").endswith("/v1beta/decisions"):
+        return JevHttpBackend(
+            endpoint,
+            wire_format=DecisionWireFormat.GEMINI_DECISIONS,
+            model=settings.model or DEFAULT_GEMINI_DECISION_MODEL,
+            auth=settings.auth,
+            timeout_seconds=settings.timeout_seconds,
+            calibration=settings.calibration,
+        )
     systemone = settings.kind == DecisionBackendType.SYSTEMONE.value or (
         endpoint.rstrip("/").endswith("/v1/systemone")
     )
@@ -1648,6 +1708,22 @@ def _create_jev_backend(settings: _BackendSettings) -> JevHttpBackend:
             DecisionWireFormat.SYSTEMONE if systemone else DecisionWireFormat.JEV
         ),
         model=settings.model or (default_model if systemone else "default"),
+        auth=settings.auth,
+        timeout_seconds=settings.timeout_seconds,
+        calibration=settings.calibration,
+    )
+
+
+def _create_gemini_backend(settings: _BackendSettings) -> JevHttpBackend:
+    default_url = _DEFAULT_GEMINI_DECISIONS_URL if settings.vendor_key else None
+    default_model = (
+        os.environ.get("GEMINI_DECISION_MODEL") or DEFAULT_GEMINI_DECISION_MODEL
+    )
+    endpoint = _require_url(settings.kind, settings.url or default_url)
+    return JevHttpBackend(
+        endpoint,
+        wire_format=DecisionWireFormat.GEMINI_DECISIONS,
+        model=settings.model or default_model,
         auth=settings.auth,
         timeout_seconds=settings.timeout_seconds,
         calibration=settings.calibration,
@@ -1673,6 +1749,7 @@ def _create_mock_backend(settings: _BackendSettings) -> DeterministicMockBackend
 _BACKEND_BUILDERS: dict[str, Callable[[_BackendSettings], DecisionBackend]] = {
     DecisionBackendType.SYSTEMONE.value: _create_jev_backend,
     DecisionBackendType.JEV.value: _create_jev_backend,
+    DecisionBackendType.GEMINI.value: _create_gemini_backend,
     DecisionBackendType.STEP_ZERO.value: _create_step_zero_backend,
     DecisionBackendType.MOCK.value: _create_mock_backend,
 }
@@ -1701,19 +1778,23 @@ def create_decision_backend(
             from ``A2UI_DECISION_BACKEND``.
         endpoint_url: Endpoint for the HTTP backends.
         model: Model identifier for remote backends.
-        auth: ``"adc"``, a bearer token, or a callable returning one.
+        auth: ``"adc"``, a bearer token or API key, or a callable returning one.
         calibration: A `Calibration`, a profile file, or None for the bundled
             profile of the backend's kind and model.
         timeout_seconds: Deadline for each backend request.
 
     Environment variables:
-        A2UI_DECISION_BACKEND: 'systemone', 'jev', 'step0', or 'mock'.
+        A2UI_DECISION_BACKEND: 'systemone', 'jev', 'gemini', 'step0', or 'mock'.
         A2UI_DECISION_URL: Endpoint URL for HTTP backends.
         A2UI_DECISION_MODEL: Model identifier for remote backends.
-        A2UI_DECISION_AUTH: 'adc' or a bearer token.
+        A2UI_DECISION_AUTH: 'adc' or a bearer token / API key.
         JEV_API_KEY / TYPESAFE_API_KEY: API key for hosted Jev
             (``/v1/systemone``); selects the hosted URL and pinned model.
         JEV_MODEL: Overrides the hosted Jev model id.
+        GEMINI_API_KEY / GOOGLE_API_KEY: API key for the Google Gemini
+            Decisions API (``/v1beta/decisions``); selects the public URL and
+            pinned `DEFAULT_GEMINI_DECISION_MODEL`.
+        GEMINI_DECISION_MODEL: Overrides the Gemini Decisions model id.
 
     Raises:
         ValueError: If no kind is configured, the kind is unknown, or the
@@ -1733,7 +1814,12 @@ def create_decision_backend(
             f"Unknown decision backend type '{raw_kind}'. Choose from:"
             f" {_backend_choices()}."
         )
-    vendor_key = os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
+    if normalized == DecisionBackendType.GEMINI.value:
+        vendor_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+            "GOOGLE_API_KEY"
+        )
+    else:
+        vendor_key = os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
     settings = _BackendSettings(
         kind=normalized,
         url=endpoint_url or os.environ.get("A2UI_DECISION_URL"),
@@ -1759,6 +1845,7 @@ def _normalize_backend_kind(raw_kind: str | DecisionBackendType | None) -> str |
 
 
 __all__ = [
+    "DEFAULT_GEMINI_DECISION_MODEL",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_TYPESAFE_MODEL",
     "BackendCapabilities",

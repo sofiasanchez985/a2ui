@@ -24,6 +24,7 @@ from .archetypes import (
     SlotSpec,
 )
 from .backends import (
+    DEFAULT_GEMINI_DECISION_MODEL,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TYPESAFE_MODEL,
     BackendCapabilities,
@@ -121,6 +122,7 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "DECISION_RULES",
+    "DEFAULT_GEMINI_DECISION_MODEL",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_TYPESAFE_MODEL",
     "MAX_BRIEF_SECTIONS",

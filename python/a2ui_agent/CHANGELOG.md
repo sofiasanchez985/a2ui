@@ -258,10 +258,12 @@
     `ValueError` when it is unset (the mock backend is used only when asked
     for). Backends answer a whole `DecisionBatch` in one `answer()` call and
     declare `backend_kind`, a pinned `model_id` (TypeSafe defaults to
-    `jev-1.14.0`), and `BackendCapabilities`; a per-model `Calibration` is loaded
-    from a bundled profile file. HTTP requests time out after 30 seconds by
-    default, and timeouts or transport failures raise `DecisionBackendError`,
-    which the parser reports as a compilation error with no fallback.
+    `jev-1.14.0`, and the Google Gemini Decisions API defaults to
+    `gemini-decision-1`), and `BackendCapabilities`; a per-model `Calibration`
+    is loaded from a bundled profile file. HTTP requests time out after 30
+    seconds by default, and timeouts or transport failures raise
+    `DecisionBackendError`, which the parser reports as a compilation error
+    with no fallback.
   - `DecisionSynthesizer.synthesize` plans each surface with one `answer()`
     call (two for backends that declare `two_stage`), renders a registered
     template when the batch's template question picks one, and otherwise

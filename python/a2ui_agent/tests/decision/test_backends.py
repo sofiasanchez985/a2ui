@@ -29,6 +29,7 @@ import pytest
 
 from a2ui.core import A2uiValidationError
 from a2ui.inference_formats.decision import (
+    DEFAULT_GEMINI_DECISION_MODEL,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TYPESAFE_MODEL,
     BackendCapabilities,
@@ -39,6 +40,7 @@ from a2ui.inference_formats.decision import (
     DecisionBatch,
     DecisionDistribution,
     DecisionQuestion,
+    DecisionWireFormat,
     DeterministicMockBackend,
     JevHttpBackend,
     QuestionKind,
@@ -55,6 +57,9 @@ _BACKEND_ENV = (
     "JEV_API_KEY",
     "TYPESAFE_API_KEY",
     "JEV_MODEL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_DECISION_MODEL",
 )
 
 
@@ -847,7 +852,7 @@ def test_create_decision_backend_http_kinds(clean_env: pytest.MonkeyPatch) -> No
     assert isinstance(native_custom, JevHttpBackend)
     assert (native_custom._wire_format, native_custom.model_id) == ("jev", "custom-jev")
 
-    for kind in ("systemone", "jev", "step0"):
+    for kind in ("systemone", "jev", "gemini", "step0"):
         with pytest.raises(ValueError, match="requires an endpoint URL"):
             create_decision_backend(kind)
 
@@ -856,6 +861,7 @@ def test_create_decision_backend_pins_hosted_models(
     clean_env: pytest.MonkeyPatch,
 ) -> None:
     assert DEFAULT_TYPESAFE_MODEL == "jev-1.14.0"
+    assert DEFAULT_GEMINI_DECISION_MODEL == "gemini-decision-1"
     clean_env.setenv("JEV_API_KEY", "ts-test-key")
     typesafe = create_decision_backend("jev")
     assert isinstance(typesafe, JevHttpBackend)
@@ -871,6 +877,20 @@ def test_create_decision_backend_pins_hosted_models(
 
     clean_env.setenv("JEV_MODEL", "jev-v1")
     assert create_decision_backend("jev").model_id == "jev-v1"
+
+    clean_env.setenv("GEMINI_API_KEY", "gem-test-key")
+    gemini = create_decision_backend("gemini")
+    assert isinstance(gemini, JevHttpBackend)
+    assert gemini.backend_kind == "gemini"
+    assert (
+        gemini.endpoint_url
+        == "https://generativelanguage.googleapis.com/v1beta/decisions"
+    )
+    assert gemini.model_id == "gemini-decision-1"
+    assert gemini._wire_format == DecisionWireFormat.GEMINI_DECISIONS.value
+
+    clean_env.setenv("GEMINI_DECISION_MODEL", "gemini-decision-2")
+    assert create_decision_backend("gemini").model_id == "gemini-decision-2"
 
 
 def test_generic_token_does_not_select_the_hosted_url(
@@ -980,3 +1000,108 @@ async def test_jev_http_backend_records_server_reported_latency_ms() -> None:
         native = JevHttpBackend("http://local/predict", client=client)
         await native.answer(batch)
         assert native.last_call_latency_ms == pytest.approx(48.5)
+
+
+@pytest.mark.asyncio
+async def test_gemini_decisions_wire_format_and_error_surfacing() -> None:
+    captured_requests: list[tuple[dict[str, str], dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured_requests.append((dict(request.headers), body))
+        if body.get("input", "").startswith("User intent: blocked"):
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "safety",
+                        "message": "Request blocked by safety filter.",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "q_0": {"noul": 0.85, "confidence": 0.85},
+                    "q_1": {
+                        "choice": "primary",
+                        "probabilities": {"primary": 0.75, "secondary": 0.25},
+                        "confidence": 0.75,
+                    },
+                },
+                "usage": {"total_input_tokens": 102},
+            },
+        )
+
+    q_gate = DecisionQuestion(
+        id="gate:banner",
+        kind=QuestionKind.BOOLEAN,
+        prompt="Does the payload include an urgent alert banner?",
+        context={"yes": "Has an alert", "no": "No alert"},
+    )
+    q_salience = DecisionQuestion(
+        id="salience:/cpu_percent",
+        kind=QuestionKind.CHOICE,
+        prompt="Which salience tier fits /cpu_percent?",
+        options=("primary", "secondary"),
+    )
+    q_single = DecisionQuestion(
+        id="single:only",
+        kind=QuestionKind.CHOICE,
+        prompt="Single option short-circuit",
+        options=("only_one",),
+        allow_none=False,
+    )
+    batch = DecisionBatch(
+        shared_context={"intent": "Monitor CPU usage", "pointers": ["/cpu_percent"]},
+        questions=(q_gate, q_salience, q_single),
+    )
+
+    async with _json_client(handler) as client:
+        default_cal = JevHttpBackend(
+            "https://generativelanguage.googleapis.com/v1beta/decisions",
+            auth="gemini-secret-key",
+            client=client,
+        )
+        assert default_cal.calibration.temperature == pytest.approx(0.25)
+
+        backend = JevHttpBackend(
+            "https://generativelanguage.googleapis.com/v1beta/decisions",
+            auth="gemini-secret-key",
+            calibration=Calibration(temperature=1.0),
+            client=client,
+        )
+        assert backend.backend_kind == "gemini"
+        assert backend.model_id == "gemini-decision-1"
+        answers = await backend.answer(batch)
+
+        assert len(captured_requests) == 1
+        hdrs, payload = captured_requests[0]
+        assert hdrs.get("x-goog-api-key") == "gemini-secret-key"
+        assert "authorization" not in hdrs
+        assert payload["model"] == "gemini-decision-1"
+        assert "input" in payload and "state" not in payload
+        assert "Monitor CPU usage" in payload["input"]
+        assert set(payload["questions"].keys()) == {"q_0", "q_1"}
+        assert payload["questions"]["q_0"]["criteria"] == {
+            "true_description": "Has an alert",
+            "false_description": "No alert",
+        }
+
+        assert [a.question_id for a in answers] == [
+            "gate:banner",
+            "salience:/cpu_percent",
+            "single:only",
+        ]
+        assert answers[0].distribution.probabilities["yes"] == pytest.approx(0.85)
+        assert answers[1].distribution.probabilities["primary"] == pytest.approx(0.75)
+        assert answers[2].distribution.probabilities["only_one"] == pytest.approx(1.0)
+        assert backend.last_call_latency_ms is None
+
+        blocked_batch = DecisionBatch(
+            shared_context={"intent": "blocked request"},
+            questions=(q_gate,),
+        )
+        with pytest.raises(DecisionBackendError, match="safety: Request blocked"):
+            await backend.answer(blocked_batch)
