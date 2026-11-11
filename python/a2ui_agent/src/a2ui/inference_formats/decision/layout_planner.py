@@ -1977,7 +1977,10 @@ def _degrade_group_instances(
 
 
 def _gate_single_block(
-    block: PlannedBlock, required_ids: set[str], state: PlannerState
+    block: PlannedBlock,
+    required_ids: set[str],
+    state: PlannerState,
+    gate: float = 1.0,
 ) -> PlannedBlock | None:
     """Applies the `actions_allowed == False` gate to one `PlannedBlock`."""
     if block.block_id in {"actions", "compose"}:
@@ -1992,10 +1995,29 @@ def _gate_single_block(
         block.block_id == "collection"
         and block.variant_knobs.get("trailing") == "button"
     ):
+        has_scoped = (
+            _scoped_collection_action(block.bindings, state.actions) is not None
+        )
+        if has_scoped and state.gate_probabilities.get("collection", 0.0) >= gate:
+            return block
         return replace(block, variant_knobs={**block.variant_knobs, "trailing": "none"})
     if block.block_id == "groups":
         return replace(block, instances=_degrade_group_instances(block.instances))
     return block
+
+
+def _effective_action_confidence(plan: LayoutPlan, state: PlannerState) -> float:
+    """Returns `plan.confidence`, pooling `confirm`+`checkout` when `act` has no `none`/`result` mass."""
+    if plan.family == "act" and plan.archetype in {"confirm", "checkout"}:
+        arch_ans = state.answers_by_id.get("archetype:act")
+        if arch_ans is not None:
+            probs = arch_ans.distribution.probabilities
+            if probs.get("none", 1.0) <= 0.02 and probs.get("result", 1.0) <= 0.02:
+                return max(
+                    plan.confidence,
+                    probs.get("confirm", 0.0) + probs.get("checkout", 0.0),
+                )
+    return plan.confidence
 
 
 def _compute_action_gate(
@@ -2025,7 +2047,7 @@ def apply_actions_gate(
     to `floor` and ``1.0`` raises it to `cap`.
     """
     gate = _compute_action_gate(plan.stakes, floor, cap, conservativeness)
-    allowed = plan.confidence >= gate
+    allowed = _effective_action_confidence(plan, state) >= gate
     plan = replace(plan, actions_allowed=allowed)
     if allowed:
         return plan
@@ -2033,7 +2055,7 @@ def apply_actions_gate(
     required_ids = set(archetype.required_block_ids()) if archetype else set()
     updated: list[PlannedBlock] = []
     for block in plan.blocks:
-        gated = _gate_single_block(block, required_ids, state)
+        gated = _gate_single_block(block, required_ids, state, gate)
         if gated is not None:
             updated.append(gated)
     return replace(plan, blocks=tuple(updated))
@@ -3907,6 +3929,39 @@ class LayoutPlanner:
             and not any(p.mutable_hint for p in pointers)
         )
 
+    def _refine_specialized_family(
+        self,
+        chosen: str,
+        eligible_fams: set[str],
+        state: PlannerState,
+    ) -> str:
+        """Promotes `browse` (`chat`) or `act` (`result`) when `inspect` masks a 90%+ specialized archetype."""
+        if chosen != "inspect":
+            return chosen
+        brw_ans = state.answers_by_id.get("archetype:browse")
+        conv_ans = state.answers_by_id.get("gate:conversation")
+        if (
+            "browse" in eligible_fams
+            and brw_ans is not None
+            and brw_ans.top()[0] == "chat"
+            and brw_ans.top()[1] >= 0.90
+            and conv_ans is not None
+            and conv_ans.yes >= 0.80
+        ):
+            return "browse"
+        act_ans = state.answers_by_id.get("archetype:act")
+        out_ans = state.answers_by_id.get("gate:outcome")
+        if (
+            "act" in eligible_fams
+            and act_ans is not None
+            and act_ans.top()[0] == "result"
+            and act_ans.top()[1] >= 0.90
+            and out_ans is not None
+            and out_ans.yes >= 0.80
+        ):
+            return "act"
+        return chosen
+
     def _read_family(self, state: PlannerState) -> str | None:
         """Resolves the winning family ID from `brief` or the `family` answer."""
         pinned_fam = self._brief_pinned_family(state.brief)
@@ -3938,6 +3993,7 @@ class LayoutPlanner:
             chosen = self._best_eligible_family(
                 fam_ans, eligible_fams, state.eligible[0].family
             )
+        chosen = self._refine_specialized_family(chosen, eligible_fams, state)
         state.trace.append(
             DecisionRecord(
                 question=fam_q, answer=fam_ans, threshold=thresh, outcome=chosen
@@ -3991,6 +4047,25 @@ class LayoutPlanner:
         )
         return self._grammar.archetype(best_id), best_prob
 
+    def _prefer_feed_for_scoped_action(
+        self,
+        chosen: str,
+        prob: float,
+        arch_ans: DecisionAnswer,
+        fam_archs: Sequence[LayoutArchetype],
+        actions: Sequence[ActionSpec],
+    ) -> tuple[str, float]:
+        """Selects `feed` over `compare` when a scoped item action requires `collection`."""
+        if (
+            chosen == "compare"
+            and any(a.scope is not None for a in actions)
+            and any(a.id == "feed" for a in fam_archs)
+        ):
+            feed_p = arch_ans.distribution.probabilities.get("feed", 0.0)
+            if feed_p > 0.0:
+                return "feed", max(prob, feed_p)
+        return chosen, prob
+
     def _read_archetype(
         self, state: PlannerState, family: str
     ) -> tuple[LayoutArchetype | None, float]:
@@ -4002,7 +4077,9 @@ class LayoutPlanner:
         fam_archs = [a for a in state.eligible if a.family == family]
         if arch_q is None or arch_ans is None:
             return (fam_archs[0], 1.0) if fam_archs else (None, 0.0)
-        chosen, prob = arch_ans.top()
+        chosen, prob = self._prefer_feed_for_scoped_action(
+            *arch_ans.top(), arch_ans, fam_archs, state.actions
+        )
         thresh = self.threshold("archetype")
         fam_ans = state.answers_by_id.get("family")
         if chosen == "none" or prob < thresh:
