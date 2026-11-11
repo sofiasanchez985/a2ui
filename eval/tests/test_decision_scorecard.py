@@ -92,7 +92,7 @@ def test_ensure_mock_baseline_and_yaml_config_loading(tmp_path: Path) -> None:
 backends:
   - name: jev_hosted
     backend: systemone
-    model: jev-v0
+    model: jev-1.14.0
     p95_target_ms: 250
   - name: gev_local
     backend: gev
@@ -129,7 +129,7 @@ def test_decision_scorecard_generates_markdown_and_json_across_splits(
 backends:
   - name: jev_hosted
     backend: systemone
-    model: jev-v0
+    model: jev-1.14.0
     p95_target_ms: 250
   - name: mock_ref
     backend: mock

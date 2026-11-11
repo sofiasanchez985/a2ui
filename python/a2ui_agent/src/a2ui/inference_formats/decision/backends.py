@@ -65,7 +65,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 """Default deadline, in seconds, for one backend request (and for fetching an
 access token with ``gcloud``)."""
 
-DEFAULT_TYPESAFE_MODEL = "jev-v0"
+DEFAULT_TYPESAFE_MODEL = "jev-1.14.0"
 """Pinned TypeSafe model id; the bundled calibration was fitted on it."""
 
 _DEFAULT_VERCEL_TYPESAFE_MODEL = "jev"
@@ -1181,14 +1181,8 @@ class JevHttpBackend(_HttpClientOwner):
         }
         data: Mapping[str, Any] = {}
         if wire_questions:
-            wire_model = (
-                "jev-1.14.0"
-                if self.model_id in ("jev-v0", "default")
-                and "api.typesafe.ai" in self._endpoint_url.lower()
-                else self.model_id
-            )
             payload = {
-                "model": wire_model,
+                "model": self.model_id,
                 "state": _build_systemone_state(batch.shared_context),
                 "questions": wire_questions,
             }
