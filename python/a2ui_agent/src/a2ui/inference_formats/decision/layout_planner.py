@@ -4185,10 +4185,13 @@ class LayoutPlanner:
         thresh = self.threshold(
             "optional" if ref.requirement == "optional" else "expected"
         )
-        passed = prob >= thresh
+        has_surface_actions = ref.id == "actions" and any(
+            a.scope is None for a in state.actions
+        )
+        passed = prob >= thresh or has_surface_actions
         outcome = (
             "required_override (disagreement)"
-            if (ref.requirement == "required" and not passed)
+            if (ref.requirement == "required" and prob < thresh)
             else ("include" if passed else "drop")
         )
         if q_obj is not None and ans is not None:
