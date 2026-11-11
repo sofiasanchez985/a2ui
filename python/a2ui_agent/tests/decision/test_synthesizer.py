@@ -631,3 +631,23 @@ async def test_compare_archetype_binds_repeated_attributes_and_validates() -> No
     assert "comparison_0_cmp_attr_label" in comps
     assert comps["comparison_0_cmp_attr_label"]["text"] == "Vram gb"
     assert comps["comparison_0_cmp_attr_value"]["text"] == {"@path": "vram_gb"}
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_uses_server_reported_last_call_latency_ms() -> None:
+    class _DelayedServerReportedBackend(DeterministicMockBackend):
+
+        def __init__(self) -> None:
+            super().__init__(scripted_answers=HOST_SCRIPTED)
+            self.last_call_latency_ms = 0.05
+
+        async def answer(self, batch: Any) -> Any:
+            import asyncio
+
+            await asyncio.sleep(0.02)
+            return await super().answer(batch)
+
+    synth = DecisionSynthesizer([CATALOG], _DelayedServerReportedBackend())
+    out = await synth.synthesize(HOST.intent, HOST.payload)
+    assert out.decision_calls == 1
+    assert out.decision_latency_ms == pytest.approx(0.05)
