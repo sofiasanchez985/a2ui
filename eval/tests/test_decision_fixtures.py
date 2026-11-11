@@ -65,12 +65,23 @@ def test_build_decision_backend_known_names(
 ) -> None:
     """Verifies build_decision_backend returns the expected backend instance."""
     monkeypatch.setenv("JEV_API_KEY", "test-jev-key")
-    assert DECISION_BACKEND_NAMES == ("mock", "jev", "systemone", "step0")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    assert DECISION_BACKEND_NAMES == (
+        "mock",
+        "jev",
+        "gemini",
+        "systemone",
+        "step0",
+    )
     mock_backend = build_decision_backend("mock", model="mock-v1")
     assert isinstance(mock_backend, DeterministicMockBackend)
     assert mock_backend.backend_kind == "mock"
     assert mock_backend.model_id == "mock-v1"
     assert isinstance(build_decision_backend("jev"), JevHttpBackend)
+    gemini_backend = build_decision_backend("gemini")
+    assert isinstance(gemini_backend, JevHttpBackend)
+    assert gemini_backend.backend_kind == "gemini"
+    assert gemini_backend.model_id == "gemini-decision-1"
 
 
 def test_build_decision_backend_requires_explicit_selection(
