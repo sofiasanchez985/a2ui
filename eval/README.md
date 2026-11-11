@@ -342,7 +342,7 @@ It reports:
 uv run ./bin/decision_bench.py --backend mock --model mock --split heldout --paraphrase --template-arm
 
 # Run hosted Jev across tuning and held-out splits (reports each split separately plus mock baseline)
-uv run ./bin/decision_bench.py --backend systemone --model jev-v0 --split all --repeat 3
+uv run ./bin/decision_bench.py --backend systemone --model jev-1.14.0 --split all --repeat 3
 ```
 
 The benchmark reports:
@@ -363,7 +363,7 @@ uv run ./bin/decision_scorecard.py --config backends.yaml --split all --out scor
 `bin/calibrate_decision_backend.py` fits per-model temperature profiles on tuning cases from `datasets/decision_plans/v1.yaml` and writes a JSON profile readable by `Calibration.load`. It refuses cases tagged `heldout` or marked `split: heldout`:
 
 ```bash
-uv run ./bin/calibrate_decision_backend.py --backend jev --model jev-v0 --split tuning --out calibration.json
+uv run ./bin/calibrate_decision_backend.py --backend jev --model jev-1.14.0 --split tuning --out calibration.json
 ```
 
 ## Running Unit Tests & Schema Validation
