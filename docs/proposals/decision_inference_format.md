@@ -60,7 +60,7 @@ Every synthesis turn flows through eight stages. We trace one incident-response 
 An incident-response agent wants to show an active checkout latency alert (`incident_482`), let the on-call engineer edit a handoff note, and expose actions to roll back the release, acknowledge the page, or inspect an individual timeline event:
 
 ```xml
-<a2ui-inference>
+<a2ui>
 {
   "surfaceId": "incident_482",
   "intent": "Inspect the checkout latency incident, edit the operator handoff note, and acknowledge or roll back the release",
@@ -115,10 +115,10 @@ An incident-response agent wants to show an active checkout latency alert (`inci
     "actions:rollback_release,acknowledge"
   ]
 }
-</a2ui-inference>
+</a2ui>
 ```
 
-`DecisionBlock.from_json` parses this object into typed fields: `actions` becomes a tuple of three `ActionSpec` records in declaration order (`rollback_release`, `acknowledge`, `inspect_event`), `layout` becomes four `LayoutBrief` entries, and `mutable_paths`, `exclude`, and `labels` are validated as `/`-prefixed JSON Pointers.
+`DecisionBlock.from_mapping` parses this object into typed fields: `actions` becomes a tuple of three `ActionSpec` records in declaration order (`rollback_release`, `acknowledge`, `inspect_event`), `layout` becomes four `LayoutBrief` entries, and `mutable_paths`, `exclude`, and `labels` are validated as `/`-prefixed JSON Pointers.
 
 ### Worked example: Stage 2 (`inspect_payload_pointers`)
 
@@ -199,21 +199,21 @@ The backend (`backend.answer(batch)`) scores all questions in one call and appli
 
 ### Worked example: Stage 5 (`LayoutPlan`)
 
-`LayoutPlanner.resolve` checks the calibrated probabilities against the grammar thresholds in `catalogs/decision/v1/archetypes.json`:
+`LayoutPlanner.read(state, answers)` checks the calibrated probabilities against the grammar thresholds in `catalogs/decision/v1/archetypes.json`:
 
 1. `family` selects `inspect` (`p = 0.84 >= 0.40`).
 2. `archetype:inspect` selects `detail` (`p = 0.79 >= 0.40`).
-3. `stakes` is `high` (`0.81`), which raises the stakes-scaled action gate threshold to `0.70 + 0.5 * 0.25 * 0.81 = 0.80125`. Because the block explicitly declared `actions` and the planner's action confidence exceeds that threshold, `actions_allowed` is `True`.
-4. The planner honours the `layout` brief roles (`headline`, `timeline`, `form`, `actions`), binds the page title and summary from `AuthoredCopy`, attaches the scoped `inspect_event` action to `/events`, and records `fit_score = 0.91`.
+3. `stakes` (`2.4` on the `[0.0, 3.0]` scale, so `clamped_stakes = 0.8`) sets the stakes-scaled action gate threshold at `conservativeness = 0.5` to `0.70 + (0.95 - 0.70) * 0.8 = 0.90`. Because the block explicitly declared `actions` and the planner's action confidence exceeds that threshold, `actions_allowed` is `True`.
+4. The planner honours the `layout` brief roles (`headline`, `timeline`, `form`, `actions`), binds the page title and summary from `AuthoredCopy`, attaches the scoped `inspect_event` action to `/events`, and computes `fit_score = 0.74` via `compute_fit_score`.
 
 ### Worked example: Stages 6, 7, and 8 (`PatternExpander` and v1.0 messages)
 
-`PatternExpander` expands the `page`, `headline`, `timeline`, `form`, and `actions` patterns from `catalogs/basic/v1/patterns.json`. Because `/handoffNote` is bound in a mutable `form` block, `Expansion.send_data_model` is `True`. For a new `surfaceId` (`"incident_482"`), `DecisionSynthesizer` emits three A2UI v1.0 messages:
+`PatternExpander` expands the `page`, `headline`, `timeline`, `form`, and `actions` patterns from `catalogs/basic/v1/patterns.json`. Because `/handoffNote` is bound in a mutable `form` block, `Expansion.send_data_model` is `True`. For a new `surfaceId` (`"incident_482"`), `DecisionSynthesizer` emits three A2UI v1.0 messages (`"version": "1.0"`):
 
 ```json
 [
   {
-    "version": "v1.0",
+    "version": "1.0",
     "createSurface": {
       "surfaceId": "incident_482",
       "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
@@ -221,7 +221,7 @@ The backend (`backend.answer(batch)`) scores all questions in one call and appli
     }
   },
   {
-    "version": "v1.0",
+    "version": "1.0",
     "updateComponents": {
       "surfaceId": "incident_482",
       "components": [
@@ -231,10 +231,10 @@ The backend (`backend.answer(batch)`) scores all questions in one call and appli
           "children": [
             "page_head",
             "page_subtitle",
-            "b0_headline_row",
-            "b1_timeline_list",
-            "b2_form_col",
-            "b3_actions_row"
+            "headline_root",
+            "timeline_root",
+            "form_root",
+            "actions_root"
           ]
         },
         {
@@ -255,16 +255,16 @@ The backend (`backend.answer(batch)`) scores all questions in one call and appli
           "variant": "caption"
         },
         {
-          "id": "b2_f0_input",
+          "id": "form_f0_input",
           "component": "TextField",
           "label": "Handoff Note",
           "value": {"path": "/handoffNote"},
           "variant": "longText"
         },
         {
-          "id": "b3_a0_btn",
+          "id": "actions_a0_btn",
           "component": "Button",
-          "child": "b3_a0_label",
+          "child": "actions_a0_label",
           "variant": "primary",
           "action": {
             "event": {
@@ -274,9 +274,9 @@ The backend (`backend.answer(batch)`) scores all questions in one call and appli
           }
         },
         {
-          "id": "b3_a1_btn",
+          "id": "actions_a1_btn",
           "component": "Button",
-          "child": "b3_a1_label",
+          "child": "actions_a1_label",
           "variant": "primary",
           "action": {
             "event": {
@@ -288,7 +288,7 @@ The backend (`backend.answer(batch)`) scores all questions in one call and appli
     }
   },
   {
-    "version": "v1.0",
+    "version": "1.0",
     "updateDataModel": {
       "surfaceId": "incident_482",
       "path": "/",
@@ -322,14 +322,14 @@ Every emitted message passes `CatalogApi.validator.validate` before leaving `Dec
 
 ## 4. Decision block contract
 
-In chat mode, the conversational model emits a JSON object (or a JSON array of objects, one per surface) inside `<a2ui-inference>...</a2ui-inference>`. In tool mode, the model passes the same JSON fields as arguments to `render_a2ui_decision`.
+In chat mode, the conversational model emits a JSON object (or a JSON array of objects, one per surface) inside `<a2ui>...</a2ui>`. In tool mode, the model passes the same JSON fields as arguments to `render_a2ui_decision`.
 
 ### Block fields
 
 | Field | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `intent` | `string` | Yes | Non-empty natural-language description of what the data represents and how the user should inspect or interact with it. |
-| `payload` (`data` alias) | `object` or `array` | Yes | The JSON data to display. An array payload is wrapped at `{"items": [...]}` so bindings address `/items/0/...`. `DecisionBlock.from_json` accepts `"data"` as a wire alias when `"payload"` is absent and serializes back to `"payload"`. |
+| `payload` (`data` alias) | `object` or `array` | Yes | The JSON data to display. An array payload is wrapped at `{"items": [...]}` so bindings address `/items/0/...`. `DecisionBlock.from_mapping` accepts `"data"` as a wire alias when `"payload"` is absent and serializes back to `"payload"`. |
 | `surfaceId` | `string` | No | Target surface identifier. Defaults to `SynthesisConfig.default_surface_id` (`"default_surface"`). Creating, updating, or replacing a surface is controlled by `surfaceId`, `region`, and `replace`. |
 | `replace` | `boolean` | No | Defaults to `false`. When `true` on an existing `surfaceId`, the synthesizer emits `deleteSurface` followed by `createSurface`, `updateComponents`, and `updateDataModel`. Cannot be combined with `region`. |
 | `region` | `string` | No | Block role name (such as `"headline"` or `"actions"`) of a single section to re-plan and replace in place on an existing surface. Cannot be combined with `replace: true`. |
@@ -388,10 +388,10 @@ Because `generate_catalog_instructions()` lists only component names (`- Card`, 
 
 ### `RendererState` ownership
 
-Multi-turn surface updates require tracking which `surfaceId` values already exist, whether each active surface was created with `sendDataModel: true`, and which component IDs belong to each planned block role. `RendererState` owns that per-conversation state:
+Multi-turn surface updates require tracking which `surfaceId` values already exist and whether each active surface was created with `sendDataModel: true`. `RendererState` owns that per-conversation surface state, while `PlanCache` retains the most recent `CachedPlan` (including expanded components by block role) for each surface:
 
-1. Explicit caller state: An application managing its own session object can pass `state=RendererState()` to `DecisionFormat`, `DecisionSynthesizer.synthesize`, or `DecisionRenderTool.create`.
-2. Per-conversation state map: When `DecisionFormat` is constructed without a shared `state`, calling `format.create_parser(conversation_id="conv_42")` or `format.state_for("conv_42")` returns a dedicated `RendererState` for that conversation ID (evicting the oldest entry once `_MAX_CONVERSATION_STATES = 256` is exceeded). Calling `create_parser()` with no `conversation_id` allocates a fresh isolated `RendererState` for that turn so concurrent conversations never bleed surface state into one another.
+1. Explicit caller state: An application managing its own session object can pass `state=RendererState()` to `parser.parse_response(..., state=state)` or `synthesizer.synthesize(..., state=state)`.
+2. Per-conversation state map: Calling `format.create_parser(conversation_id="conv_42")` or `format.state_for("conv_42")` returns a dedicated `RendererState` for that conversation ID (evicting the oldest entry once `_MAX_CONVERSATION_STATES = 256` is exceeded). Calling `create_parser()` with no `conversation_id` allocates a fresh isolated `RendererState` for that turn so concurrent conversations never bleed surface state into one another.
 
 ### Surface lifecycle operations
 
@@ -402,7 +402,7 @@ For every block, `resolve_surface_operation` determines the `SurfaceOperation` f
 | `surfaceId` is not active in `RendererState` | `SurfaceOperation.CREATE` | `createSurface`, `updateComponents`, `updateDataModel` (when payload is non-empty) |
 | `surfaceId` is active, `replace: false`, `region` unset, and `PlanCache` hits (same payload shape and no structural changes) | `SurfaceOperation.UPDATE_ROOT` (cache hit) | `updateDataModel` only (`decision_calls = 0`, `cache_hit = True`) |
 | `surfaceId` is active, `replace: false`, `region` unset, and payload shape or layout changes | `SurfaceOperation.UPDATE_ROOT` | `updateComponents` (with root component `"id": "root"`), `updateDataModel` |
-| `surfaceId` is active, `replace: false`, and `region: "<role>"` matches an existing block role on the surface | `SurfaceOperation.UPDATE_ROOT` (region) | `updateComponents` (containing only the re-planned block subtree prefixed with the existing block ID prefix, without `"id": "root"`), `updateDataModel` |
+| `surfaceId` is active, `replace: false`, and `region: "<role>"` matches an existing block role in the cached plan | `SurfaceOperation.UPDATE_ROOT` (region) | `updateComponents` (splicing the re-expanded `<role>_root` and `<role>_*` components into the cached surface tree via `replace_block_components`), `updateDataModel` |
 | `surfaceId` is active and `replace: true` | `SurfaceOperation.REPLACE` | `deleteSurface`, `createSurface`, `updateComponents`, `updateDataModel` |
 | `surfaceId` is active without `sendDataModel: true`, and an update introduces mutable bindings (`Expansion.send_data_model == True`) | `SurfaceOperation.REPLACE` (escalated) | `deleteSurface`, `createSurface` (with `"sendDataModel": true`), `updateComponents`, `updateDataModel` |
 
@@ -417,7 +417,7 @@ Returning to the `incident_482` worked example, suppose Turn 2 reports that late
 ```json
 [
   {
-    "version": "v1.0",
+    "version": "1.0",
     "updateDataModel": {
       "surfaceId": "incident_482",
       "path": "/",
@@ -445,7 +445,7 @@ Returning to the `incident_482` worked example, suppose Turn 2 reports that late
 ]
 ```
 
-In Turn 3, the agent sets `"region": "actions"` to replace the action bar with a single `"close_incident"` button, leaving the rest of `"incident_482"` untouched. `DecisionSynthesizer` looks up the existing block prefix (`"b3"` for role `"actions"` in `RendererState.get_surface_blocks("incident_482")`), re-expands only that block under prefix `"b3"`, and emits `updateComponents` for the `"b3_*"` components plus `updateDataModel`.
+In Turn 3, the agent sets `"region": "actions"` to replace the action bar with a single `"close_incident"` button, leaving the rest of `"incident_482"` untouched. `DecisionSynthesizer` retrieves the cached plan via `plan_cache.get_for_surface("incident_482")`, re-expands the `"actions"` block (`"actions_root"` and `"actions_*"`), splices those components into the cached component list via `replace_block_components`, and emits `updateComponents` plus `updateDataModel`.
 
 ### User action round-trip
 
@@ -477,7 +477,7 @@ sequenceDiagram
     Agent->>Synth: Turn 3 DecisionBlock (surfaceId="incident_482", region="actions")
     Synth->>Backend: answer(DecisionBatch) [1 call]
     Backend-->>Synth: Calibrated DecisionAnswers
-    Synth->>Client: updateComponents (b3_* subtree only) + updateDataModel
+    Synth->>Client: updateComponents (actions_root + actions_* replaced) + updateDataModel
 
     Agent->>Synth: Turn 4 DecisionBlock (surfaceId="incident_482", replace=true)
     Synth->>Backend: answer(DecisionBatch) [1 call]
@@ -489,7 +489,7 @@ sequenceDiagram
 
 ## 6. Synthesis pipeline
 
-`DecisionSynthesizer.synthesize_with_output` orchestrates template matching, cache lookup, batch scoring, threshold gating, pattern expansion, and fallback recovery.
+`DecisionSynthesizer.synthesize` (and its synchronous wrapper `synthesize_sync`) orchestrates template matching, cache lookup, batch scoring, threshold gating, pattern expansion, and fallback recovery, returning a `SynthesisOutput`.
 
 ```mermaid
 flowchart TD
@@ -499,17 +499,17 @@ flowchart TD
     C -- "No" --> E["Compile template question (if TemplateRegistry non-empty) + grammar DecisionBatch"]
     E --> F{"Backend capabilities.two_stage?"}
     F -- "False (Jev / Gev / Mock)" --> G["Single backend.answer(batch) call (timeout=30s)"]
-    F -- "True (StepZeroLogprobBackend)" --> H["Stage 1 call (family, archetype, stakes, template) + Stage 2 call (selected archetype blocks)"]
+    F -- "True (StepZeroLogprobBackend)" --> H["Stage 1 call (template, family, archetype, stakes) + Stage 2 call (selected archetype blocks)"]
     G --> I{"Registered template above threshold?"}
     H --> I
     I -- "Yes (0.75 read-only / 0.85 mutable)" --> J["Expand SurfaceTemplate (Stage: TEMPLATE_SELECT)"]
-    I -- "No" --> K{"Grammar exists for catalog and family != none and fit_score >= 0.50?"}
-    K -- "Yes (all required blocks bound)" --> L["Apply stakes-scaled actionGate; PatternExpander.expand (Stage: ARCHETYPE)"]
-    K -- "No (abstain or missing required block)" --> M["Fallback chain (Stage: ABSTAIN_FALLBACK)"]
+    I -- "No" --> K{"Grammar exists for catalog and family != none and required blocks bind?"}
+    K -- "Yes" --> L["Apply stakes-scaled actionGate; PatternExpander.expand (Stage: ARCHETYPE)"]
+    K -- "No (none >= noFit or missing required block)" --> M["Fallback chain (Stage: ABSTAIN_FALLBACK)"]
     M --> M1{"1. block.fallbackDsl?"}
     M1 -- "Yes" --> N["Compile A2UI Express fallbackDsl"]
     M1 -- "No" --> M2{"2. synthesizer fallback_fn?"}
-    M2 -- "Yes" --> O["Invoke caller fallback_fn(block)"]
+    M2 -- "Yes" --> O["Invoke caller fallback_fn(intent, payload, surface_id)"]
     M2 -- "No" --> M3{"3. Catalog has facts pattern and pointers exist?"}
     M3 -- "Yes" --> P["Expand deterministic facts pattern"]
     M3 -- "No" --> Q["Raise A2uiCompilationError"]
@@ -522,46 +522,51 @@ flowchart TD
 
 ### Single-batch scoring and two-stage mode
 
-By default (`BackendCapabilities.two_stage = False`), `LayoutPlanner.build_batch` includes questions for every shape-eligible archetype in a single `DecisionBatch`, and `DecisionSynthesizer` prepends the optional `template_select` question to that same batch. The backend scores the entire turn in one network round-trip (`decision_calls = 1`).
+By default (`BackendCapabilities.two_stage = False`), `LayoutPlanner.build_batch` includes questions for every shape-eligible archetype in a single `DecisionBatch`, including the optional `"template"` choice question (whose options are matching registered template IDs plus `"compose"`). The backend scores the entire turn in one network round-trip (`decision_calls = 1`).
 
-When a backend sets `BackendCapabilities.two_stage = True` (used by `StepZeroLogprobBackend`, where each question requires a separate chat completion request), `DecisionSynthesizer` runs a compact first batch containing only `template_select`, `family`, `stakes`, `urgency`, and `archetype:<family>`, then builds a second batch containing only the block, knob, salience, and instance questions for the winning archetype (`decision_calls = 2`, or `1` if `template_select` or `family == "none"` short-circuits after the first batch).
+When a backend sets `BackendCapabilities.two_stage = True` (used by `StepZeroLogprobBackend`, where each question requires a separate chat completion request), `DecisionSynthesizer` runs a compact first batch containing `"template"`, `"family"`, `"stakes"`, `"urgency"`, and `"archetype:<family>"`, then builds a second batch containing only the block, knob, salience, and instance questions for the winning archetype (`decision_calls = 2`, or `1` if `"template"` or `family == "none"` short-circuits after the first batch).
 
-### Thresholds and gates
+### Thresholds, gates, and `fit_score`
 
 All grammar thresholds live in `catalogs/decision/v1/archetypes.json` and are validated on load by `validate_threshold_relations`:
 
 | Threshold key | Value | Meaning |
 | :--- | :--- | :--- |
-| `template` | `0.75` | Minimum calibrated probability to pick a registered `SurfaceTemplate` when `block.mutable_paths` is empty and the template has `is_mutable = False`. |
+| `template` | `0.75` | Minimum calibrated probability on the `"template"` question to pick a registered `SurfaceTemplate` when `block.mutable_paths` is empty and the template has `is_mutable = False`. |
 | `templateMutable` | `0.85` | Higher minimum probability required to pick a registered `SurfaceTemplate` when `block.mutable_paths` is non-empty or `template.is_mutable` is `True`. |
-| `family` | `0.40` | Minimum probability for the winning layout family (`browse`, `monitor`, `inspect`, `act`, `input`, `follow`). If `none` wins or the top family falls below `0.40`, planning abstains (`PlanReason.NO_FAMILY`). |
+| `family` | `0.40` | Minimum probability for the winning layout family (`browse`, `monitor`, `inspect`, `act`, `input`, `follow`). If the top non-`none` family falls below `0.40`, planning abstains (`PlanReason.NO_FAMILY`). |
+| `noFit` | `0.50` | Minimum probability for the `"none"` option on the `family` question to abstain directly with `PlanReason.NO_FIT` (`chosen == "none" and prob >= 0.50`). |
 | `archetype` | `0.40` | Minimum probability for the winning archetype within the chosen family (`PlanReason.NO_ARCHETYPE` on failure). |
 | `expected` | `0.50` | Minimum probability to include an expected (`name`) block in an archetype. Required (`name!`) blocks are always included if their slots can bind. |
 | `optional` | `0.75` | Minimum probability to include an optional (`name?`) block in an archetype (`expected <= optional`). |
 | `instance` | `0.50` | Minimum probability for per-pointer widget selection (`$byInstance`). |
-| `noFit` | `0.50` | Minimum overall `LayoutPlan.fit_score` (the geometric mean of the winning family, archetype, and required block confidences, penalized by unbound brief roles). Plans below `0.50` abstain with `PlanReason.NO_FIT`. |
-| `actionGateFloor` | `0.70` | Base confidence floor for emitting interactive action blocks when `stakes` is `0.0`. |
-| `actionGateCap` | `0.95` | Maximum action confidence cap when `stakes` and `conservativeness` are both `1.0`. |
+| `actionGateFloor` | `0.70` | Base confidence floor for emitting interactive action blocks when `stakes` is `0.0` (or `conservativeness` is `0.0`). |
+| `actionGateCap` | `0.95` | Maximum action confidence cap when `stakes` is at its maximum (`3.0`) or `conservativeness` is `1.0`. |
+
+For every resolved `LayoutPlan`, `compute_fit_score` computes a diagnostic `fit_score` in `[0.0, 1.0]` combining four factors:
+
+```text
+fit_score = p * (1.0 - 0.35 * h) * (1.0 - 0.50 * o) * (1.0 - 0.40 * w)
+```
+
+Here `p` is the winning archetype probability, `h` is the normalized Shannon entropy of the archetype distribution, `o` is the share of bindable pointers left unbound (or swept into an unrequested fallback `facts` block beyond `MAX_ORPHAN_FACTS_ROWS = 8`), and `w` is the share of required slots whose binding confidence fell below `thresholds.instance` (`0.50`).
 
 ### Stakes-scaled action gate
 
-Even when a payload or archetype can render an `actions` or `outcome` block, the planner checks whether interactive triggers are safe to emit for the turn's inferred operational stakes (`stakes` in `[0.0, 1.0]`, computed as the expected value over `low = 0.0`, `medium = 0.5`, `high = 1.0`) and `SynthesisConfig.conservativeness` (default `0.5`):
+Even when a payload or archetype can render an `actions` or `outcome` block, `_compute_action_gate` checks whether interactive triggers are safe to emit for the turn's inferred operational stakes (`stakes` in `[0.0, 3.0]`, normalized to `clamped_stakes = min(max(stakes, 0.0), 3.0) / 3.0`) and `SynthesisConfig.conservativeness` (in `[0.0, 1.0]`, default `0.5`):
 
 ```text
-action_threshold = min(
-    actionGateCap,
-    actionGateFloor + conservativeness * (actionGateCap - actionGateFloor) * stakes
-)
+base = actionGateFloor + (actionGateCap - actionGateFloor) * clamped_stakes
 ```
 
-With the default thresholds (`0.70` floor, `0.95` cap, `conservativeness = 0.5`), a low-stakes turn (`stakes = 0.0`) requires `0.70` confidence, a medium-stakes turn (`stakes = 0.5`) requires `0.7625`, and a high-stakes turn (`stakes = 1.0`) requires `0.825`. If an archetype requires `actions_allowed` (such as `confirm` or `checkout`) and the gate fails, the planner abstains with `PlanReason.ACTION_GATE`.
+`conservativeness` interpolates linearly from `actionGateFloor` (at `conservativeness = 0.0`) through `base` (at `conservativeness = 0.5`) to `actionGateCap` (at `conservativeness = 1.0`). With the default thresholds (`0.70` floor, `0.95` cap, `conservativeness = 0.5`), a low-stakes turn (`stakes = 0.0`) requires `0.70` confidence, a medium-stakes turn (`stakes = 1.5`) requires `0.825`, and a high-stakes turn (`stakes = 3.0`) requires `0.95`. If an archetype requires `actions_allowed` (such as `confirm` or `checkout`) and the gate fails, the planner abstains with `PlanReason.ACTION_GATE`.
 
 ### Deterministic fallback chain
 
 When template selection does not match and the archetype planner abstains (or the active catalog has no `patterns.json`), `DecisionSynthesizer` transitions to `SynthesisStage.ABSTAIN_FALLBACK` (`fallback_reason` records the `PlanReason` value, or `"no_patterns"` when the catalog provides no pattern library) and tries three fallbacks in order:
 
 1. `block.fallback_dsl`: If the block includes an A2UI Express string in `fallbackDsl`, the synthesizer compiles it against the active catalogs, populates `updateDataModel` with the filtered payload, and sets `fallback_source = FallbackSource.DSL` (`"fallback_dsl"`).
-2. `fallback_fn`: If the caller configured a `fallback_fn(block)` callback on `DecisionSynthesizer` or `DecisionFormat`, the synthesizer invokes it, validates the returned v1.0 messages, and sets `fallback_source = FallbackSource.CALLBACK` (`"fallback_fn"`).
+2. `fallback_fn`: If the caller configured a `fallback_fn(intent, payload, surface_id)` callback (`FallbackCallback`) on `DecisionSynthesizer` or `DecisionFormat`, the synthesizer invokes it, validates the returned v1.0 messages, and sets `fallback_source = FallbackSource.CALLBACK` (`"fallback_fn"`).
 3. `facts` pattern: If the active `MergedPatternLibrary` defines the terminal `facts` pattern (plus `page`) and the inspected payload has at least one scalar pointer, the synthesizer deterministically binds up to 12 scalar pointers into a `facts` key-value layout and sets `fallback_source = FallbackSource.FACTS` (`"fallback_facts"`).
 
 If none of the three fallbacks can produce messages, `DecisionSynthesizer` raises `A2uiCompilationError`.
@@ -595,32 +600,27 @@ class DecisionBackend(Protocol):
 
 | Class | `backend_kind` | Default `model_id` | Wire contract and usage |
 | :--- | :--- | :--- | :--- |
-| `JevHttpBackend` (TypeSafe Jev) | `"typesafe_jev"` | `DEFAULT_TYPESAFE_MODEL = "jev-v0"` | Calls a hosted TypeSafe Jev endpoint using either the native Jev batch schema (`{"model", "shared_context", "questions"}`) or `/v1/systemone` (`{"context", "questions": [{"question", "answers"}]}`). Auto-detects wire format from the URL path (`DecisionWireFormat.AUTO`). |
-| `JevHttpBackend` (Local Gev) | `"local_gev"` | `"gev-local"` | Constructed via `JevHttpBackend.local_gev(endpoint_url=...)`. Speaks the `/v1/systemone` batch decision protocol against a local Gev server with `two_stage = False`. |
-| `StepZeroLogprobBackend` | `"step_zero"` | Caller-supplied (for example `"gemini-2.5-flash"`) | Prompts an OpenAI-compatible `/v1/chat/completions` endpoint to output a single choice token (`A` through `J`) with `max_tokens = 1` and `top_logprobs = 10`, converts token logprobs into a normalized distribution, and runs with `two_stage = True`. |
-| `DeterministicMockBackend` | `"mock"` | `"deterministic-mock-v1"` | Rule-based in-memory backend for unit tests, CI, and offline conformance checks. Requires no network access. |
+| `JevHttpBackend` (TypeSafe Jev or Local Gev) | `"jev"` | `DEFAULT_TYPESAFE_MODEL = "jev-v0"` | Calls a hosted TypeSafe Jev endpoint or a local Gev `/v1/systemone` endpoint using either the native Jev batch schema (`{"model", "shared_context", "questions"}`) or `/v1/systemone` (`{"context", "questions": [{"question", "answers"}]}`). Auto-detects wire format from the URL path (`DecisionWireFormat.AUTO`), with `two_stage = False`. |
+| `StepZeroLogprobBackend` | `"step0"` | Caller-supplied (for example `"gemini-2.5-flash"`) | Prompts an OpenAI-compatible `/v1/chat/completions` endpoint to output a single choice token (`A` through `J`) with `max_tokens = 1` and `top_logprobs = 10`, converts token logprobs into a normalized distribution, and runs with `two_stage = True`. |
+| `DeterministicMockBackend` | `"mock"` | `"mock"` | Rule-based in-memory backend for unit tests, CI, and offline conformance checks. Requires no network access. |
 
-`create_decision_backend(kind=..., endpoint_url=..., api_key=..., model=..., calibration=...)` constructs any of the four backends from explicit arguments or environment variables (`A2UI_DECISION_BACKEND`, `A2UI_DECISION_ENDPOINT`, `A2UI_DECISION_MODEL`, `JEV_API_KEY`, `TYPESAFE_API_KEY`, `STEP_ZERO_API_KEY`). Every backend ID is pinned (such as `"jev-v0"`); floating aliases are not used.
+`create_decision_backend(kind=..., endpoint_url=..., api_key=..., model_id=..., calibration=...)` constructs any of the backends (`"jev"`, `"step0"`, or `"mock"`) from explicit arguments or environment variables. Every backend model ID is pinned (such as `"jev-v0"`); floating aliases are not used.
 
 ### Temperature calibration (`calibration_profiles.json`)
 
 Different backends produce raw probability distributions with different sharpness. Before comparing answers against the fixed grammar thresholds in `archetypes.json`, every backend applies `Calibration(temperature: float)` (`distribution.with_temperature(T)`), scaling log-probabilities by `1 / T` and re-normalizing (`T = 1.0` is an identity transform, `T < 1.0` sharpens flat distributions, and `T > 1.0` softens overconfident ones).
 
-Bundled calibration profiles live in `python/a2ui_agent/src/a2ui/inference_formats/decision/assets/calibration_profiles.json`, keyed by `"<backend_kind>/<model_id>"`:
+Bundled calibration profiles live in `python/a2ui_agent/src/a2ui/inference_formats/decision/calibration_profiles.json`, stored as a flat map keyed by `"<backend_kind>/<model_id>"`:
 
 ```json
 {
-  "schemaVersion": "1",
-  "profiles": {
-    "mock/deterministic-mock-v1": {"temperature": 1.0},
-    "typesafe_jev/jev-v0": {"temperature": 1.0},
-    "local_gev/gev-local": {"temperature": 1.0},
-    "step_zero/default": {"temperature": 1.0}
+  "jev/jev-v0": {
+    "temperature": 4.0
   }
 }
 ```
 
-When a backend is instantiated without an explicit `Calibration`, `load_calibration_for(backend_kind, model_id)` resolves its profile (falling back to `"<backend_kind>/default"`, then `Calibration(temperature=1.0)`). To fit a temperature for a new backend or model checkpoint, run `eval/bin/calibrate_decision_backend.py`, which minimizes negative log-likelihood on the `tuning` split of `decision_bench` only (never on the `held_out` split) and writes the fitted temperature and Expected Calibration Error (ECE) into `calibration_profiles.json`.
+When a backend is instantiated without an explicit `Calibration`, `Calibration.load(path, backend_kind=..., model_id=...)` resolves its profile from `calibration_profiles.json` (falling back to `"<backend_kind>"`, then `Calibration(temperature=1.0)`). To fit a temperature for a new backend or model checkpoint, run `eval/bin/calibrate_decision_backend.py`, which minimizes negative log-likelihood on the `"tuning"` split of `decision_bench` only (never on the `"heldout"` split) and writes the fitted temperature into `calibration_profiles.json`.
 
 ---
 
@@ -688,27 +688,27 @@ Applications can expose `a2ui-decision` to the conversational model in two ways:
 
 | Dimension | Chat mode (`DecisionFormat`) | Tool mode (`DecisionRenderTool`) |
 | :--- | :--- | :--- |
-| Model interface | Emits `<a2ui-inference>{...}</a2ui-inference>` blocks inside assistant text responses. | Calls the structured tool `render_a2ui_decision` with JSON arguments matching `DecisionBlock.json_schema()`. |
-| Prompt footprint | `DecisionPromptGenerator` injects the 13-field contract and available component names into the system prompt. | The tool's `description` and `parameters_json_schema()` carry the contract; no `<a2ui-inference>` tag parser is needed. |
+| Model interface | Emits `<a2ui>{...}</a2ui>` blocks inside assistant text responses. | Calls the structured tool `render_a2ui_decision` with JSON arguments matching `tool.declaration()["parameters"]`. |
+| Prompt footprint | `DecisionPromptGenerator` injects the 13-field contract and available component names into the system prompt. | `tool.declaration()` provides the tool's `name`, `description`, and JSON Schema `parameters`; no `<a2ui>` tag parser is needed. |
 | Lifecycle state | `DecisionFormat.create_parser(conversation_id=...)` binds a per-conversation `RendererState`. | `DecisionRenderTool` holds a `RendererState` and a tool-level `PlanCache` across tool invocations. |
-| Template promotion | Templates are registered ahead of time in `TemplateRegistry`. | `tool.promote(template_id, description, surface_id=...)` promotes the most recent cached `LayoutPlan` for a surface into a reusable `SurfaceTemplate` in `TemplateRegistry` at runtime. |
+| Template promotion | Templates are registered ahead of time in `TemplateRegistry`. | `tool.promote(template_id, description, is_mutable=...)` promotes the most recent synthesized plan into a reusable `SurfaceTemplate` in `TemplateRegistry` at runtime. |
 
 ### Promoting a live plan to a template in tool mode
 
-During interactive development or multi-step agent sessions, a tool-mode agent can freeze a successful layout plan into a named `SurfaceTemplate` so future turns with similar intents bypass archetype planning:
+During interactive development or multi-step agent sessions, a tool-mode agent can freeze the most recently synthesized layout plan into a named `SurfaceTemplate` so future turns with similar intents bypass archetype planning:
 
 ```python
 tool = DecisionRenderTool.create(catalogs=[basic_catalog], backend=backend)
-output = await tool.run_async(
-    intent="Inspect the checkout latency incident",
-    payload=incident_payload,
-    surfaceId="incident_482",
-    actions={"acknowledge": "Acknowledge"},
-)
+output = await tool.run_async({
+    "intent": "Inspect the checkout latency incident",
+    "payload": incident_payload,
+    "surfaceId": "incident_482",
+    "actions": {"acknowledge": "Acknowledge"},
+})
 template = tool.promote(
     "incident_summary_v1",
     "Incident status header, event timeline, and operator actions",
-    surface_id="incident_482",
+    is_mutable=True,
 )
 ```
 
@@ -722,14 +722,14 @@ Use `a2ui-decision` archetype synthesis when payload shapes vary across turns or
 
 ### `SynthesisOutput` telemetry
 
-Calling `synthesizer.synthesize_with_output(block, state=state)` (or `tool.run_async(...)`) returns a frozen `SynthesisOutput` containing both the validated A2UI v1.0 wire messages and per-turn telemetry:
+Calling `await synthesizer.synthesize(intent, payload, ..., state=state)` (or `await tool.run_async(args)`) returns a frozen `SynthesisOutput` containing both the validated A2UI v1.0 wire messages and per-turn telemetry:
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `stage` | `SynthesisStage` | Which path produced the messages: `TEMPLATE_SELECT`, `ARCHETYPE`, or `ABSTAIN_FALLBACK`. |
 | `messages` | `list[dict[str, Any]]` | Validated A2UI v1.0 protocol messages (`createSurface`, `updateComponents`, `updateDataModel`, `deleteSurface`). |
 | `operation` | `SurfaceOperation` | Lifecycle operation executed (`CREATE`, `UPDATE_ROOT`, or `REPLACE`). |
-| `backend_kind` | `str` | Backend identifier (`"typesafe_jev"`, `"local_gev"`, `"step_zero"`, or `"mock"`). |
+| `backend_kind` | `str` | Backend identifier (`"jev"`, `"step0"`, or `"mock"`). |
 | `model_id` | `str` | Pinned model identifier used for scoring (such as `"jev-v0"`). |
 | `decision_calls` | `int` | Number of `backend.answer` calls made during the turn (`0` on `PlanCache` hit, `1` for single-batch backends, `1` or `2` for two-stage backends). |
 | `decision_latency_ms` | `float` | Wall-clock time spent inside `backend.answer` calls in milliseconds. |
@@ -744,7 +744,7 @@ Calling `synthesizer.synthesize_with_output(block, state=state)` (or `tool.run_a
 
 ### Evaluation suite (`decision_bench` and `decision_scorecard`)
 
-The evaluation suite under `eval/decision_bench/` and `eval/decision_scorecard/` measures the decision pipeline across a stratified corpus of cases. Cases are split into `"tuning"` (used for prompt tuning and temperature calibration via `eval/bin/calibrate_decision_backend.py`) and `"held_out"` (reserved strictly for final release scoring; tuning or calibrating on `"held_out"` is rejected by the calibration script).
+The evaluation suite under `eval/decision_bench/` and `eval/decision_scorecard/` measures the decision pipeline across a stratified corpus of cases. Cases are split into `"tuning"` (used for prompt tuning and temperature calibration via `eval/bin/calibrate_decision_backend.py`) and `"heldout"` (reserved strictly for final release scoring; tuning or calibrating on `"heldout"` is rejected by the calibration script).
 
 The benchmark and scorecard measure:
 
