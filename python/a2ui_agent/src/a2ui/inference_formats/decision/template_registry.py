@@ -216,7 +216,11 @@ class SurfaceTemplate:
 
     def matches_payload(self, available_pointers: Collection[str]) -> bool:
         """Returns whether all required JSON Pointers are present in the payload."""
-        return all(req in available_pointers for req in self.required_pointers)
+        return all(
+            req in available_pointers
+            or any(req.startswith(f"{avail}/") for avail in available_pointers)
+            for req in self.required_pointers
+        )
 
     def root_component(self) -> str | None:
         """Returns the component type name of the root component in this template."""
@@ -249,6 +253,8 @@ class SurfaceTemplate:
         create_surface_body: dict[str, Any] = {"surfaceId": target_surface_id}
         if self.catalog_id is not None:
             create_surface_body["catalogId"] = self.catalog_id
+        if self.is_mutable:
+            create_surface_body["sendDataModel"] = True
 
         raw_messages: list[dict[str, Any]] = [
             {

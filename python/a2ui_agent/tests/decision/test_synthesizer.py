@@ -594,3 +594,40 @@ async def test_tool_mode_cache_and_promote_exports_cached_plan() -> None:
     assert "/host" in template.required_pointers
     rendered = template.render_messages(HOST.payload)
     validate_payload([CATALOG], rendered)
+
+
+@pytest.mark.asyncio
+async def test_compare_archetype_binds_repeated_attributes_and_validates() -> None:
+    compare_scripted = {
+        "family": {"browse": 0.90, "inspect": 0.05},
+        "archetype:browse": {"compare": 0.85, "feed": 0.10},
+        "gate:comparison": {"yes": 0.95, "no": 0.05},
+    }
+    payload = {
+        "tiers": [
+            {
+                "id": "a100",
+                "name": "A100 80GB",
+                "vram_gb": "80 GB",
+                "hourly_usd": 3.67,
+            },
+            {
+                "id": "h100",
+                "name": "H100 80GB",
+                "vram_gb": "80 GB",
+                "hourly_usd": 4.95,
+            },
+        ]
+    }
+    out = await _synth(compare_scripted).synthesize(
+        "Compare cloud GPU instance tiers side by side",
+        payload,
+    )
+    assert out.stage is SynthesisStage.ARCHETYPE
+    assert out.layout_plan is not None
+    assert out.layout_plan.archetype == "compare"
+    validate_payload([CATALOG], out.messages)
+    comps = {c["id"]: c for c in _components(out.messages)}
+    assert "comparison_0_cmp_attr_label" in comps
+    assert comps["comparison_0_cmp_attr_label"]["text"] == "Vram gb"
+    assert comps["comparison_0_cmp_attr_value"]["text"] == {"@path": "vram_gb"}

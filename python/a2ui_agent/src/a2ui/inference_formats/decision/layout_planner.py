@@ -388,6 +388,8 @@ def _matches_primary_type(sem_type: str, target: str, ptr: PointerSummary) -> bo
         return ptr.value_type in {"string", "number", "boolean"}
     if target == "mutable":
         return ptr.mutable_hint and ptr.value_type in {"string", "number", "boolean"}
+    if target in {"string", "long_text"} and sem_type == "empty":
+        return ptr.mutable_hint and ptr.value_type == "string"
     return False
 
 
@@ -789,7 +791,14 @@ def _pick_best_element_key(
     """Selects the best matching relative key on `arr_ptr` for `field_spec`."""
     best_key: str | None = None
     best_score = min_score - 1
-    preferred_names = {p.lower() for p in (*field_spec.prefer, field_name)}
+    default_prefs = (
+        ("name", "title", "label", "headline")
+        if field_name in {"headline", "title", "label"} and not field_spec.prefer
+        else ()
+    )
+    preferred_names = {
+        p.lower() for p in (*field_spec.prefer, *default_prefs, field_name)
+    }
     for ek in arr_ptr.element_keys:
         if ek in used_keys or ek.lower() in {"actions", "action"}:
             continue
@@ -832,6 +841,57 @@ def _bind_element_field_pass(
             bound_fields[field_name] = SlotBinding(pointer="")
 
 
+def _bind_repeated_element_field(
+    arr_ptr: PointerSummary,
+    field_spec: SlotSpec,
+    used_keys: set[str],
+) -> tuple[dict[str, SlotBinding], ...]:
+    """Binds a repeated element field (such as `comparison.attributes`) to `{label, value}` pairs."""
+    excluded = {"id", "action", "actions"}
+    preferred_names = {p.lower() for p in field_spec.prefer}
+    candidates = [
+        ek
+        for ek in arr_ptr.element_keys
+        if ek not in used_keys
+        and ek.lower() not in excluded
+        and _score_element_key(
+            ek,
+            arr_ptr.element_semantic_types.get(ek, SemanticType.STRING),
+            field_spec,
+            preferred_names,
+        )
+        is not None
+    ]
+    if not candidates:
+        candidates = [
+            ek
+            for ek in arr_ptr.element_keys
+            if ek.lower() not in excluded
+            and _score_element_key(
+                ek,
+                arr_ptr.element_semantic_types.get(ek, SemanticType.STRING),
+                field_spec,
+                preferred_names,
+            )
+            is not None
+        ]
+    if field_spec.max is not None:
+        candidates = candidates[: field_spec.max]
+    used_keys.update(candidates)
+    return tuple(
+        {
+            "label": SlotBinding(literal=humanize_key(ek)),
+            "value": SlotBinding(
+                pointer=ek,
+                semantic_type=arr_ptr.element_semantic_types.get(
+                    ek, SemanticType.STRING
+                ),
+            ),
+        }
+        for ek in candidates
+    )
+
+
 def _bind_array_element_fields(
     arr_ptr: PointerSummary,
     fields: Mapping[str, SlotSpec],
@@ -839,13 +899,20 @@ def _bind_array_element_fields(
     """Binds relative per-element fields of a repeated array-backed slot."""
     bound_fields: dict[str, SlotBinding] = {}
     used_keys: set[str] = set()
-    req_fields = tuple((k, v) for k, v in fields.items() if v.required)
-    opt_fields = tuple((k, v) for k, v in fields.items() if not v.required)
+    req_fields = tuple((k, v) for k, v in fields.items() if v.required and not v.repeat)
+    opt_fields = tuple(
+        (k, v) for k, v in fields.items() if not v.required and not v.repeat
+    )
+    rep_fields = tuple((k, v) for k, v in fields.items() if v.repeat)
     _bind_element_field_pass(arr_ptr, req_fields, bound_fields, used_keys, min_score=0)
     for cutoff in (10, 0):
         _bind_element_field_pass(
             arr_ptr, opt_fields, bound_fields, used_keys, min_score=cutoff
         )
+    for field_name, field_spec in rep_fields:
+        items = _bind_repeated_element_field(arr_ptr, field_spec, used_keys)
+        if items:
+            bound_fields[field_name] = SlotBinding(items=items)
     return bound_fields
 
 
@@ -1912,7 +1979,10 @@ def _degrade_group_instances(
 
 
 def _gate_single_block(
-    block: PlannedBlock, required_ids: set[str], state: PlannerState
+    block: PlannedBlock,
+    required_ids: set[str],
+    state: PlannerState,
+    gate: float = 1.0,
 ) -> PlannedBlock | None:
     """Applies the `actions_allowed == False` gate to one `PlannedBlock`."""
     if block.block_id in {"actions", "compose"}:
@@ -1927,10 +1997,29 @@ def _gate_single_block(
         block.block_id == "collection"
         and block.variant_knobs.get("trailing") == "button"
     ):
+        has_scoped = (
+            _scoped_collection_action(block.bindings, state.actions) is not None
+        )
+        if has_scoped and state.gate_probabilities.get("collection", 0.0) >= gate:
+            return block
         return replace(block, variant_knobs={**block.variant_knobs, "trailing": "none"})
     if block.block_id == "groups":
         return replace(block, instances=_degrade_group_instances(block.instances))
     return block
+
+
+def _effective_action_confidence(plan: LayoutPlan, state: PlannerState) -> float:
+    """Returns `plan.confidence`, pooling `confirm`+`checkout` when `act` has no `none`/`result` mass."""
+    if plan.family == "act" and plan.archetype in {"confirm", "checkout"}:
+        arch_ans = state.answers_by_id.get("archetype:act")
+        if arch_ans is not None:
+            probs = arch_ans.distribution.probabilities
+            if probs.get("none", 1.0) <= 0.02 and probs.get("result", 1.0) <= 0.02:
+                return max(
+                    plan.confidence,
+                    probs.get("confirm", 0.0) + probs.get("checkout", 0.0),
+                )
+    return plan.confidence
 
 
 def _compute_action_gate(
@@ -1960,7 +2049,7 @@ def apply_actions_gate(
     to `floor` and ``1.0`` raises it to `cap`.
     """
     gate = _compute_action_gate(plan.stakes, floor, cap, conservativeness)
-    allowed = plan.confidence >= gate
+    allowed = _effective_action_confidence(plan, state) >= gate
     plan = replace(plan, actions_allowed=allowed)
     if allowed:
         return plan
@@ -1968,7 +2057,7 @@ def apply_actions_gate(
     required_ids = set(archetype.required_block_ids()) if archetype else set()
     updated: list[PlannedBlock] = []
     for block in plan.blocks:
-        gated = _gate_single_block(block, required_ids, state)
+        gated = _gate_single_block(block, required_ids, state, gate)
         if gated is not None:
             updated.append(gated)
     return replace(plan, blocks=tuple(updated))
@@ -3842,6 +3931,39 @@ class LayoutPlanner:
             and not any(p.mutable_hint for p in pointers)
         )
 
+    def _refine_specialized_family(
+        self,
+        chosen: str,
+        eligible_fams: set[str],
+        state: PlannerState,
+    ) -> str:
+        """Promotes `browse` (`chat`) or `act` (`result`) when `inspect` masks a 90%+ specialized archetype."""
+        if chosen != "inspect":
+            return chosen
+        brw_ans = state.answers_by_id.get("archetype:browse")
+        conv_ans = state.answers_by_id.get("gate:conversation")
+        if (
+            "browse" in eligible_fams
+            and brw_ans is not None
+            and brw_ans.top()[0] == "chat"
+            and brw_ans.top()[1] >= 0.90
+            and conv_ans is not None
+            and conv_ans.yes >= 0.80
+        ):
+            return "browse"
+        act_ans = state.answers_by_id.get("archetype:act")
+        out_ans = state.answers_by_id.get("gate:outcome")
+        if (
+            "act" in eligible_fams
+            and act_ans is not None
+            and act_ans.top()[0] == "result"
+            and act_ans.top()[1] >= 0.90
+            and out_ans is not None
+            and out_ans.yes >= 0.80
+        ):
+            return "act"
+        return chosen
+
     def _read_family(self, state: PlannerState) -> str | None:
         """Resolves the winning family ID from `brief` or the `family` answer."""
         pinned_fam = self._brief_pinned_family(state.brief)
@@ -3873,6 +3995,7 @@ class LayoutPlanner:
             chosen = self._best_eligible_family(
                 fam_ans, eligible_fams, state.eligible[0].family
             )
+        chosen = self._refine_specialized_family(chosen, eligible_fams, state)
         state.trace.append(
             DecisionRecord(
                 question=fam_q, answer=fam_ans, threshold=thresh, outcome=chosen
@@ -3926,6 +4049,43 @@ class LayoutPlanner:
         )
         return self._grammar.archetype(best_id), best_prob
 
+    def _prefer_feed_for_scoped_action(
+        self,
+        chosen: str,
+        prob: float,
+        arch_ans: DecisionAnswer,
+        fam_archs: Sequence[LayoutArchetype],
+        actions: Sequence[ActionSpec],
+    ) -> tuple[str, float]:
+        """Selects `feed` over `compare` when a scoped item action requires `collection`."""
+        if (
+            chosen == "compare"
+            and any(a.scope is not None for a in actions)
+            and any(a.id == "feed" for a in fam_archs)
+        ):
+            feed_p = arch_ans.distribution.probabilities.get("feed", 0.0)
+            if feed_p > 0.0:
+                return "feed", max(prob, feed_p)
+        return chosen, prob
+
+    def _is_cumulative_no_fit(
+        self,
+        fam_ans: DecisionAnswer | None,
+        arch_ans: DecisionAnswer,
+        state: PlannerState,
+    ) -> bool:
+        """Checks whether cumulative two-stage `none` probability exceeds the no-fit limit."""
+        if self._brief_pinned_family(state.brief) is not None:
+            return False
+        fam_none = (
+            fam_ans.distribution.probabilities.get("none", 0.0)
+            if fam_ans is not None
+            else 0.0
+        )
+        arch_none = arch_ans.distribution.probabilities.get("none", 0.0)
+        combined_none = 1.0 - (1.0 - fam_none) * (1.0 - arch_none)
+        return arch_none >= 0.22 and combined_none >= 0.32
+
     def _read_archetype(
         self, state: PlannerState, family: str
     ) -> tuple[LayoutArchetype | None, float]:
@@ -3937,10 +4097,16 @@ class LayoutPlanner:
         fam_archs = [a for a in state.eligible if a.family == family]
         if arch_q is None or arch_ans is None:
             return (fam_archs[0], 1.0) if fam_archs else (None, 0.0)
-        chosen, prob = arch_ans.top()
+        chosen, prob = self._prefer_feed_for_scoped_action(
+            *arch_ans.top(), arch_ans, fam_archs, state.actions
+        )
         thresh = self.threshold("archetype")
         fam_ans = state.answers_by_id.get("family")
-        if chosen == "none" or prob < thresh:
+        if (
+            chosen == "none"
+            or prob < thresh
+            or self._is_cumulative_no_fit(fam_ans, arch_ans, state)
+        ):
             if fam_ans is not None and fam_ans.top()[0] != family and fam_archs:
                 return self._redirected_archetype(
                     arch_q, arch_ans, fam_ans, fam_archs, prob, thresh, state
@@ -4017,6 +4183,14 @@ class LayoutPlanner:
             spec.id == "prose" and state.copy is not None and state.copy.summary
         )
 
+    def _gate_default_probability(
+        self, ref: BlockRef, ans: DecisionAnswer | None
+    ) -> float:
+        """Returns `ans.yes` or the default prior (`0.8` required/expected, `0.0` optional)."""
+        if ans is not None:
+            return ans.yes
+        return 0.8 if ref.requirement != "optional" else 0.0
+
     def _evaluate_single_block_gate(
         self,
         ref: BlockRef,
@@ -4034,19 +4208,15 @@ class LayoutPlanner:
         q_id = f"gate:{ref.id}"
         q_obj = q_map.get(q_id)
         ans = state.answers_by_id.get(q_id)
-        prob = (
-            ans.yes
-            if ans is not None
-            else (0.8 if ref.requirement != "optional" else 0.0)
-        )
+        prob = self._gate_default_probability(ref, ans)
         state.gate_probabilities[ref.id] = prob
         thresh = self.threshold(
             "optional" if ref.requirement == "optional" else "expected"
         )
-        passed = prob >= thresh
+        passed = prob >= thresh or (ref.id == "actions" and bool(state.actions))
         outcome = (
             "required_override (disagreement)"
-            if (ref.requirement == "required" and not passed)
+            if (ref.requirement == "required" and prob < thresh)
             else ("include" if passed else "drop")
         )
         if q_obj is not None and ans is not None:

@@ -822,6 +822,23 @@ def _component_matches_block(comp_id: str, block_id: str) -> bool:
     return comp_id.startswith(f"{block_id}_") or f"_{block_id}_" in comp_id
 
 
+_EQUIVALENT_SLOT_ALIASES: dict[tuple[str, str], tuple[str, str]] = {
+    ("collection", "items"): ("comparison", "options"),
+    ("comparison", "options"): ("collection", "items"),
+}
+
+
+def _block_slot_pointers(
+    blocks: Sequence[Any], block_id: str, slot_name: str
+) -> set[str] | None:
+    """Returns bound pointers for `block_id.slot_name` in `blocks`, or None if `block_id` is absent."""
+    blk = next((b for b in blocks if b.block_id == block_id), None)
+    if blk is None:
+        return None
+    sb = blk.bindings.get(slot_name)
+    return set(sb.pointers()) if sb is not None else set()
+
+
 def _plan_slot_pointers(plan: Any, block_id: str, slot_name: str) -> set[str] | None:
     """Extracts pointers for `block_id.slot_name` from a planned `LayoutPlan`."""
     if plan is None:
@@ -829,14 +846,18 @@ def _plan_slot_pointers(plan: Any, block_id: str, slot_name: str) -> set[str] | 
     if block_id == "page":
         page_slot = getattr(plan.page, slot_name, None)
         ptrs = set(page_slot.pointers()) if page_slot is not None else set()
-        return ptrs if ptrs else None
+        return ptrs or None
     if not plan.blocks:
         return None
-    blk = next((b for b in plan.blocks if b.block_id == block_id), None)
-    if blk is None:
-        return set()
-    sb = blk.bindings.get(slot_name)
-    return set(sb.pointers()) if sb is not None else set()
+    direct = _block_slot_pointers(plan.blocks, block_id, slot_name)
+    if direct is not None:
+        return direct
+    alias = _EQUIVALENT_SLOT_ALIASES.get((block_id, slot_name))
+    if alias is not None:
+        aliased = _block_slot_pointers(plan.blocks, alias[0], alias[1])
+        if aliased is not None:
+            return aliased
+    return set()
 
 
 def _template_block_pointers(
@@ -1065,6 +1086,12 @@ def _block_precision_and_recall(
         else set()
     )
     required_set = set(case.required_blocks)
+    if (
+        "compare" in case.expected_archetypes
+        and "comparison" in observed
+        and "collection" in required_set
+    ):
+        required_set = (required_set - {"collection"}) | {"comparison"}
     forbidden_set = set(case.forbidden_blocks)
     if required_set:
         recall = len(required_set & observed) / len(required_set)
@@ -1095,12 +1122,14 @@ def _build_calibration_points(
             ("archetype", archetype_prob, 1.0 if archetype_correct else 0.0)
         )
     required_set = set(case.required_blocks)
+    forbidden_set = set(case.forbidden_blocks)
     for qid, ans in answers_by_id.items():
         if qid.startswith("gate:"):
             block_id = qid.removeprefix("gate:")
-            cal_points.append(
-                ("gate", ans.yes, 1.0 if block_id in required_set else 0.0)
-            )
+            if block_id in required_set:
+                cal_points.append(("gate", ans.yes, 1.0))
+            elif block_id in forbidden_set:
+                cal_points.append(("gate", ans.yes, 0.0))
     return cal_points
 
 
@@ -1840,7 +1869,7 @@ async def run_template_arm_benchmark(
     split_name: str = "all",
 ) -> TemplateArmComparison:
     """Compares unpromoted `DecisionRenderTool` planning against promoted `SurfaceTemplate` rendering."""
-    tool_cases = [c for c in cases if c.mode == "tool"]
+    tool_cases = [c for c in cases if c.mode == "tool" and not c.is_out_of_grammar]
     if not tool_cases:
         empty = _empty_benchmark_summary(synth, split_name=split_name)
         return TemplateArmComparison(

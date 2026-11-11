@@ -202,10 +202,14 @@ def _case_calibration_pairs(
     pairs.append((arch_p, 1.0 if ev.archetype_correct else 0.0))
 
     req_blocks = set(case.required_blocks)
+    forb_blocks = set(case.forbidden_blocks)
     for qid, ans in answers_by_id.items():
         if qid.startswith("gate:"):
             b_id = qid.removeprefix("gate:")
-            pairs.append((ans.yes, 1.0 if b_id in req_blocks else 0.0))
+            if b_id in req_blocks:
+                pairs.append((ans.yes, 1.0))
+            elif b_id in forb_blocks:
+                pairs.append((ans.yes, 0.0))
     return pairs
 
 
