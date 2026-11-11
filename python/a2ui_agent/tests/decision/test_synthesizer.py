@@ -630,4 +630,4 @@ async def test_compare_archetype_binds_repeated_attributes_and_validates() -> No
     comps = {c["id"]: c for c in _components(out.messages)}
     assert "comparison_0_cmp_attr_label" in comps
     assert comps["comparison_0_cmp_attr_label"]["text"] == "Vram gb"
-    assert comps["comparison_0_cmp_attr_value"]["text"] == {"path": "vram_gb"}
+    assert comps["comparison_0_cmp_attr_value"]["text"] == {"@path": "vram_gb"}
