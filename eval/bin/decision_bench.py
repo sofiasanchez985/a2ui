@@ -19,21 +19,34 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
 from typing import Any
 
 from a2ui.core.basic_catalog import BasicCatalog
-from a2ui.inference_formats.decision import DecisionSynthesizer, SynthesisConfig
+from a2ui.inference_formats.decision import (
+    DecisionSynthesizer,
+    DeterministicMockBackend,
+    SynthesisConfig,
+)
 from a2ui_eval.decision_bench import (
     BenchmarkSummary,
+    ParaphraseComparison,
+    PlanCase,
+    TemplateArmComparison,
     load_plan_cases,
     render_markdown,
+    render_paraphrase_markdown,
+    render_template_arm_markdown,
     run_benchmark,
+    run_paraphrase_benchmark,
+    run_template_arm_benchmark,
+    serialize_benchmark_summary,
 )
 from a2ui_eval.decision_common import (
-    DECISION_BACKEND_NAMES,
+    DECISION_CLI_BACKEND_CHOICES,
     build_decision_backend,
 )
 from a2ui_eval.shared.utils import GIT_ROOT
@@ -42,33 +55,41 @@ from dotenv import load_dotenv
 load_dotenv()
 load_dotenv(Path.home() / ".env")
 
-DEFAULT_CASES_PATH = GIT_ROOT / "eval" / "datasets" / "decision_plans" / "v1.yaml"
+DEFAULT_DATASET_DIR = GIT_ROOT / "eval" / "datasets" / "decision_plans"
+
+
+@dataclass
+class SplitRunBundle:
+    """Results for one dataset split (`tuning` or `heldout`)."""
+
+    split_name: str
+    summary: BenchmarkSummary
+    mock_baseline: BenchmarkSummary | None = None
+    paraphrase: ParaphraseComparison | None = None
+    template_arm: TemplateArmComparison | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark decision backend latency, accuracy, and calibration.",
+        description="Benchmark decision backend latency, accuracy, and Wave 6 metrics.",
     )
     parser.add_argument(
         "--backend",
-        choices=list(DECISION_BACKEND_NAMES),
-        default=None,
-        help=(
-            "Decision backend to evaluate (mock, jev, systemone, or step0;"
-            " required unless A2UI_DECISION_BACKEND is set)."
-        ),
+        choices=list(DECISION_CLI_BACKEND_CHOICES),
+        required=True,
+        help="Decision backend to evaluate (mock, jev, gev, systemone, or step0).",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default=None,
-        help="Optional model identifier passed to the backend.",
+        required=True,
+        help="Explicit model identifier passed to the backend.",
     )
     parser.add_argument(
         "--endpoint-url",
         type=str,
         default=None,
-        help="Optional endpoint URL override for remote backends.",
+        help="Optional endpoint URL override for remote or local HTTP backends.",
     )
     parser.add_argument(
         "--calibration",
@@ -77,33 +98,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional path to a calibration profile JSON file.",
     )
     parser.add_argument(
+        "--dataset",
         "--cases",
         type=str,
-        default=str(DEFAULT_CASES_PATH),
-        help="Path to YAML cases file (default: eval/datasets/decision_plans/v1.yaml).",
+        default=str(DEFAULT_DATASET_DIR),
+        dest="cases",
+        help=(
+            "Path to dataset directory or YAML file (default:"
+            " eval/datasets/decision_plans)."
+        ),
     )
     parser.add_argument(
         "--split",
-        type=str,
-        default=None,
-        help="Optional dataset split filter (tuning or heldout).",
+        choices=["tuning", "heldout", "all"],
+        default="all",
+        help="Dataset split to evaluate: tuning, heldout, or all (default: all).",
     )
     parser.add_argument(
         "--tags",
         type=str,
-        default="smoke",
-        help="Comma-separated filter tags (default: smoke).",
+        default=None,
+        help="Optional comma-separated filter tags.",
     )
     parser.add_argument(
         "--repeat",
         type=int,
-        default=3,
-        help="Number of times to run each case (default: 3).",
+        default=1,
+        help="Number of times to run each case (default: 1).",
     )
     parser.add_argument(
         "--include-unverified",
         action="store_true",
-        help="Include cases with verified=false.",
+        help="Include cases with verified=false on tuning splits.",
+    )
+    parser.add_argument(
+        "--paraphrase",
+        action="store_true",
+        help="Rerun with deterministic paraphrased question prompts and report delta.",
+    )
+    parser.add_argument(
+        "--template-arm",
+        action="store_true",
+        help=(
+            "Compare tool-mode cases against promoted SurfaceTemplates (0 model calls)."
+        ),
     )
     parser.add_argument(
         "--fit-temperature",
@@ -121,53 +159,143 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--markdown",
         action="store_true",
         default=True,
-        help="Render summary table in Markdown to stdout (default: True).",
+        help="Render summary report in Markdown to stdout (default: True).",
     )
     return parser.parse_args(argv)
 
 
-def _serialize_summary(summary: BenchmarkSummary) -> dict[str, Any]:
-    """Serializes `summary` into a JSON-compatible dictionary."""
-    return {
-        "backend_kind": summary.backend_kind,
-        "model_id": summary.model_id,
-        "cases_count": summary.cases_count,
-        "total_runs": summary.total_runs,
-        "family_accuracy": summary.family_accuracy,
-        "archetype_accuracy": summary.archetype_accuracy,
-        "block_precision": summary.block_precision,
-        "block_recall": summary.block_recall,
-        "abstain_rate": summary.abstain_rate,
-        "fallback_rate": summary.fallback_rate,
-        "round_trips_per_surface": summary.round_trips_per_surface,
-        "decision_latency_p50": summary.decision_latency_p50,
-        "decision_latency_p95": summary.decision_latency_p95,
-        "host_overhead_p50": summary.host_overhead_p50,
-        "host_overhead_p95": summary.host_overhead_p95,
-        "decision_calls_mean": summary.decision_calls_mean,
-        "brier_family": summary.brier_family,
-        "ece_family": summary.ece_family,
-        "brier_archetype": summary.brier_archetype,
-        "ece_archetype": summary.ece_archetype,
-        "brier_gates": summary.brier_gates,
-        "ece_gates": summary.ece_gates,
-        "fitted_temperature": summary.fitted_temperature,
-        "cases": [
-            {
-                "name": cs.case.name,
-                "family_accuracy": cs.family_accuracy,
-                "archetype_accuracy": cs.archetype_accuracy,
-                "block_precision": cs.block_precision,
-                "block_recall": cs.block_recall,
-                "abstain_rate": cs.abstain_rate,
-                "fallback_rate": cs.fallback_rate,
-                "round_trips_per_surface": cs.round_trips_per_surface,
-                "decision_latency_p50": cs.decision_latency_p50,
-                "host_overhead_p50": cs.host_overhead_p50,
-            }
-            for cs in summary.case_scores
-        ],
-    }
+def _load_split_groups(
+    cases_path: Path, args: argparse.Namespace
+) -> list[tuple[str, list[PlanCase]]]:
+    """Loads `(split_name, cases)` groups according to `args.split`."""
+    if args.split == "tuning":
+        loaded = load_plan_cases(
+            cases_path,
+            tags=args.tags,
+            split="tuning",
+            include_unverified=args.include_unverified,
+        )
+        return [("tuning", loaded)]
+    if args.split == "heldout":
+        loaded = load_plan_cases(
+            cases_path,
+            tags=args.tags,
+            split="heldout",
+            include_unverified=True,
+        )
+        return [("heldout", loaded)]
+
+    tuning = load_plan_cases(
+        cases_path,
+        tags=args.tags,
+        split="tuning",
+        include_unverified=args.include_unverified,
+    )
+    heldout = load_plan_cases(
+        cases_path,
+        tags=args.tags,
+        split="heldout",
+        include_unverified=True,
+    )
+    groups: list[tuple[str, list[PlanCase]]] = []
+    if tuning:
+        groups.append(("tuning", tuning))
+    if heldout:
+        groups.append(("heldout", heldout))
+    return groups
+
+
+async def _run_split_bundle(
+    synth: DecisionSynthesizer,
+    split_name: str,
+    cases: list[PlanCase],
+    args: argparse.Namespace,
+) -> SplitRunBundle:
+    """Runs benchmark, optional mock baseline, paraphrase, and template arm for one split."""
+    fit_t = args.fit_temperature and split_name == "tuning"
+    summary = await run_benchmark(
+        synth,
+        cases,
+        repeat=args.repeat,
+        fit_temp=fit_t,
+        split_name=split_name,
+    )
+    mock_summary: BenchmarkSummary | None = None
+    if args.backend != "mock":
+        mock_synth = DecisionSynthesizer(
+            [BasicCatalog("v1.0")],
+            DeterministicMockBackend(model_id="mock"),
+            config=SynthesisConfig(),
+        )
+        mock_summary = await run_benchmark(
+            mock_synth, cases, repeat=1, split_name=split_name
+        )
+
+    para_comp: ParaphraseComparison | None = None
+    if args.paraphrase:
+        para_comp = await run_paraphrase_benchmark(
+            synth,
+            cases,
+            repeat=args.repeat,
+            split_name=split_name,
+            baseline=summary,
+        )
+
+    tpl_comp: TemplateArmComparison | None = None
+    if args.template_arm:
+        tpl_comp = await run_template_arm_benchmark(
+            synth, cases, repeat=args.repeat, split_name=split_name
+        )
+
+    return SplitRunBundle(
+        split_name=split_name,
+        summary=summary,
+        mock_baseline=mock_summary,
+        paraphrase=para_comp,
+        template_arm=tpl_comp,
+    )
+
+
+def _render_bundle_markdown(bundle: SplitRunBundle) -> str:
+    """Formats Markdown sections for one `SplitRunBundle`."""
+    label = f"{bundle.summary.backend_kind}/{bundle.summary.model_id}"
+    sections = [render_markdown(bundle.summary, backend_name=label)]
+    if bundle.mock_baseline is not None:
+        sections.append(
+            render_markdown(bundle.mock_baseline, backend_name="mock/mock (baseline)")
+        )
+    if bundle.paraphrase is not None:
+        sections.append(render_paraphrase_markdown(bundle.paraphrase))
+    if bundle.template_arm is not None:
+        sections.append(render_template_arm_markdown(bundle.template_arm))
+    return "\n\n".join(sections)
+
+
+def _serialize_bundle(bundle: SplitRunBundle) -> dict[str, Any]:
+    """Serializes one `SplitRunBundle` for JSON output."""
+    out = serialize_benchmark_summary(bundle.summary)
+    if bundle.mock_baseline is not None:
+        out["mock_baseline"] = serialize_benchmark_summary(bundle.mock_baseline)
+    if bundle.paraphrase is not None:
+        out["paraphrase"] = {
+            "paraphrased": serialize_benchmark_summary(bundle.paraphrase.paraphrased),
+            "family_accuracy_delta": bundle.paraphrase.family_accuracy_delta,
+            "archetype_accuracy_delta": bundle.paraphrase.archetype_accuracy_delta,
+            "slot_binding_accuracy_delta": (
+                bundle.paraphrase.slot_binding_accuracy_delta
+            ),
+            "forced_fit_rate_delta": bundle.paraphrase.forced_fit_rate_delta,
+            "false_no_fit_rate_delta": bundle.paraphrase.false_no_fit_rate_delta,
+        }
+    if bundle.template_arm is not None:
+        out["template_arm"] = {
+            "tool_cases_count": bundle.template_arm.tool_cases_count,
+            "planner_arm": serialize_benchmark_summary(bundle.template_arm.planner_arm),
+            "template_arm": serialize_benchmark_summary(
+                bundle.template_arm.template_arm
+            ),
+        }
+    return out
 
 
 async def _async_main(args: argparse.Namespace) -> int:
@@ -175,13 +303,8 @@ async def _async_main(args: argparse.Namespace) -> int:
     if not cases_path.is_absolute():
         cases_path = GIT_ROOT / cases_path
 
-    cases = load_plan_cases(
-        cases_path,
-        tags=args.tags,
-        split=args.split,
-        include_unverified=args.include_unverified,
-    )
-    if not cases:
+    groups = _load_split_groups(cases_path, args)
+    if not groups or (len(groups) == 1 and not groups[0][1] and cases_path.is_file()):
         sys.stderr.write(f"No cases found matching criteria in {cases_path}\n")
         return 1
 
@@ -199,26 +322,25 @@ async def _async_main(args: argparse.Namespace) -> int:
     )
 
     try:
-        summary = await run_benchmark(
-            synth,
-            cases,
-            repeat=args.repeat,
-            fit_temp=args.fit_temperature,
-        )
+        bundles = [
+            await _run_split_bundle(synth, split_name, split_cases, args)
+            for split_name, split_cases in groups
+        ]
     finally:
         await backend.aclose()
 
     if args.markdown:
-        label = f"{summary.backend_kind}/{summary.model_id}"
-        print(render_markdown(summary, backend_name=label))
+        print("\n\n---\n\n".join(_render_bundle_markdown(b) for b in bundles))
 
     if args.json_path:
         out_path = Path(args.json_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(
-            json.dumps(_serialize_summary(summary), indent=2),
-            encoding="utf-8",
+        payload = (
+            _serialize_bundle(bundles[0])
+            if len(bundles) == 1
+            else {"splits": {b.split_name: _serialize_bundle(b) for b in bundles}}
         )
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     return 0
 
