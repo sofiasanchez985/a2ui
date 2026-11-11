@@ -26,20 +26,35 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../bin")))
 
 from a2ui.core.basic_catalog import BasicCatalog
-from a2ui.inference_formats.decision import Calibration, DecisionSynthesizer
+from a2ui.inference_formats.decision import (
+    Calibration,
+    DecisionAnswer,
+    DecisionBatch,
+    DecisionSynthesizer,
+)
 from a2ui_eval.decision_bench import (
     PlanCase,
+    PlanTurn,
     brier_score,
     expected_calibration_error,
     fit_temperature,
     load_plan_cases,
     render_markdown,
+    render_paraphrase_markdown,
+    render_template_arm_markdown,
     run_benchmark,
     run_case,
+    run_paraphrase_benchmark,
+    run_template_arm_benchmark,
 )
-from a2ui_eval.decision_common import is_transcrypt_ciphertext
+from a2ui_eval.decision_common import (
+    ParaphraseDecisionBackend,
+    is_transcrypt_ciphertext,
+    rewrite_question_prompt,
+)
 from a2ui_eval.shared.utils import GIT_ROOT
 import calibrate_decision_backend
+import decision_bench as decision_bench_cli
 from decision_fixtures import (
     HOST_ANSWERS,
     HOST_DECISION_BLOCK,
@@ -474,3 +489,254 @@ async def test_collect_calibration_pairs_preserves_alignment_on_empty_score() ->
         host_score,
     ])
     assert pairs_with_empty == pairs_direct
+
+
+@pytest.mark.asyncio
+async def test_wave6_forced_fit_and_false_no_fit_rates() -> None:
+    none_case = PlanCase(
+        name="chess_board_canvas",
+        intent="Render an interactive 8x8 chess board with drag-and-drop moves",
+        payload={"fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"},
+        expected_family="none",
+        expected_archetypes=[],
+        split="heldout",
+        verified=False,
+    )
+    cases = [_HOST_PLAN_CASE, none_case]
+
+    # 1. Always returning `none` yields 0% forced-fit and 100% false no-fit on in-grammar
+    abstain_synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")],
+        scripted_backend({"family": ("none", 0.90)}, model_id="mock-none"),
+    )
+    abstain_summary = await run_benchmark(abstain_synth, cases, repeat=1)
+    assert abstain_summary.in_grammar_count == 1
+    assert abstain_summary.out_of_grammar_count == 1
+    assert abstain_summary.unverified_count == 1
+    assert abstain_summary.forced_fit_rate == 0.0
+    assert abstain_summary.false_no_fit_rate == 1.0
+    assert abstain_summary.family_accuracy == 0.0
+
+    # 2. Always forcing `monitor -> dashboard` yields 100% forced-fit on `none` case
+    force_synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")],
+        scripted_backend(HOST_ANSWERS, model_id="mock-force"),
+    )
+    force_summary = await run_benchmark(force_synth, cases, repeat=1)
+    assert force_summary.forced_fit_rate == 1.0
+    assert force_summary.false_no_fit_rate == 0.0
+    assert force_summary.family_accuracy == 1.0
+    assert force_summary.archetype_accuracy == 1.0
+
+
+@pytest.mark.asyncio
+async def test_wave6_slot_bindings_sensitive_leaks_and_action_accuracy() -> None:
+    safe_case = PlanCase(
+        name="host_with_action_and_secret",
+        intent="Show server record for prod-1",
+        payload={
+            "name": "prod-1",
+            "cpu": 0.78,
+            "uptimeHours": 412,
+            "debugTag": "DBG-SECRET-9942",
+        },
+        actions={
+            "ack_alert": {
+                "label": "Acknowledge",
+                "context": {"hostName": "/name"},
+            }
+        },
+        exclude=["/debugTag"],
+        sensitive=["/debugTag"],
+        expected_family="inspect",
+        expected_archetypes=["detail"],
+        expected_bindings={
+            "page.title": ["/name"],
+            "headline.items": ["/cpu"],
+            "facts.rows": ["/uptimeHours"],
+        },
+        expected_actions={"ack_alert": ["/name"]},
+        split="heldout",
+    )
+    answers = {
+        "family": ("inspect", 0.90),
+        "stakes": 0.5,
+        "urgency": 0.5,
+        "archetype:inspect": ("detail", 0.92),
+        "gate:headline": 0.90,
+        "gate:facts": 0.90,
+        "gate:actions": 0.90,
+        "salience:/cpu": 2.8,
+        "salience:/uptimeHours": 1.1,
+        "instance:actions.primary:buttons": ("ack_alert", 0.90),
+        "instance:actions.destructive:ack_alert": 0.10,
+    }
+    synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")], scripted_backend(answers, model_id="mock-safe")
+    )
+    safe_summary = await run_benchmark(synth, [safe_case], repeat=1)
+    assert safe_summary.slot_binding_accuracy == 1.0
+    assert safe_summary.action_accuracy == 1.0
+    assert safe_summary.sensitive_leak_rate == 0.0
+
+    # Removing `exclude` causes `/debugTag` to bind in `facts`, triggering a sensitive leak
+    leak_case = PlanCase(
+        name="host_leak",
+        intent="Show server record for prod-1",
+        payload=safe_case.payload,
+        sensitive=["/debugTag"],
+        expected_family="inspect",
+        expected_archetypes=["detail"],
+        expected_actions={"missing_event": ["/name"]},
+        split="heldout",
+    )
+    leak_summary = await run_benchmark(synth, [leak_case], repeat=1)
+    assert leak_summary.sensitive_leak_rate == 1.0
+    assert leak_summary.action_accuracy == 0.0
+
+
+@pytest.mark.asyncio
+async def test_wave6_multi_turn_cache_hits_and_operation_accuracy() -> None:
+    mt_case = PlanCase(
+        name="host_lifecycle",
+        intent="Display server metrics",
+        payload=dict(HOST_DECISION_BLOCK.payload),
+        expected_family="monitor",
+        expected_archetypes=["dashboard"],
+        turns=[
+            PlanTurn(
+                surface_id="ops",
+                intent="Display server metrics",
+                payload=dict(HOST_DECISION_BLOCK.payload),
+                expected_operation="create",
+                expected_cache_hit=False,
+            ),
+            PlanTurn(
+                surface_id="ops",
+                intent="Display server metrics",
+                payload={**HOST_DECISION_BLOCK.payload, "cpu": 0.31},
+                expected_operation="update_root",
+                expected_cache_hit=True,
+            ),
+            PlanTurn(
+                surface_id="ops",
+                intent="Display server metrics",
+                payload={**HOST_DECISION_BLOCK.payload, "cpu": 0.55},
+                region="headline",
+                expected_operation="update_region",
+                expected_cache_hit=False,
+            ),
+            PlanTurn(
+                surface_id="ops",
+                intent="Display server metrics",
+                payload=dict(HOST_DECISION_BLOCK.payload),
+                replace=True,
+                expected_operation="replace",
+                expected_cache_hit=False,
+            ),
+        ],
+    )
+    synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")], scripted_backend(HOST_ANSWERS, model_id="mock-mt")
+    )
+    summary = await run_benchmark(synth, [mt_case], repeat=1)
+    assert summary.multi_turn_cache_hit_rate == 1.0
+    assert summary.multi_turn_operation_accuracy == 1.0
+    assert summary.mean_round_trips == pytest.approx(0.75)
+
+
+@pytest.mark.asyncio
+async def test_wave6_paraphrase_and_template_arm_modes() -> None:
+    tool_case = PlanCase(
+        name="host_tool",
+        intent="Show CPU and host metrics",
+        payload=dict(HOST_DECISION_BLOCK.payload),
+        mode="tool",
+        tool_name="render_host_metrics",
+        expected_family="monitor",
+        expected_archetypes=["dashboard"],
+        expected_bindings={"headline.items": ["/cpu"]},
+    )
+
+    seen_prompts: list[str] = []
+    inner = scripted_backend(HOST_ANSWERS, model_id="mock-para")
+
+    class _SpyBackend(ParaphraseDecisionBackend):
+
+        async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
+            res = await super().answer(batch)
+            seen_prompts.extend(
+                rewrite_question_prompt(q.prompt) for q in batch.questions
+            )
+            return res
+
+    assert (
+        rewrite_question_prompt("What job is this surface doing for the person?")
+        != "What job is this surface doing for the person?"
+    )
+    synth = DecisionSynthesizer([BasicCatalog("v1.0")], inner)
+    para_comp = await run_paraphrase_benchmark(synth, [tool_case], repeat=1)
+    assert para_comp.family_accuracy_delta == 0.0
+    assert "Paraphrase sensitivity" in render_paraphrase_markdown(para_comp)
+
+    spy_synth = DecisionSynthesizer([BasicCatalog("v1.0")], _SpyBackend(inner))
+    await run_benchmark(spy_synth, [tool_case], repeat=1)
+    assert seen_prompts
+
+    tpl_comp = await run_template_arm_benchmark(synth, [tool_case], repeat=2)
+    assert tpl_comp.tool_cases_count == 1
+    assert tpl_comp.planner_arm.round_trips_per_surface == 1.0
+    assert tpl_comp.template_arm.round_trips_per_surface == 0.0
+    assert tpl_comp.template_arm.p95_latency_ms == 0.0
+    assert tpl_comp.template_arm.slot_binding_accuracy == 1.0
+    assert "Promoted template" in render_template_arm_markdown(tpl_comp)
+
+
+def test_decision_bench_cli_required_flags_and_heldout_unfrozen_notice(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        decision_bench_cli.parse_args([])
+
+    ds_dir = tmp_path / "decision_plans"
+    ds_dir.mkdir()
+    _write_synthetic_tuning_yaml(ds_dir / "v1.yaml")
+    (ds_dir / "heldout_v1.yaml").write_text(
+        """
+- name: heldout_canvas
+  intent: "Draw a free-form pixel art editor canvas"
+  payload:
+    gridWidth: 32
+    gridHeight: 32
+  expected:
+    family: "none"
+    archetypes: []
+  split: "heldout"
+  verified: false
+""",
+        encoding="utf-8",
+    )
+    json_out = tmp_path / "bench_out.json"
+    rc = decision_bench_cli.main([
+        "--backend",
+        "mock",
+        "--model",
+        "mock",
+        "--dataset",
+        str(ds_dir),
+        "--split",
+        "all",
+        "--paraphrase",
+        "--template-arm",
+        "--json",
+        str(json_out),
+    ])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "[UNFROZEN HELDOUT]" in captured
+    assert "Forced-fit rate:" in captured
+    assert "False no-fit rate:" in captured
+    assert "Slot binding accuracy:" in captured
+    data = json.loads(json_out.read_text(encoding="utf-8"))
+    assert set(data["splits"]) == {"tuning", "heldout"}
+    assert data["splits"]["heldout"]["unverified_count"] == 1

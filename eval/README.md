@@ -333,25 +333,32 @@ It reports:
 - Token usage: prompt and output tokens per turn, and token reduction percentage.
 - Latency: median and 95th percentile wall-clock response time, plus decision-stage latency and call counts.
 
-## Decision Model Benchmarking and Calibration
+## Decision Model Benchmarking, Scorecards, and Calibration
 
-`bin/decision_bench.py` benchmarks decision backends directly against the encrypted golden plan dataset (`datasets/decision_plans/v1.yaml`):
+`bin/decision_bench.py` evaluates decision backends against the encrypted datasets under `datasets/decision_plans/` (`v1.yaml` for tuning and `heldout_v1.yaml` for held-out evaluation). Both `--backend` and `--model` are required so runs never fall back to an implicit backend:
 
 ```bash
-# Run against the step-0 backend
-uv run ./bin/decision_bench.py --backend step0 --repeat 3 --markdown
+# Run the mock baseline on the held-out split with paraphrase and template-arm checks
+uv run ./bin/decision_bench.py --backend mock --model mock --split heldout --paraphrase --template-arm
 
-# Run against remote Jev with a custom calibration profile
-uv run ./bin/decision_bench.py --backend jev --calibration profiles.json --repeat 3 --markdown
+# Run hosted Jev across tuning and held-out splits (reports each split separately plus mock baseline)
+uv run ./bin/decision_bench.py --backend systemone --model jev-v0 --split all --repeat 3
 ```
 
 The benchmark reports:
 
-1. Backend kind and model identifier (`backend_kind`, `model_id`).
-2. Job family and layout archetype classification accuracy, plus block recall and precision.
-3. Round trips per surface, fallback rate, and abstain rate.
-4. Calibration: Brier score and 10-bin Expected Calibration Error (ECE).
-5. Latency: p50 and p95 backend latency and host overhead in milliseconds.
+1. Backend kind, model identifier, split name, and `[UNFROZEN HELDOUT]` notice when any evaluated case has `verified: false`.
+2. In-grammar family and archetype accuracy, out-of-grammar forced-fit rate (target `<= 5%`), and in-grammar false no-fit rate (target `<= 10%`).
+3. Per-slot binding accuracy, action event and context accuracy, and sensitive pointer leak rate.
+4. Multi-turn `PlanCache` hit rate, multi-turn operation accuracy (`create`, `update_root`, `update_region`, `replace`), mean round trips per surface, fallback rate, and abstain rate.
+5. Calibration (Brier score and 10-bin Expected Calibration Error) and latency (`p50` and `p95` backend latency and host overhead in milliseconds).
+6. Optional `--paraphrase` sensitivity deltas (deterministic prompt rewriting) and `--template-arm` comparison of unpromoted `DecisionRenderTool` planning against promoted `SurfaceTemplate` rendering (zero backend calls).
+
+`bin/decision_scorecard.py` runs the benchmark across multiple backends (`--config <yaml>` or CLI flags) and always includes the `mock/mock` baseline. It writes a Markdown scorecard table with per-backend P95 latency targets (hosted reference `< 250 ms`):
+
+```bash
+uv run ./bin/decision_scorecard.py --config backends.yaml --split all --out scorecard.md --json scorecard.json
+```
 
 `bin/calibrate_decision_backend.py` fits per-model temperature profiles on tuning cases from `datasets/decision_plans/v1.yaml` and writes a JSON profile readable by `Calibration.load`. It refuses cases tagged `heldout` or marked `split: heldout`:
 
