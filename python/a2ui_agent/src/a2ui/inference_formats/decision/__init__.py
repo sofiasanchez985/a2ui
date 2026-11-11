@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from .backends import (
+    DEFAULT_GEMINI_DECISION_MODEL,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TYPESAFE_MODEL,
     BackendCapabilities,
@@ -76,6 +77,7 @@ from .semantic_types import classify_scalar, humanize_key
 from .template_registry import SurfaceTemplate, TemplateRegistry
 
 __all__ = [
+    "DEFAULT_GEMINI_DECISION_MODEL",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_TYPESAFE_MODEL",
     "MAX_BRIEF_SECTIONS",
