@@ -219,21 +219,22 @@ def compile_decision_payload(
             surface_id=default_surface,
             block_examples=DEFAULT_DECISION_BLOCK_EXAMPLES,
         )
-        format_obj = factory.create_format(catalogs)
-
-        async def attempt_synthesize(completion: str) -> _CompileResult:
-            return await _synthesize_completion(
-                state,
-                completion,
-                format_obj=format_obj,
-                backend_label=backend_label,
-                version=version,
-                resolved_catalog_path=resolved_catalog_path,
-                allowed_surface_ids=allowed_surface_ids,
-                options=options,
-            )
 
         try:
+            format_obj = factory.create_format(catalogs)
+
+            async def attempt_synthesize(completion: str) -> _CompileResult:
+                return await _synthesize_completion(
+                    state,
+                    completion,
+                    format_obj=format_obj,
+                    backend_label=backend_label,
+                    version=version,
+                    resolved_catalog_path=resolved_catalog_path,
+                    allowed_surface_ids=allowed_surface_ids,
+                    options=options,
+                )
+
             result, completion, _ = await retry_until_ok(
                 state,
                 generate,

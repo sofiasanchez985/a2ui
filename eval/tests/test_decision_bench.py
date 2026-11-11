@@ -448,3 +448,29 @@ def test_seed_script_creates_unverified_stubs_skipped_by_default(
     finally:
         if target_seeded.is_file():
             target_seeded.unlink()
+
+
+@pytest.mark.asyncio
+async def test_collect_calibration_pairs_preserves_alignment_on_empty_score() -> None:
+    from a2ui_eval.decision_bench import CaseScore
+
+    synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")], backend=scripted_backend(HOST_ANSWERS)
+    )
+    host_score = await run_case(synth, _HOST_PLAN_CASE)
+    empty_case = PlanCase(
+        name="empty_case",
+        intent="Empty",
+        payload={},
+        expected_family="inform",
+        expected_archetypes=["article"],
+        required_blocks=["nonexistent_block"],
+    )
+    pairs_with_empty = calibrate_decision_backend._collect_calibration_pairs([
+        CaseScore(case=empty_case, repeats=1, evaluations=[]),
+        host_score,
+    ])
+    pairs_direct = calibrate_decision_backend._collect_calibration_pairs([
+        host_score,
+    ])
+    assert pairs_with_empty == pairs_direct
