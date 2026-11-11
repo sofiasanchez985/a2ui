@@ -101,15 +101,16 @@ synthesizer = DecisionSynthesizer(
 | :---------- | :------------------------------------------------------------------ | :------------------------------------------------------ |
 | `systemone` | Set `A2UI_DECISION_URL` and `JEV_API_KEY` (or `A2UI_DECISION_AUTH`) | Hosted or local `/v1/systemone` decision API over HTTP. |
 | `jev`       | Set `JEV_API_KEY` or `TYPESAFE_API_KEY`, or `A2UI_DECISION_URL`     | TypeSafe Jev, pinned to `jev-1.14.0` by default.        |
+| `gemini`    | Set `GEMINI_API_KEY` or `GOOGLE_API_KEY`, or `A2UI_DECISION_URL`    | Google Gemini Decisions API (`/v1beta/decisions`), pinned to `gemini-decision-1` by default. |
 | `step0`     | Set `A2UI_DECISION_URL`                                             | Step-zero logprob scorer; asks questions in two stages. |
 | `mock`      | Set `A2UI_DECISION_BACKEND=mock`                                    | Deterministic offline backend for tests.                |
 
 ### Environment Variables
 
-- `A2UI_DECISION_BACKEND`: `systemone`, `jev`, `step0`, or `mock`. Required unless a backend is passed in code.
+- `A2UI_DECISION_BACKEND`: `systemone`, `jev`, `gemini`, `step0`, or `mock`. Required unless a backend is passed in code.
 - `A2UI_DECISION_URL`: Endpoint URL for remote HTTP backends.
-- `A2UI_DECISION_MODEL` / `JEV_MODEL`: Model id overrides.
-- `A2UI_DECISION_AUTH` / `A2UI_DECISION_TOKEN` / `JEV_API_KEY` / `TYPESAFE_API_KEY`: Authentication for remote backends.
+- `A2UI_DECISION_MODEL` / `JEV_MODEL` / `GEMINI_DECISION_MODEL`: Model id overrides.
+- `A2UI_DECISION_AUTH` / `A2UI_DECISION_TOKEN` / `JEV_API_KEY` / `TYPESAFE_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY`: Authentication for remote backends.
 
 Each backend applies a per-model `Calibration` (temperature scaling) from a bundled profile, or from a file passed as `calibration=`. HTTP requests time out after 30 seconds unless `timeout_seconds` says otherwise.
 

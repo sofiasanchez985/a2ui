@@ -199,13 +199,15 @@ class PlanReason(_WireEnum):
 class DecisionWireFormat(_WireEnum):
     """Request and response format spoken by a remote decision endpoint.
 
-    `AUTO` picks SystemOne when the endpoint path ends in `/v1/systemone`
-    and Jev otherwise.
+    `AUTO` picks Gemini Decisions when the endpoint path ends in
+    `/v1beta/decisions`, SystemOne when it ends in `/v1/systemone`, and Jev
+    otherwise.
     """
 
     AUTO = "auto"
     JEV = "jev"
     SYSTEMONE = "systemone"
+    GEMINI_DECISIONS = "gemini_decisions"
 
 
 class FallbackSource(_WireEnum):
@@ -247,6 +249,7 @@ class DecisionBackendType(_WireEnum):
 
     MOCK = "mock"
     JEV = "jev"
+    GEMINI = "gemini"
     SYSTEMONE = "systemone"
     STEP_ZERO = "step0"
 

@@ -26,7 +26,7 @@ Inside the agent process, a synthesis pipeline inspects the JSON Pointers of `pa
 
 1. Keep the conversational model's output restricted to application intent, data payload, action identifiers, and field mutability or visibility constraints.
 2. Target A2UI v1.0 only, validating every synthesized message against the active v1.0 catalogs and protocol schemas.
-3. Keep the synthesis runtime vendor-independent across hosted TypeSafe Jev (`JevHttpBackend`), local Gev servers (`JevHttpBackend` over `/v1/systemone`), any step-zero chat completion model with single-token logprobs (`StepZeroLogprobBackend`), and deterministic test mocks (`DeterministicMockBackend`).
+3. Keep the synthesis runtime vendor-independent across hosted TypeSafe Jev (`JevHttpBackend`), the Google Gemini Decisions API (`JevHttpBackend` over `/v1beta/decisions`, see https://ai.google.dev/gemini-api/docs/decisions-api), any step-zero chat completion model with single-token logprobs (`StepZeroLogprobBackend`), and deterministic test mocks (`DeterministicMockBackend`).
 4. Score all layout decisions for a turn in one batched backend call (or two calls when a backend declares `BackendCapabilities.two_stage = True`), with an explicit HTTP timeout (`DEFAULT_TIMEOUT_SECONDS = 30.0`) that raises `DecisionBackendError` (or `A2uiCompilationError` wrapping `DecisionBackendError` in chat-mode `DecisionParser`) rather than hiding backend outages behind silent short-timeout fallbacks.
 5. Support multi-turn surface creation, in-place root updates, single-region updates, full surface replacement, and cached data-only updates when the block signature does not change.
 6. Provide calibrated confidence gates for template selection, abstention (`none` family and `noFit` threshold), and stakes-scaled action suppression, backed by a deterministic fallback chain (`fallbackDsl`, caller `fallback_fn`, or the catalog's `facts` pattern).
@@ -528,7 +528,7 @@ flowchart TD
     C -- "Yes (same intent & shape, replace=false, region=None)" --> D["Emit updateDataModel only (cache_hit=true)"]
     C -- "No" --> E["Compile template question (if TemplateRegistry non-empty) + grammar DecisionBatch"]
     E --> F{"Backend capabilities.two_stage?"}
-    F -- "False (Jev / Gev / Mock)" --> G["Single backend.answer(batch) call (timeout=30s)"]
+    F -- "False (Jev / Gemini Decisions / Mock)" --> G["Single backend.answer(batch) call (timeout=30s)"]
     F -- "True (StepZeroLogprobBackend)" --> H["Stage 1 call (template, family, archetype, stakes) + Stage 2 call (selected archetype blocks)"]
     G --> I{"Registered template above threshold?"}
     H --> I
@@ -632,11 +632,11 @@ class DecisionBackend(Protocol):
 
 | Class | `backend_kind` | Default `model_id` | Wire contract and usage |
 | :--- | :--- | :--- | :--- |
-| `JevHttpBackend` (TypeSafe Jev or Local Gev) | `"jev"` | `DEFAULT_TYPESAFE_MODEL = "jev-1.14.0"` | Speaks either the native Jev batch schema (`{"shared_context": {...}, "questions": [...]}`) or the `/v1/systemone` wire schema (`{"model": ..., "state": ..., "questions": {qid: {"type": ..., "instructions": ..., "criteria": ...}}}`). Auto-detects wire format from the URL path (`DecisionWireFormat.AUTO`), with `two_stage = False`. |
+| `JevHttpBackend` (TypeSafe Jev or Google Gemini Decisions API) | `"jev"` or `"gemini"` | `DEFAULT_TYPESAFE_MODEL = "jev-1.14.0"` / `DEFAULT_GEMINI_DECISION_MODEL = "gemini-decision-1"` | Speaks the native Jev batch schema (`{"shared_context": {...}, "questions": [...]}`), the `/v1/systemone` wire schema (`{"model": ..., "state": ..., "questions": {qid: {"type": ..., "instructions": ..., "criteria": ...}}}`), or the Google Gemini Decisions API `/v1beta/decisions` schema (`{"model": "gemini-decision-1", "input": ..., "questions": {...}}` with `true_description`/`false_description` criteria and `x-goog-api-key` authentication; see https://ai.google.dev/gemini-api/docs/decisions-api). Auto-detects wire format from the URL path (`DecisionWireFormat.AUTO`), with `two_stage = False`. |
 | `StepZeroLogprobBackend` | `"step0"` | Caller-supplied (for example `"gemini-2.5-flash"`) | Prompts an OpenAI-compatible `/v1/chat/completions` endpoint to output a single choice token (`A` through `J`, supporting up to 10 options per question) with `max_tokens = 1` and `top_logprobs = 20` (`max_logprobs = 20`), converts token logprobs into a normalized distribution, and runs with `two_stage = True`. |
 | `DeterministicMockBackend` | `"mock"` | `"mock"` | Rule-based in-memory backend for unit tests, CI, and offline conformance checks. Requires no network access. |
 
-`create_decision_backend(kind=None, *, endpoint_url=None, model=None, auth=None, calibration=None, timeout_seconds=30.0)` constructs any of the backends (`"jev"`, `"step0"`, or `"mock"`) from explicit arguments or environment variables. Every backend model ID is pinned (such as `"jev-1.14.0"`); floating aliases are not used.
+`create_decision_backend(kind=None, *, endpoint_url=None, model=None, auth=None, calibration=None, timeout_seconds=30.0)` constructs any of the backends (`"jev"`, `"gemini"`, `"step0"`, or `"mock"`) from explicit arguments or environment variables. Every backend model ID is pinned (such as `"jev-1.14.0"` or `"gemini-decision-1"`); floating aliases are not used.
 
 ### Temperature calibration (`calibration_profiles.json`)
 
@@ -648,6 +648,9 @@ Bundled calibration profiles live in `python/a2ui_agent/src/a2ui/inference_forma
 {
   "jev/jev-1.14.0": {
     "temperature": 1.0
+  },
+  "gemini/gemini-decision-1": {
+    "temperature": 0.25
   }
 }
 ```
@@ -763,7 +766,7 @@ Calling `await synthesizer.synthesize(intent, payload, ..., state=state)` (or `a
 | `stage` | `SynthesisStage` | Which path produced the messages: `TEMPLATE_SELECT`, `ARCHETYPE`, or `ABSTAIN_FALLBACK`. |
 | `messages` | `list[dict[str, Any]]` | Validated A2UI v1.0 protocol messages (`createSurface`, `updateComponents`, `updateDataModel`, `deleteSurface`). |
 | `operation` | `SurfaceOperation` | Lifecycle operation executed (`CREATE`, `UPDATE_ROOT`, or `REPLACE`). |
-| `backend_kind` | `str` | Backend identifier (`"jev"`, `"step0"`, or `"mock"`). |
+| `backend_kind` | `str` | Backend identifier (`"jev"`, `"gemini"`, `"step0"`, or `"mock"`). |
 | `model_id` | `str` | Pinned model identifier used for scoring (such as `"jev-1.14.0"`). |
 | `decision_calls` | `int` | Number of `backend.answer` calls made during the turn (`0` on `PlanCache` hit, `1` for single-batch backends, `1` or `2` for two-stage backends). |
 | `decision_latency_ms` | `float` | Wall-clock time spent inside `backend.answer` calls in milliseconds. |
@@ -808,12 +811,14 @@ Before `a2ui-decision` becomes a normative, multi-language A2UI specification:
 
 ### Held-out benchmark status
 
-The 111-case held-out split (`eval/datasets/decision_plans/heldout_v1.yaml`: 79 in-grammar cases across all 6 families and 14 archetypes, 32 out-of-grammar `none` cases, 55 chat-mode and 56 tool-mode cases, 24 sensitive-pointer cases, and 13 multi-turn lifecycle cases) and 16-case tuning split (`eval/datasets/decision_plans/v1.yaml`) have been reviewed and frozen (`verified: true`). Evaluated against the pinned `jev/jev-1.14.0` reference backend (`T = 1.0`):
+The 111-case held-out split (`eval/datasets/decision_plans/heldout_v1.yaml`: 79 in-grammar cases across all 6 families and 14 archetypes, 32 out-of-grammar `none` cases, 55 chat-mode and 56 tool-mode cases, 24 sensitive-pointer cases, and 13 multi-turn lifecycle cases) and 16-case tuning split (`eval/datasets/decision_plans/v1.yaml`) have been reviewed and frozen (`verified: true`). Evaluated against the pinned `jev/jev-1.14.0` (`T = 1.0`) and `gemini/gemini-decision-1` (`T = 0.25`, [Google Gemini Decisions API](https://ai.google.dev/gemini-api/docs/decisions-api)) backends:
 
 | Split | Backend | Cases | Family Acc | Archetype Acc | Forced-Fit (<=5%) | False No-Fit (<=10%) | Slot Bind | Action Acc | Sens Leak | Round Trips | Cache Hit | P50 ms | P95 ms | Target Pass |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
-| `tuning` | `jev/jev-1.14.0` | 16 | 100.0% | 100.0% | 0.0% | 0.0% | 100.0% | 100.0% | 0.0% | 1.00 | 0.0% | 83.2 | 168.3 | pass |
-| `heldout` | `jev/jev-1.14.0` | 111 | 100.0% | 100.0% | 3.1% | 0.0% | 100.0% | 100.0% | 0.0% | 0.94 | 100.0% | 80.2 | 94.3 | pass |
+| `tuning` | `jev/jev-1.14.0` | 16 | 100.0% | 100.0% | 0.0% | 0.0% | 100.0% | 100.0% | 0.0% | 1.00 | 0.0% | 90.2 | 138.8 | pass |
+| `tuning` | `gemini/gemini-decision-1` | 16 | 100.0% | 93.8% | 0.0% | 0.0% | 100.0% | 100.0% | 0.0% | 1.00 | 0.0% | 239.2 | 402.7 | pass |
+| `heldout` | `jev/jev-1.14.0` | 111 | 100.0% | 100.0% | 3.1% | 0.0% | 100.0% | 100.0% | 0.0% | 0.94 | 100.0% | 86.6 | 114.2 | pass |
+| `heldout` | `gemini/gemini-decision-1` | 111 | 97.5% | 94.9% | 12.5% | 0.0% | 92.4% | 96.8% | 0.0% | 0.94 | 100.0% | 210.0 | 358.4 | FAIL |
 
 ---
 
