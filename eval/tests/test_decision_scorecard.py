@@ -94,10 +94,10 @@ backends:
     backend: systemone
     model: jev-1.14.0
     p95_target_ms: 250
-  - name: gev_local
-    backend: gev
-    model: gev-v0
-    endpoint_url: http://localhost:18080/v1/batch
+  - name: gemini_hosted
+    backend: gemini
+    model: gemini-decision-1
+    endpoint_url: https://generativelanguage.googleapis.com/v1beta/decisions
     p95_target_ms: 500
 """,
         encoding="utf-8",
@@ -105,7 +105,7 @@ backends:
     specs = decision_scorecard.load_scorecard_config(cfg_path)
     assert len(specs) == 2
     assert specs[0].target_ms == 250.0
-    assert specs[1].backend == "gev"
+    assert specs[1].backend == "gemini"
 
     with_baseline = decision_scorecard.ensure_mock_baseline(specs)
     assert len(with_baseline) == 3
