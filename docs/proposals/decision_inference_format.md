@@ -1,0 +1,792 @@
+# Decision inference format
+
+**Status:** Experimental proposal (`a2ui-decision`, A2UI v1.0)
+
+This document specifies the `a2ui-decision` inference format implemented in `a2ui.inference_formats.decision` and its catalog assets under `catalogs/decision/v1/` and `catalogs/basic/v1/patterns.json`. It is written for engineers who already know A2UI v1.0 and want to understand how `a2ui-decision` turns agent intent and structured data into A2UI v1.0 wire messages.
+
+---
+
+## 1. Problem and idea
+
+In direct A2UI formats such as `a2ui-json` and `a2ui-express`, the conversational model authors the component tree itself. It must know every active component name, property signature, child layout rule, data binding path, and event payload convention. That approach works well when an agent needs custom free-form layouts, but it carries three structural costs for routine data-display and input turns:
+
+1. The system prompt grows with the size and schema detail of the active component catalogs.
+2. The model spends its output tokens on layout boilerplate (`Card`, `Column`, `Row`, `Text`, child IDs, and data binding objects) before a surface can render.
+3. Component selection and visual hierarchy drift across turns unless the prompt includes domain-specific templates or few-shot examples.
+
+`a2ui-decision` separates what to show from how to lay it out. The conversational model emits a compact JSON block (`DecisionBlock`) containing a plain-language `intent`, a structured JSON `payload`, optional user `actions`, and optional hints such as `mutablePaths`, `exclude`, `labels`, and a short `layout` brief. It does not name components or build a tree.
+
+Inside the agent process, a synthesis pipeline inspects the JSON Pointers of `payload` and compiles a batch of narrow multiple-choice questions (`DecisionBatch`) from a declarative layout grammar (`ArchetypeGrammar`). A small decision model (`DecisionBackend`) scores the batch in a single call, and deterministic catalog pattern templates (`PatternLibrary` and `PatternExpander`) expand the winning layout plan (`LayoutPlan`) into validated A2UI v1.0 messages (`createSurface`, `updateComponents`, `updateDataModel`, and `deleteSurface`).
+
+---
+
+## 2. Goals and non-goals
+
+### Goals
+
+1. Keep the conversational model's output restricted to application intent, data payload, action identifiers, and field mutability or visibility constraints.
+2. Target A2UI v1.0 only, validating every synthesized message against the active v1.0 catalogs and protocol schemas.
+3. Keep the synthesis runtime vendor-independent across hosted TypeSafe Jev (`JevHttpBackend`), local Gev servers (`JevHttpBackend` over `/v1/systemone`), any step-zero chat completion model with single-token logprobs (`StepZeroLogprobBackend`), and deterministic test mocks (`DeterministicMockBackend`).
+4. Score all layout decisions for a turn in one batched backend call (or two calls when a backend declares `BackendCapabilities.two_stage = True`), with an explicit HTTP timeout (`DEFAULT_TIMEOUT_SECONDS = 30.0`) that raises `DecisionBackendError` rather than hiding backend outages behind silent short-timeout fallbacks.
+5. Support multi-turn surface creation, in-place root updates, single-region updates, full surface replacement, and cached data-only updates when the payload shape does not change.
+6. Provide calibrated confidence gates for template selection, abstention (`none` family and `noFit` threshold), and stakes-scaled action suppression, backed by a deterministic fallback chain (`fallbackDsl`, caller `fallback_fn`, or the catalog's `facts` pattern).
+
+### Non-goals
+
+1. Supporting pre-1.0 protocol versions (`v0.8`, `v0.9`, `v0.9.1`). Passing a pre-1.0 catalog to `DecisionFormat`, `DecisionSynthesizer`, or `PatternLibrary` raises `ValueError`.
+2. Generating arbitrary bespoke visual layouts outside the archetype grammar. The format has a bounded layout ceiling defined by the 14 archetypes and 20 abstract block patterns in `catalogs/decision/v1/archetypes.json`. Interfaces that need custom component graphs beyond those archetypes should use a registered `SurfaceTemplate`, `fallbackDsl` (A2UI Express), or the `a2ui-express` format directly.
+3. Hiding network or model failures behind a low-latency timeout fallback. When a configured decision backend times out or returns an HTTP error, it raises `DecisionBackendError` with `backend_kind` and `model_id` so the caller sees the failure immediately.
+4. Allowing the decision model to invent component properties or arbitrary wire JSON. The decision model only answers closed-choice questions; all component JSON comes from validated catalog patterns or registered templates.
+
+---
+
+## 3. Core concepts and worked example
+
+Every synthesis turn flows through eight stages. We trace one incident-response turn from the block emitted by the agent to the final A2UI v1.0 wire messages.
+
+| Stage | Primary types and functions | Responsibility |
+| :--- | :--- | :--- |
+| 1. Decision block | `DecisionBlock`, `ActionSpec`, `LayoutBrief` | Parses the agent's JSON block from chat tags or a tool call. |
+| 2. Payload inspection | `inspect_payload_pointers`, `PointerSummary`, `SemanticType` | Walks `payload`, filters secrets and `exclude` pointers, classifies semantic types, and attaches `labels` and `mutable_hint`. |
+| 3. Question batching | `LayoutPlanner`, `DecisionBatch`, `DecisionQuestion` | Prunes ineligible archetypes by shape and catalog support, then compiles closed-choice questions for family, archetype, blocks, variants, and stakes. |
+| 4. Backend scoring | `DecisionBackend.answer`, `DecisionAnswer`, `Calibration` | Scores every question in the batch and returns temperature-calibrated probability distributions. |
+| 5. Layout planning | `ArchetypeGrammar`, `LayoutPlan`, `PlannedBlock`, `PlanOutcome` | Applies grammar thresholds and the stakes-scaled action gate, binds slots to JSON Pointers, and computes `fit_score`. |
+| 6. Pattern lookup | `PatternLibrary`, `MergedPatternLibrary`, `CatalogPattern` | Resolves abstract pattern names and variants against the active v1.0 catalogs. |
+| 7. Pattern expansion | `PatternExpander`, `Expansion` | Expands `$slot`, `$text`, `$if`, `$repeat`, `$byInstance`, `$event`, and `$actionContext` directives into flat A2UI v1.0 components. |
+| 8. Wire message emission | `DecisionSynthesizer`, `SynthesisOutput`, `RendererState` | Diffs against surface state, consults `PlanCache`, emits A2UI v1.0 messages, and validates them against the catalog. |
+
+### Worked example: Stage 1 (`DecisionBlock`)
+
+An incident-response agent wants to show an active checkout latency alert (`incident_482`), let the on-call engineer edit a handoff note, and expose actions to roll back the release, acknowledge the page, or inspect an individual timeline event:
+
+```xml
+<a2ui-inference>
+{
+  "surfaceId": "incident_482",
+  "intent": "Inspect the checkout latency incident, edit the operator handoff note, and acknowledge or roll back the release",
+  "title": "Incident INC-482: Checkout latency spike",
+  "summary": "Elevated p99 latency in us-east1 after build 2026.11.10-rc3",
+  "payload": {
+    "service": "checkout-api",
+    "severity": "SEV-2",
+    "p99LatencyMs": 840,
+    "errorRate": 0.042,
+    "handoffNote": "Investigating connection pool saturation on read replica 2.",
+    "internalTraceToken": "tr_99182a7f",
+    "events": [
+      {
+        "id": "ev_1",
+        "time": "2026-11-10T20:11:00Z",
+        "summary": "Canary shifted to 25% traffic"
+      },
+      {
+        "id": "ev_2",
+        "time": "2026-11-10T20:14:00Z",
+        "summary": "Alert fired: p99 latency above 500 ms"
+      }
+    ]
+  },
+  "actions": {
+    "rollback_release": {
+      "label": "Roll back release",
+      "style": "destructive",
+      "context": {"service": "/service"}
+    },
+    "acknowledge": {
+      "label": "Acknowledge",
+      "style": "primary"
+    },
+    "inspect_event": {
+      "label": "View event",
+      "scope": "/events",
+      "key": "id"
+    }
+  },
+  "mutablePaths": ["/handoffNote"],
+  "exclude": ["/internalTraceToken"],
+  "labels": {
+    "/p99LatencyMs": "p99 latency (ms)",
+    "/errorRate": "Error rate"
+  },
+  "layout": [
+    "headline:service,severity,p99LatencyMs,errorRate",
+    "timeline:/events",
+    "form:handoffNote",
+    "actions:rollback_release,acknowledge"
+  ]
+}
+</a2ui-inference>
+```
+
+`DecisionBlock.from_json` parses this object into typed fields: `actions` becomes a tuple of three `ActionSpec` records in declaration order (`rollback_release`, `acknowledge`, `inspect_event`), `layout` becomes four `LayoutBrief` entries, and `mutable_paths`, `exclude`, and `labels` are validated as `/`-prefixed JSON Pointers.
+
+### Worked example: Stage 2 (`inspect_payload_pointers`)
+
+The synthesizer strips pointers listed in `exclude` (`/internalTraceToken`) along with any pointer matching `is_secret_pointer` (keys naming tokens, passwords, secrets, or API keys unless explicitly marked mutable in `mutablePaths`). It then runs `inspect_payload_pointers(payload, mutable_paths=block.mutable_paths)` and applies `block.labels`:
+
+```python
+(
+    PointerSummary(
+        path="/service",
+        value_type="string",
+        cardinality=1,
+        semantic_type=SemanticType.NAME,
+        key="service",
+        label="Service",
+    ),
+    PointerSummary(
+        path="/severity",
+        value_type="string",
+        cardinality=1,
+        semantic_type=SemanticType.STATUS,
+        key="severity",
+        label="Severity",
+    ),
+    PointerSummary(
+        path="/p99LatencyMs",
+        value_type="number",
+        cardinality=1,
+        semantic_type=SemanticType.INTEGER,
+        key="p99LatencyMs",
+        label="p99 latency (ms)",
+    ),
+    PointerSummary(
+        path="/errorRate",
+        value_type="number",
+        cardinality=1,
+        semantic_type=SemanticType.NUMBER,
+        key="errorRate",
+        label="Error rate",
+    ),
+    PointerSummary(
+        path="/handoffNote",
+        value_type="string",
+        cardinality=1,
+        mutable_hint=True,
+        semantic_type=SemanticType.LONG_TEXT,
+        key="handoffNote",
+        label="Handoff Note",
+    ),
+    PointerSummary(
+        path="/events",
+        value_type="array",
+        cardinality=2,
+        element_keys=("id", "time", "summary"),
+        element_semantic_types={
+            "id": SemanticType.IDENTIFIER,
+            "time": SemanticType.TIMESTAMP,
+            "summary": SemanticType.STRING,
+        },
+        semantic_type=SemanticType.ARRAY,
+        key="events",
+        label="Events",
+    ),
+)
+```
+
+Notice that `/internalTraceToken` is absent, `/handoffNote` has `mutable_hint=True`, and `/p99LatencyMs` and `/errorRate` carry the caller's custom `labels`.
+
+### Worked example: Stages 3 and 4 (`DecisionBatch` and `DecisionBackend`)
+
+`LayoutPlanner.build_batch` combines the user `intent`, the pointer table, the declared `actions`, and the `layout` brief into `shared_context`, and emits a `DecisionBatch` of closed-choice `DecisionQuestion` records:
+
+1. `family`: Chooses among `browse`, `monitor`, `inspect`, `act`, `input`, `follow`, and `none`.
+2. `archetype:inspect`: Chooses among `detail`, `article`, `timeline`, and `location`.
+3. `stakes` and `urgency`: Score the operational risk (`low`, `medium`, `high`) and time pressure (`calm`, `elevated`, `urgent`) of the intent.
+4. Block gate, anatomy knob, salience, and instance questions: Score optional blocks, variant knobs (such as `headline` count and `actions` layout), pointer ordering, and the input control for `/handoffNote` (`instance:form:/handoffNote` -> `text_area`).
+
+The backend (`backend.answer(batch)`) scores all questions in one call and applies temperature scaling from `calibration_profiles.json`.
+
+### Worked example: Stage 5 (`LayoutPlan`)
+
+`LayoutPlanner.resolve` checks the calibrated probabilities against the grammar thresholds in `catalogs/decision/v1/archetypes.json`:
+
+1. `family` selects `inspect` (`p = 0.84 >= 0.40`).
+2. `archetype:inspect` selects `detail` (`p = 0.79 >= 0.40`).
+3. `stakes` is `high` (`0.81`), which raises the stakes-scaled action gate threshold to `0.70 + 0.5 * 0.25 * 0.81 = 0.80125`. Because the block explicitly declared `actions` and the planner's action confidence exceeds that threshold, `actions_allowed` is `True`.
+4. The planner honours the `layout` brief roles (`headline`, `timeline`, `form`, `actions`), binds the page title and summary from `AuthoredCopy`, attaches the scoped `inspect_event` action to `/events`, and records `fit_score = 0.91`.
+
+### Worked example: Stages 6, 7, and 8 (`PatternExpander` and v1.0 messages)
+
+`PatternExpander` expands the `page`, `headline`, `timeline`, `form`, and `actions` patterns from `catalogs/basic/v1/patterns.json`. Because `/handoffNote` is bound in a mutable `form` block, `Expansion.send_data_model` is `True`. For a new `surfaceId` (`"incident_482"`), `DecisionSynthesizer` emits three A2UI v1.0 messages:
+
+```json
+[
+  {
+    "version": "v1.0",
+    "createSurface": {
+      "surfaceId": "incident_482",
+      "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+      "sendDataModel": true
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateComponents": {
+      "surfaceId": "incident_482",
+      "components": [
+        {
+          "id": "root",
+          "component": "Column",
+          "children": [
+            "page_head",
+            "page_subtitle",
+            "b0_headline_row",
+            "b1_timeline_list",
+            "b2_form_col",
+            "b3_actions_row"
+          ]
+        },
+        {
+          "id": "page_head",
+          "component": "Row",
+          "align": "center",
+          "children": ["page_title"]
+        },
+        {
+          "id": "page_title",
+          "component": "Text",
+          "text": "## Incident INC-482: Checkout latency spike"
+        },
+        {
+          "id": "page_subtitle",
+          "component": "Text",
+          "text": "Elevated p99 latency in us-east1 after build 2026.11.10-rc3",
+          "variant": "caption"
+        },
+        {
+          "id": "b2_f0_input",
+          "component": "TextField",
+          "label": "Handoff Note",
+          "value": {"path": "/handoffNote"},
+          "variant": "longText"
+        },
+        {
+          "id": "b3_a0_btn",
+          "component": "Button",
+          "child": "b3_a0_label",
+          "variant": "primary",
+          "action": {
+            "event": {
+              "name": "rollback_release",
+              "context": {"service": {"path": "/service"}}
+            }
+          }
+        },
+        {
+          "id": "b3_a1_btn",
+          "component": "Button",
+          "child": "b3_a1_label",
+          "variant": "primary",
+          "action": {
+            "event": {
+              "name": "acknowledge"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "incident_482",
+      "path": "/",
+      "value": {
+        "service": "checkout-api",
+        "severity": "SEV-2",
+        "p99LatencyMs": 840,
+        "errorRate": 0.042,
+        "handoffNote": "Investigating connection pool saturation on read replica 2.",
+        "events": [
+          {
+            "id": "ev_1",
+            "time": "2026-11-10T20:11:00Z",
+            "summary": "Canary shifted to 25% traffic"
+          },
+          {
+            "id": "ev_2",
+            "time": "2026-11-10T20:14:00Z",
+            "summary": "Alert fired: p99 latency above 500 ms"
+          }
+        ]
+      }
+    }
+  }
+]
+```
+
+Every emitted message passes `CatalogApi.validator.validate` before leaving `DecisionSynthesizer`.
+
+---
+
+## 4. Decision block contract
+
+In chat mode, the conversational model emits a JSON object (or a JSON array of objects, one per surface) inside `<a2ui-inference>...</a2ui-inference>`. In tool mode, the model passes the same JSON fields as arguments to `render_a2ui_decision`.
+
+### Block fields
+
+| Field | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `intent` | `string` | Yes | Non-empty natural-language description of what the data represents and how the user should inspect or interact with it. |
+| `payload` (`data` alias) | `object` or `array` | Yes | The JSON data to display. An array payload is wrapped at `{"items": [...]}` so bindings address `/items/0/...`. `DecisionBlock.from_json` accepts `"data"` as a wire alias when `"payload"` is absent and serializes back to `"payload"`. |
+| `surfaceId` | `string` | No | Target surface identifier. Defaults to `SynthesisConfig.default_surface_id` (`"default_surface"`). Creating, updating, or replacing a surface is controlled by `surfaceId`, `region`, and `replace`. |
+| `replace` | `boolean` | No | Defaults to `false`. When `true` on an existing `surfaceId`, the synthesizer emits `deleteSurface` followed by `createSurface`, `updateComponents`, and `updateDataModel`. Cannot be combined with `region`. |
+| `region` | `string` | No | Block role name (such as `"headline"` or `"actions"`) of a single section to re-plan and replace in place on an existing surface. Cannot be combined with `replace: true`. |
+| `actions` | `object` | No | Ordered map from action ID (`^[A-Za-z_][A-Za-z0-9_.-]*$`) to either a button label string or an options object (`{"label", "scope"?, "key"?, "context"?, "style"?}`). The action ID becomes the wire `event.name`. |
+| `mutablePaths` | `array<string>` | No | `/`-prefixed JSON Pointers in `payload` that the user can edit. Forms and settings surfaces must list their editable pointers here, or those fields render as read-only display. |
+| `exclude` | `array<string>` | No | `/`-prefixed JSON Pointers in `payload` that must be stripped before payload inspection, planning, and `updateDataModel` emission. |
+| `labels` | `object<string, string>` | No | Map from `/`-prefixed JSON Pointer to display label override, replacing the default humanized key name. |
+| `layout` | `array<string>` | No | Up to 6 (`MAX_BRIEF_SECTIONS`) brief strings formatted as `"<role>:<key>,<key>"`. Valid roles come from `ArchetypeGrammar.brief_roles()`. Keys may be top-level names or `/`-prefixed JSON Pointers. |
+| `title` | `string` | No | Surface title placed directly into the page heading or banner without LLM rewriting (`AuthoredCopy.title`). |
+| `summary` | `string` | No | One-line surface subtitle or caption placed directly into supporting prose without rewriting (`AuthoredCopy.summary`). |
+| `fallbackDsl` | `string` | No | A2UI Express source compiled and rendered if the decision pipeline abstains or cannot satisfy required blocks. |
+
+### The `actions` map contract
+
+Buttons never come from an `"actions"` array inside `payload`. All interactive triggers live in the top-level `actions` map, which preserves insertion order and separates the stable machine identifier (the map key, used as `event.name`) from the human-readable button label:
+
+```json
+{
+  "actions": {
+    "sign_in": "Sign In",
+    "reset_password": {
+      "label": "Forgot password?",
+      "style": "secondary",
+      "context": {"email": "/email"}
+    },
+    "cancel_order": {
+      "label": "Cancel",
+      "scope": "/orders",
+      "key": "orderId",
+      "style": "destructive"
+    }
+  }
+}
+```
+
+Each entry is parsed into `ActionSpec(id, label, scope=None, key=None, context={}, style=None)`:
+
+1. `id`: The map key. Must match `^[A-Za-z_][A-Za-z0-9_.-]*$`.
+2. `label`: Non-empty button text displayed to the user.
+3. `style`: Optional `ActionStyle` (`"primary"`, `"secondary"`, or `"destructive"`). When omitted, the first top-level action defaults to primary styling in the `actions` pattern and subsequent actions default to secondary styling.
+4. `context`: Optional map from event context key to a `/`-prefixed JSON Pointer (for example `{"email": "/email"}`).
+5. `scope` and `key`: When `scope` is a `/`-prefixed JSON Pointer to an array in `payload` (such as `"/orders"` or `"/events"`), the action is attached to each repeated item in that collection rather than the page-level action bar. `key` names the item property sent in `event.context` to identify which row was clicked (defaulting to `"id"` when omitted).
+
+### System-prompt scaling with catalog size
+
+`DecisionPromptGenerator` emits two sections:
+
+1. `generate_base_rules()`: The fixed 13-field `DecisionBlock` contract and one example block (`decision_rules(archetypes)`).
+2. `generate_catalog_instructions()`: A bulleted list of root-eligible component names from the active catalogs (`CatalogDecisionGraph.root_candidates()`), without property schemas, type definitions, or structural nesting rules.
+
+Because `generate_catalog_instructions()` lists only component names (`- Card`, `- Text`, `- Button`, and so on) so the conversational model knows what kinds of widgets exist, the system prompt grows by one short line per component rather than by full JSON Schema definitions. Passing `include_schema=False` to `generate_catalog_instructions` omits the component name list entirely.
+
+---
+
+## 5. Multi-turn conversation behavior
+
+### `RendererState` ownership
+
+Multi-turn surface updates require tracking which `surfaceId` values already exist, whether each active surface was created with `sendDataModel: true`, and which component IDs belong to each planned block role. `RendererState` owns that per-conversation state:
+
+1. Explicit caller state: An application managing its own session object can pass `state=RendererState()` to `DecisionFormat`, `DecisionSynthesizer.synthesize`, or `DecisionRenderTool.create`.
+2. Per-conversation state map: When `DecisionFormat` is constructed without a shared `state`, calling `format.create_parser(conversation_id="conv_42")` or `format.state_for("conv_42")` returns a dedicated `RendererState` for that conversation ID (evicting the oldest entry once `_MAX_CONVERSATION_STATES = 256` is exceeded). Calling `create_parser()` with no `conversation_id` allocates a fresh isolated `RendererState` for that turn so concurrent conversations never bleed surface state into one another.
+
+### Surface lifecycle operations
+
+For every block, `resolve_surface_operation` determines the `SurfaceOperation` from `RendererState`, `block.replace`, `block.region`, and `Expansion.send_data_model`:
+
+| Scenario | `SurfaceOperation` | Wire messages emitted |
+| :--- | :--- | :--- |
+| `surfaceId` is not active in `RendererState` | `SurfaceOperation.CREATE` | `createSurface`, `updateComponents`, `updateDataModel` (when payload is non-empty) |
+| `surfaceId` is active, `replace: false`, `region` unset, and `PlanCache` hits (same payload shape and no structural changes) | `SurfaceOperation.UPDATE_ROOT` (cache hit) | `updateDataModel` only (`decision_calls = 0`, `cache_hit = True`) |
+| `surfaceId` is active, `replace: false`, `region` unset, and payload shape or layout changes | `SurfaceOperation.UPDATE_ROOT` | `updateComponents` (with root component `"id": "root"`), `updateDataModel` |
+| `surfaceId` is active, `replace: false`, and `region: "<role>"` matches an existing block role on the surface | `SurfaceOperation.UPDATE_ROOT` (region) | `updateComponents` (containing only the re-planned block subtree prefixed with the existing block ID prefix, without `"id": "root"`), `updateDataModel` |
+| `surfaceId` is active and `replace: true` | `SurfaceOperation.REPLACE` | `deleteSurface`, `createSurface`, `updateComponents`, `updateDataModel` |
+| `surfaceId` is active without `sendDataModel: true`, and an update introduces mutable bindings (`Expansion.send_data_model == True`) | `SurfaceOperation.REPLACE` (escalated) | `deleteSurface`, `createSurface` (with `"sendDataModel": true`), `updateComponents`, `updateDataModel` |
+
+### Plan cache and data-only updates
+
+`DecisionSynthesizer` maintains a bounded LRU `PlanCache` (`max_entries = 64`) keyed by `PlanCacheKey(surface_id, catalog_id, grammar_version, shape_signature)`. `plan_shape_signature` hashes the sorted `(path, value_type, semantic_type, element_keys, mutable_hint)` tuples of the inspected pointers alongside the block's `actions`, `mutable_paths`, `exclude`, `labels`, `layout`, `title`, and `summary`.
+
+When a subsequent turn targets an existing `surfaceId` with `replace=False` and `region=None`, and the new block produces the exact same `PlanCacheKey` (meaning only scalar values or array length changed, while the pointer schema and action contract stayed identical), `DecisionSynthesizer` skips the decision backend and component expansion entirely. It emits a single `updateDataModel` message with `cache_hit=True` and `decision_calls=0`.
+
+Returning to the `incident_482` worked example, suppose Turn 2 reports that latency dropped after traffic shifted away from the canary, with the same fields and actions:
+
+```json
+[
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "incident_482",
+      "path": "/",
+      "value": {
+        "service": "checkout-api",
+        "severity": "SEV-2",
+        "p99LatencyMs": 210,
+        "errorRate": 0.004,
+        "handoffNote": "Canary drained; monitoring recovery.",
+        "events": [
+          {
+            "id": "ev_1",
+            "time": "2026-11-10T20:11:00Z",
+            "summary": "Canary shifted to 25% traffic"
+          },
+          {
+            "id": "ev_2",
+            "time": "2026-11-10T20:14:00Z",
+            "summary": "Alert fired: p99 latency above 500 ms"
+          }
+        ]
+      }
+    }
+  }
+]
+```
+
+In Turn 3, the agent sets `"region": "actions"` to replace the action bar with a single `"close_incident"` button, leaving the rest of `"incident_482"` untouched. `DecisionSynthesizer` looks up the existing block prefix (`"b3"` for role `"actions"` in `RendererState.get_surface_blocks("incident_482")`), re-expands only that block under prefix `"b3"`, and emits `updateComponents` for the `"b3_*"` components plus `updateDataModel`.
+
+### User action round-trip
+
+When the user interacts with a rendered surface, the client sends an A2UI v1.0 action event back to the agent:
+
+1. Top-level action button: Clicking `"Roll back release"` dispatches `event.name = "rollback_release"` (the action ID from `block.actions`, never the button text) with `event.context = {"service": "checkout-api"}` resolved from the data model pointer `"/service"`.
+2. Collection-scoped action button: Clicking `"View event"` on the second row of `/events` dispatches `event.name = "inspect_event"` with `event.context = {"id": "ev_2"}` resolved via `$actionContext` inside the `$repeat` template.
+3. Form submission and `sendDataModel`: Because `/handoffNote` was declared in `mutablePaths`, `createSurface` set `"sendDataModel": true` and the form action button's `$actionContext` binds `{ "handoffNote": {"path": "/handoffNote"} }`. Edits made by the user in the `TextField` update `/handoffNote` in the client data model and return to the agent both in the event context and in the attached surface data model.
+
+```mermaid
+sequenceDiagram
+    participant Agent as Conversational Agent
+    participant Synth as DecisionSynthesizer
+    participant Backend as DecisionBackend
+    participant Client as A2UI v1.0 Client
+
+    Agent->>Synth: Turn 1 DecisionBlock (surfaceId="incident_482")
+    Synth->>Backend: answer(DecisionBatch) [1 call]
+    Backend-->>Synth: Calibrated DecisionAnswers
+    Synth->>Client: createSurface(sendDataModel=true) + updateComponents + updateDataModel
+    Note over Synth: Stores RendererState and PlanCache entry
+
+    Client->>Agent: User edits /handoffNote and clicks "acknowledge" (event.name="acknowledge")
+
+    Agent->>Synth: Turn 2 DecisionBlock (surfaceId="incident_482", same shape, updated metrics)
+    Note over Synth: PlanCache hit (decision_calls=0, cache_hit=true)
+    Synth->>Client: updateDataModel only
+
+    Agent->>Synth: Turn 3 DecisionBlock (surfaceId="incident_482", region="actions")
+    Synth->>Backend: answer(DecisionBatch) [1 call]
+    Backend-->>Synth: Calibrated DecisionAnswers
+    Synth->>Client: updateComponents (b3_* subtree only) + updateDataModel
+
+    Agent->>Synth: Turn 4 DecisionBlock (surfaceId="incident_482", replace=true)
+    Synth->>Backend: answer(DecisionBatch) [1 call]
+    Backend-->>Synth: Calibrated DecisionAnswers
+    Synth->>Client: deleteSurface + createSurface + updateComponents + updateDataModel
+```
+
+---
+
+## 6. Synthesis pipeline
+
+`DecisionSynthesizer.synthesize_with_output` orchestrates template matching, cache lookup, batch scoring, threshold gating, pattern expansion, and fallback recovery.
+
+```mermaid
+flowchart TD
+    A["Input DecisionBlock"] --> B["Filter exclude + secret pointers; inspect_payload_pointers"]
+    B --> C{"Existing surfaceId with PlanCache hit?"}
+    C -- "Yes (same shape, replace=false, region=None)" --> D["Emit updateDataModel only (cache_hit=true)"]
+    C -- "No" --> E["Compile template question (if TemplateRegistry non-empty) + grammar DecisionBatch"]
+    E --> F{"Backend capabilities.two_stage?"}
+    F -- "False (Jev / Gev / Mock)" --> G["Single backend.answer(batch) call (timeout=30s)"]
+    F -- "True (StepZeroLogprobBackend)" --> H["Stage 1 call (family, archetype, stakes, template) + Stage 2 call (selected archetype blocks)"]
+    G --> I{"Registered template above threshold?"}
+    H --> I
+    I -- "Yes (0.75 read-only / 0.85 mutable)" --> J["Expand SurfaceTemplate (Stage: TEMPLATE_SELECT)"]
+    I -- "No" --> K{"Grammar exists for catalog and family != none and fit_score >= 0.50?"}
+    K -- "Yes (all required blocks bound)" --> L["Apply stakes-scaled actionGate; PatternExpander.expand (Stage: ARCHETYPE)"]
+    K -- "No (abstain or missing required block)" --> M["Fallback chain (Stage: ABSTAIN_FALLBACK)"]
+    M --> M1{"1. block.fallbackDsl?"}
+    M1 -- "Yes" --> N["Compile A2UI Express fallbackDsl"]
+    M1 -- "No" --> M2{"2. synthesizer fallback_fn?"}
+    M2 -- "Yes" --> O["Invoke caller fallback_fn(block)"]
+    M2 -- "No" --> M3{"3. Catalog has facts pattern and pointers exist?"}
+    M3 -- "Yes" --> P["Expand deterministic facts pattern"]
+    M3 -- "No" --> Q["Raise A2uiCompilationError"]
+    J --> R["Validate v1.0 messages against CatalogApi; update RendererState and PlanCache"]
+    L --> R
+    N --> R
+    O --> R
+    P --> R
+```
+
+### Single-batch scoring and two-stage mode
+
+By default (`BackendCapabilities.two_stage = False`), `LayoutPlanner.build_batch` includes questions for every shape-eligible archetype in a single `DecisionBatch`, and `DecisionSynthesizer` prepends the optional `template_select` question to that same batch. The backend scores the entire turn in one network round-trip (`decision_calls = 1`).
+
+When a backend sets `BackendCapabilities.two_stage = True` (used by `StepZeroLogprobBackend`, where each question requires a separate chat completion request), `DecisionSynthesizer` runs a compact first batch containing only `template_select`, `family`, `stakes`, `urgency`, and `archetype:<family>`, then builds a second batch containing only the block, knob, salience, and instance questions for the winning archetype (`decision_calls = 2`, or `1` if `template_select` or `family == "none"` short-circuits after the first batch).
+
+### Thresholds and gates
+
+All grammar thresholds live in `catalogs/decision/v1/archetypes.json` and are validated on load by `validate_threshold_relations`:
+
+| Threshold key | Value | Meaning |
+| :--- | :--- | :--- |
+| `template` | `0.75` | Minimum calibrated probability to pick a registered `SurfaceTemplate` when `block.mutable_paths` is empty and the template has `is_mutable = False`. |
+| `templateMutable` | `0.85` | Higher minimum probability required to pick a registered `SurfaceTemplate` when `block.mutable_paths` is non-empty or `template.is_mutable` is `True`. |
+| `family` | `0.40` | Minimum probability for the winning layout family (`browse`, `monitor`, `inspect`, `act`, `input`, `follow`). If `none` wins or the top family falls below `0.40`, planning abstains (`PlanReason.NO_FAMILY`). |
+| `archetype` | `0.40` | Minimum probability for the winning archetype within the chosen family (`PlanReason.NO_ARCHETYPE` on failure). |
+| `expected` | `0.50` | Minimum probability to include an expected (`name`) block in an archetype. Required (`name!`) blocks are always included if their slots can bind. |
+| `optional` | `0.75` | Minimum probability to include an optional (`name?`) block in an archetype (`expected <= optional`). |
+| `instance` | `0.50` | Minimum probability for per-pointer widget selection (`$byInstance`). |
+| `noFit` | `0.50` | Minimum overall `LayoutPlan.fit_score` (the geometric mean of the winning family, archetype, and required block confidences, penalized by unbound brief roles). Plans below `0.50` abstain with `PlanReason.NO_FIT`. |
+| `actionGateFloor` | `0.70` | Base confidence floor for emitting interactive action blocks when `stakes` is `0.0`. |
+| `actionGateCap` | `0.95` | Maximum action confidence cap when `stakes` and `conservativeness` are both `1.0`. |
+
+### Stakes-scaled action gate
+
+Even when a payload or archetype can render an `actions` or `outcome` block, the planner checks whether interactive triggers are safe to emit for the turn's inferred operational stakes (`stakes` in `[0.0, 1.0]`, computed as the expected value over `low = 0.0`, `medium = 0.5`, `high = 1.0`) and `SynthesisConfig.conservativeness` (default `0.5`):
+
+```text
+action_threshold = min(
+    actionGateCap,
+    actionGateFloor + conservativeness * (actionGateCap - actionGateFloor) * stakes
+)
+```
+
+With the default thresholds (`0.70` floor, `0.95` cap, `conservativeness = 0.5`), a low-stakes turn (`stakes = 0.0`) requires `0.70` confidence, a medium-stakes turn (`stakes = 0.5`) requires `0.7625`, and a high-stakes turn (`stakes = 1.0`) requires `0.825`. If an archetype requires `actions_allowed` (such as `confirm` or `checkout`) and the gate fails, the planner abstains with `PlanReason.ACTION_GATE`.
+
+### Deterministic fallback chain
+
+When template selection does not match and the archetype planner abstains (or the active catalog has no `patterns.json`), `DecisionSynthesizer` transitions to `SynthesisStage.ABSTAIN_FALLBACK` (`fallback_reason` records the `PlanReason` value, or `"no_patterns"` when the catalog provides no pattern library) and tries three fallbacks in order:
+
+1. `block.fallback_dsl`: If the block includes an A2UI Express string in `fallbackDsl`, the synthesizer compiles it against the active catalogs, populates `updateDataModel` with the filtered payload, and sets `fallback_source = FallbackSource.DSL` (`"fallback_dsl"`).
+2. `fallback_fn`: If the caller configured a `fallback_fn(block)` callback on `DecisionSynthesizer` or `DecisionFormat`, the synthesizer invokes it, validates the returned v1.0 messages, and sets `fallback_source = FallbackSource.CALLBACK` (`"fallback_fn"`).
+3. `facts` pattern: If the active `MergedPatternLibrary` defines the terminal `facts` pattern (plus `page`) and the inspected payload has at least one scalar pointer, the synthesizer deterministically binds up to 12 scalar pointers into a `facts` key-value layout and sets `fallback_source = FallbackSource.FACTS` (`"fallback_facts"`).
+
+If none of the three fallbacks can produce messages, `DecisionSynthesizer` raises `A2uiCompilationError`.
+
+### Backend timeout and error semantics
+
+`JevHttpBackend` and `StepZeroLogprobBackend` enforce `DEFAULT_TIMEOUT_SECONDS = 30.0` (configurable via `timeout_seconds`). The pipeline never uses a short timeout to silently fall back to `facts` when a backend is slow or unreachable. Any HTTP timeout, transport failure, malformed response, or status error raises `DecisionBackendError(message, backend_kind=..., model_id=..., cause=...)`.
+
+---
+
+## 7. Backends and calibration
+
+### `DecisionBackend` protocol and capabilities
+
+All decision model integrations implement the asynchronous `DecisionBackend` protocol defined in `a2ui.inference_formats.decision.backends`:
+
+```python
+class DecisionBackend(Protocol):
+    backend_kind: str
+    model_id: str
+    capabilities: BackendCapabilities
+
+    async def answer(
+        self, batch: DecisionBatch
+    ) -> tuple[DecisionAnswer, ...]: ...
+```
+
+`BackendCapabilities(two_stage: bool = False, max_questions_per_call: int | None = None)` tells `DecisionSynthesizer` whether to send one combined `DecisionBatch` or split planning into two stages, and automatically chunks large batches when `max_questions_per_call` is set.
+
+### Concrete backends
+
+| Class | `backend_kind` | Default `model_id` | Wire contract and usage |
+| :--- | :--- | :--- | :--- |
+| `JevHttpBackend` (TypeSafe Jev) | `"typesafe_jev"` | `DEFAULT_TYPESAFE_MODEL = "jev-v0"` | Calls a hosted TypeSafe Jev endpoint using either the native Jev batch schema (`{"model", "shared_context", "questions"}`) or `/v1/systemone` (`{"context", "questions": [{"question", "answers"}]}`). Auto-detects wire format from the URL path (`DecisionWireFormat.AUTO`). |
+| `JevHttpBackend` (Local Gev) | `"local_gev"` | `"gev-local"` | Constructed via `JevHttpBackend.local_gev(endpoint_url=...)`. Speaks the `/v1/systemone` batch decision protocol against a local Gev server with `two_stage = False`. |
+| `StepZeroLogprobBackend` | `"step_zero"` | Caller-supplied (for example `"gemini-2.5-flash"`) | Prompts an OpenAI-compatible `/v1/chat/completions` endpoint to output a single choice token (`A` through `J`) with `max_tokens = 1` and `top_logprobs = 10`, converts token logprobs into a normalized distribution, and runs with `two_stage = True`. |
+| `DeterministicMockBackend` | `"mock"` | `"deterministic-mock-v1"` | Rule-based in-memory backend for unit tests, CI, and offline conformance checks. Requires no network access. |
+
+`create_decision_backend(kind=..., endpoint_url=..., api_key=..., model=..., calibration=...)` constructs any of the four backends from explicit arguments or environment variables (`A2UI_DECISION_BACKEND`, `A2UI_DECISION_ENDPOINT`, `A2UI_DECISION_MODEL`, `JEV_API_KEY`, `TYPESAFE_API_KEY`, `STEP_ZERO_API_KEY`). Every backend ID is pinned (such as `"jev-v0"`); floating aliases are not used.
+
+### Temperature calibration (`calibration_profiles.json`)
+
+Different backends produce raw probability distributions with different sharpness. Before comparing answers against the fixed grammar thresholds in `archetypes.json`, every backend applies `Calibration(temperature: float)` (`distribution.with_temperature(T)`), scaling log-probabilities by `1 / T` and re-normalizing (`T = 1.0` is an identity transform, `T < 1.0` sharpens flat distributions, and `T > 1.0` softens overconfident ones).
+
+Bundled calibration profiles live in `python/a2ui_agent/src/a2ui/inference_formats/decision/assets/calibration_profiles.json`, keyed by `"<backend_kind>/<model_id>"`:
+
+```json
+{
+  "schemaVersion": "1",
+  "profiles": {
+    "mock/deterministic-mock-v1": {"temperature": 1.0},
+    "typesafe_jev/jev-v0": {"temperature": 1.0},
+    "local_gev/gev-local": {"temperature": 1.0},
+    "step_zero/default": {"temperature": 1.0}
+  }
+}
+```
+
+When a backend is instantiated without an explicit `Calibration`, `load_calibration_for(backend_kind, model_id)` resolves its profile (falling back to `"<backend_kind>/default"`, then `Calibration(temperature=1.0)`). To fit a temperature for a new backend or model checkpoint, run `eval/bin/calibrate_decision_backend.py`, which minimizes negative log-likelihood on the `tuning` split of `decision_bench` only (never on the `held_out` split) and writes the fitted temperature and Expected Calibration Error (ECE) into `calibration_profiles.json`.
+
+---
+
+## 8. Catalog patterns and authoring workflow
+
+### Ownership and versioning
+
+The archetype grammar (`catalogs/decision/v1/archetypes.json`) is catalog-agnostic: it knows abstract block pattern names (`page`, `banner`, `picture`, `media`, `filters`, `headline`, `chart`, `facts`, `prose`, `collection`, `comparison`, `steps`, `timeline`, `conversation`, `compose`, `map`, `form`, `groups`, `actions`, `outcome`), slot names, and variant knobs, but zero concrete component names.
+
+Each v1.0 component catalog owns a `patterns.json` file beside its `catalog.json` (for example `catalogs/basic/v1/patterns.json`) that validates against `catalogs/decision/v1/pattern_definition.json`. A pattern file maps one v1.0 `catalogId` and one `grammarVersion` (`"1"`) to the abstract patterns that catalog can draw:
+
+```json
+{
+  "$schema": "https://a2ui.org/specification/v1_0/decision/pattern_definition.json",
+  "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+  "grammarVersion": "1",
+  "patterns": {
+    "page": { "...": "..." },
+    "headline": { "...": "..." },
+    "facts": { "...": "..." }
+  }
+}
+```
+
+Each pattern file targets a single `catalogId`. When an agent activates multiple v1.0 catalogs at once, `MergedPatternLibrary.for_catalogs(catalogs)` merges their `PatternLibrary` instances in catalog priority order.
+
+### Pattern template directives
+
+Inside a pattern's `components` and `fieldVariants`, JSON objects whose keys begin with `$` are expansion directives interpreted by `PatternExpander`:
+
+| Directive | Value shape | Expansion behavior |
+| :--- | :--- | :--- |
+| `$slot` | `"slotName"` or `"slotName.field"` | Emits a v1.0 data binding `{"path": "..."}` to the pointer bound to that slot (or a relative field path inside `$repeat`). Falls back to sibling `$default` when unbound. |
+| `$text` | String with `{slot}` or `{$index1}` placeholders | Substitutes authored literals directly, or emits a v1.0 `{"call": "formatString", "args": {"value": ...}}` function call when any placeholder resolves to a data-bound pointer. |
+| `$default` | Any literal value | Fallback value emitted when a sibling `$slot`, `$knobValue`, or `$event` is unbound. |
+| `$if` | `"slotName"` | Includes the component (or child ID reference in a `children` array) only when the named slot is bound. |
+| `$ifKnob` | `{"knob": ["val1", ...]}` | Includes the component or child reference only when every listed variant knob matches. |
+| `$ifSelf` | `{"true": "...", "false": "..."}` | Selects between two values or child IDs depending on whether a conversation item's author matches the `self` knob. |
+| `$ifInstance` | `{"questionKey": "val"}` | Emits the enclosing property only when the per-pointer instance answer matches. |
+| `$byType` | `"slotName"` with type-keyed siblings | Dispatches to the sibling child ID matching the bound pointer's `SemanticType` (or `"default"`). |
+| `$byInstance` | `"instanceKey"` | Selects an entry from the pattern's `fieldVariants` map (or a sibling key) matching the decision model's per-pointer widget choice (such as `text_field`, `check_box`, `slider`, `date_time_input`, or `choice_picker`). |
+| `$repeat` | `"slotName"` with sibling `"component"` | Expands a v1.0 template child list `{"path": "/arrayPath", "componentId": "..."}` bound to the repeated array slot, switching child `$slot` lookups inside the template to relative element paths. |
+| `$map` | `"knobOrInstanceKey"` | Emits the sibling literal matching the current knob or instance value. |
+| `$event` | `"actionSlotName"` | Emits `{"event": {"name": "<action.id>", "context": ...}}` from the bound `ActionSpec`. Never uses the button label as `event.name`. |
+| `$actionContext` | `true` | Inside `$event.context`: resolves to the `ActionSpec.context` pointer bindings when present; inside `$repeat`, binds the item identity field (`ActionSpec.key`, defaulting to `"id"`); inside a `form` submit button, binds every editable pointer in the form block. |
+| `$blocks` | `true` | Used inside the `page` pattern's `children` list to splice the expanded root IDs of all planned blocks in archetype order. |
+| `$knobValue` | `"knob.property"` | Reads a planned knob value from the `PlannedBlock`, falling back to `$default`. |
+
+### Authoring and validating patterns with `a2ui-generate-catalog-patterns`
+
+Catalog authors do not have to map every archetype by hand. The `a2ui-generate-catalog-patterns` skill (`.agents/skills/a2ui-generate-catalog-patterns/SKILL.md`, backed by `a2ui.inference_formats.decision.catalog_patterns_tool`) provides two deterministic commands:
+
+1. `inspect`: Runs `inspect_catalog(catalog_path)` to classify the catalog's components by role (containers, text, media, collection templates, input controls, and action triggers), reports which of the 20 abstract patterns and 14 archetypes the catalog can support, and lists the recommended pattern mappings.
+2. `validate`: Runs `validate_patterns(catalog_path, patterns_path)` across five checks: JSON Schema conformance against `pattern_definition.json`, `catalogId` and `grammarVersion` match against `catalog.json` and `archetypes.json`, directive and slot integrity against the grammar's `BlockSpec` definitions, dry-run `PatternExpander` expansion of every pattern variant and `fieldVariants` entry against synthetic `BlockBindings` verified by `CatalogApi.validator`, and archetype eligibility coverage (`eligible_archetypes`).
+
+### Behavior when a catalog has no `patterns.json`
+
+When an active v1.0 catalog has no `patterns.json` beside its `catalog.json` and no bundled asset fallback (`MergedPatternLibrary.is_empty == True`), `DecisionSynthesizer` still checks `TemplateRegistry` first. If no registered `SurfaceTemplate` matches above the template threshold, the synthesizer skips archetype planning and runs the deterministic fallback chain (`block.fallback_dsl` -> `fallback_fn`) with `fallback_reason = "no_patterns"`. When those fallbacks are absent, the synthesizer raises `A2uiCompilationError`.
+
+---
+
+## 9. Using tool mode or chat mode
+
+Applications can expose `a2ui-decision` to the conversational model in two ways:
+
+| Dimension | Chat mode (`DecisionFormat`) | Tool mode (`DecisionRenderTool`) |
+| :--- | :--- | :--- |
+| Model interface | Emits `<a2ui-inference>{...}</a2ui-inference>` blocks inside assistant text responses. | Calls the structured tool `render_a2ui_decision` with JSON arguments matching `DecisionBlock.json_schema()`. |
+| Prompt footprint | `DecisionPromptGenerator` injects the 13-field contract and available component names into the system prompt. | The tool's `description` and `parameters_json_schema()` carry the contract; no `<a2ui-inference>` tag parser is needed. |
+| Lifecycle state | `DecisionFormat.create_parser(conversation_id=...)` binds a per-conversation `RendererState`. | `DecisionRenderTool` holds a `RendererState` and a tool-level `PlanCache` across tool invocations. |
+| Template promotion | Templates are registered ahead of time in `TemplateRegistry`. | `tool.promote(template_id, description, surface_id=...)` promotes the most recent cached `LayoutPlan` for a surface into a reusable `SurfaceTemplate` in `TemplateRegistry` at runtime. |
+
+### Promoting a live plan to a template in tool mode
+
+During interactive development or multi-step agent sessions, a tool-mode agent can freeze a successful layout plan into a named `SurfaceTemplate` so future turns with similar intents bypass archetype planning:
+
+```python
+tool = DecisionRenderTool.create(catalogs=[basic_catalog], backend=backend)
+output = await tool.run_async(
+    intent="Inspect the checkout latency incident",
+    payload=incident_payload,
+    surfaceId="incident_482",
+    actions={"acknowledge": "Acknowledge"},
+)
+template = tool.promote(
+    "incident_summary_v1",
+    "Incident status header, event timeline, and operator actions",
+    surface_id="incident_482",
+)
+```
+
+### When to author a static `SurfaceTemplate` directly
+
+Use `a2ui-decision` archetype synthesis when payload shapes vary across turns or come from external APIs, database queries, or user-defined schemas. Author a static `SurfaceTemplate` in `TemplateRegistry` (or use `a2ui-express` directly) when a surface has a fixed product design that requires exact pixel-level component arrangement, custom conditional visibility expressions not expressible in the 14 grammar archetypes, or branding layouts that must never vary across model versions.
+
+---
+
+## 10. Observability and evaluation
+
+### `SynthesisOutput` telemetry
+
+Calling `synthesizer.synthesize_with_output(block, state=state)` (or `tool.run_async(...)`) returns a frozen `SynthesisOutput` containing both the validated A2UI v1.0 wire messages and per-turn telemetry:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `stage` | `SynthesisStage` | Which path produced the messages: `TEMPLATE_SELECT`, `ARCHETYPE`, or `ABSTAIN_FALLBACK`. |
+| `messages` | `list[dict[str, Any]]` | Validated A2UI v1.0 protocol messages (`createSurface`, `updateComponents`, `updateDataModel`, `deleteSurface`). |
+| `operation` | `SurfaceOperation` | Lifecycle operation executed (`CREATE`, `UPDATE_ROOT`, or `REPLACE`). |
+| `backend_kind` | `str` | Backend identifier (`"typesafe_jev"`, `"local_gev"`, `"step_zero"`, or `"mock"`). |
+| `model_id` | `str` | Pinned model identifier used for scoring (such as `"jev-v0"`). |
+| `decision_calls` | `int` | Number of `backend.answer` calls made during the turn (`0` on `PlanCache` hit, `1` for single-batch backends, `1` or `2` for two-stage backends). |
+| `decision_latency_ms` | `float` | Wall-clock time spent inside `backend.answer` calls in milliseconds. |
+| `cache_hit` | `bool` | `True` when `PlanCache` served a data-only `updateDataModel` without calling the backend. |
+| `confidence` | `float` | Overall confidence of the chosen template or `LayoutPlan` (`0.0` on fallback). |
+| `entropy` | `float` | Mean Shannon entropy across all `DecisionRecord` distributions in `trace`. |
+| `layout_plan` | `LayoutPlan \| None` | The resolved `LayoutPlan` (including `fit_score`, `family`, `archetype`, `blocks`, `stakes`, `urgency`, and `actions_allowed`) when `stage == SynthesisStage.ARCHETYPE`. |
+| `selected_template_id` | `str \| None` | Winning template ID when `stage == SynthesisStage.TEMPLATE_SELECT`. |
+| `fallback_source` | `FallbackSource \| None` | Which fallback branch ran (`"fallback_dsl"`, `"fallback_fn"`, or `"fallback_facts"`) when `stage == SynthesisStage.ABSTAIN_FALLBACK`. |
+| `fallback_reason` | `str \| None` | Why planning abstained (`"no_family"`, `"no_archetype"`, `"required_block_missing"`, `"action_gate"`, `"no_fit"`, or `"no_patterns"`). |
+| `trace` | `tuple[DecisionRecord, ...]` | Every question asked, its calibrated probability distribution, the applied threshold, and the chosen option. |
+
+### Evaluation suite (`decision_bench` and `decision_scorecard`)
+
+The evaluation suite under `eval/decision_bench/` and `eval/decision_scorecard/` measures the decision pipeline across a stratified corpus of cases. Cases are split into `"tuning"` (used for prompt tuning and temperature calibration via `eval/bin/calibrate_decision_backend.py`) and `"held_out"` (reserved strictly for final release scoring; tuning or calibrating on `"held_out"` is rejected by the calibration script).
+
+The benchmark and scorecard measure:
+
+1. Schema and catalog validity rate across all synthesized v1.0 messages.
+2. Family and archetype accuracy against human-labeled ground truth (`expected_family`, `expected_archetypes`).
+3. Abstention precision and recall on unsuited or conversational-only payloads (`family == "none"` and `noFit` cases) and high-stakes action suppression accuracy.
+4. Correctness of multi-turn surface lifecycles (`CREATE`, `UPDATE_ROOT` cache hits, `region` updates, and `REPLACE`), mutable path preservation (`sendDataModel: true`), `exclude` pointer stripping, and action `event.name == action.id` fidelity.
+5. Backend call count (`decision_calls`), decision latency distribution (`decision_latency_ms`), and Expected Calibration Error (ECE) on the held-out split.
+
+What is not yet measured by the automated scorecard: live end-user task completion time in browser studies and cross-catalog visual rendering parity outside the basic v1.0 catalog and custom test fixture catalogs.
+
+---
+
+## 11. Status and roadmap
+
+### Experimental status of `catalogs/decision/v1/`
+
+The grammar and JSON schemas under `catalogs/decision/v1/` (`archetypes.json`, `archetype_definition.json`, `pattern_definition.json`) and `catalogs/basic/v1/patterns.json` are currently **experimental and non-normative**. The Python Agent SDK package (`a2ui.inference_formats.decision`) is the reference implementation.
+
+### Path to a normative specification
+
+Before `a2ui-decision` becomes a normative, multi-language A2UI specification:
+
+1. The block contract, archetype grammar schema, pattern definition schema, and deterministic expansion rules will move under `specification/inference_formats/decision/` with versioned JSON Schemas.
+2. A model-free conformance suite under `conformance/` will pair fixed `DecisionBlock` inputs and recorded `DecisionAnswer` fixtures with expected A2UI v1.0 wire messages, verifying that the TypeScript, Dart, and Swift SDKs expand each plan identically without requiring a live model in CI.
+
+### Held-out benchmark status
+
+**Results pending held-out label sign-off and pinned-backend scorecard run.** Once the second-annotator review on the held-out split of `decision_bench` and the pinned `jev-v0` / local Gev scorecard runs are signed off, the benchmark tables in `eval/decision_scorecard/` will be published alongside this proposal.
+
+---
+
+## 12. Alternatives considered
+
+### A2UI Express DSL alone (`a2ui-express`)
+
+`a2ui-express` reduces token count compared to raw A2UI JSON by giving the conversational model a compact shorthand syntax for component trees. However, the conversational model still authors every component, layout container, and property binding on every turn, and its system prompt must still describe every component signature in the active catalog. `a2ui-decision` complements `a2ui-express` rather than replacing it: `a2ui-decision` handles structured data views, forms, and action flows with zero component syntax from the conversational model, and falls back to `a2ui-express` (`fallbackDsl`) whenever a surface needs a custom layout outside the archetype grammar.
+
+### Static templates only (`TemplateRegistry`)
+
+A pure template-selection system avoids LLM layout generation by matching each turn to a hand-written component tree. Static templates work well for fixed, recurring screens, and `a2ui-decision` includes a `TemplateRegistry` gate (`SynthesisStage.TEMPLATE_SELECT`) plus runtime `DecisionRenderTool.promote()` for that reason. On their own, static templates cannot adapt when an API payload has optional sections, varying field types, collection-scoped actions, or ad-hoc key-value structures.
+
+### Direct component-graph decisions (`jev2ui`)
+
+An earlier prototype (`jev2ui`) used a decision model to walk the raw component schema graph directly, asking per-component and per-property questions (`Card` vs `Column`, child counts, and individual widget properties). Walking raw component schemas required dozens of sequential or deeply nested decision queries per surface, coupled prompts tightly to one catalog's component tree, and frequently produced valid component JSON with poor visual hierarchy. Introducing the intermediate `ArchetypeGrammar` and per-catalog `patterns.json` bounded the decision space to one batch of layout-level questions while letting catalog authors control the exact component idioms for their design system.
