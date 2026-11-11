@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 import concurrent.futures
 import contextvars
 import copy as copy_lib
@@ -168,18 +168,25 @@ def _catalog_slug(catalog_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower() or "cat"
 
 
+def _is_function_call_dict(node: dict[str, Any]) -> bool:
+    """Returns whether `node` represents a function call dict."""
+    return "args" in node and ("@call" in node or "call" in node)
+
+
 def _stamp_function_calls(value: Any, catalog_id: str) -> None:
     """Recursively stamps `catalogId` onto function call dicts inside `value`."""
-    if isinstance(value, list):
-        for item in value:
-            _stamp_function_calls(item, catalog_id)
+    children: Iterable[Any]
+    if isinstance(value, dict):
+        if _is_function_call_dict(value):
+            value.setdefault("catalogId", catalog_id)
+        children = value.values()
+    elif isinstance(value, list):
+        children = value
+    else:
         return
-    if not isinstance(value, dict):
-        return
-    if ("@call" in value or "call" in value) and "args" in value:
-        value.setdefault("catalogId", catalog_id)
-    for child in value.values():
-        _stamp_function_calls(child, catalog_id)
+    for child in children:
+        if isinstance(child, (dict, list)):
+            _stamp_function_calls(child, catalog_id)
 
 
 def _archetype_confidence_and_entropy(
