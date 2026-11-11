@@ -1108,6 +1108,18 @@ class JevHttpBackend(_HttpClientOwner):
         self._adc_token: str | None = None
         self._adc_expires_at: float = 0.0
         self._adc_lock = threading.Lock()
+        self._last_call_latency_ms: float | None = None
+
+    @property
+    def last_call_latency_ms(self) -> float | None:
+        """Server-reported execution latency (in ms) from the last request, if any."""
+        return self._last_call_latency_ms
+
+    def _record_server_latency(self, data: Mapping[str, Any]) -> None:
+        """Records server-reported `ms` or `model_ms` from `data` when present."""
+        raw_ms = data.get("ms", data.get("model_ms"))
+        val = _safe_nonneg_float(raw_ms) if raw_ms is not None else 0.0
+        self._last_call_latency_ms = val if val > 0.0 else None
 
     @property
     def endpoint_url(self) -> str:
@@ -1179,6 +1191,7 @@ class JevHttpBackend(_HttpClientOwner):
             for q in batch.questions
             if not (q.kind is QuestionKind.CHOICE and len(q.candidates()) < 2)
         }
+        self._last_call_latency_ms = None
         data: Mapping[str, Any] = {}
         if wire_questions:
             payload = {
@@ -1189,6 +1202,7 @@ class JevHttpBackend(_HttpClientOwner):
             data = await self._post(
                 self._endpoint_url, payload, await self._build_headers()
             )
+            self._record_server_latency(data)
         raw_answers = data.get("answers", {})
         answers_map = raw_answers if isinstance(raw_answers, Mapping) else {}
         fallback_q = answers_map.get("q")
@@ -1206,6 +1220,7 @@ class JevHttpBackend(_HttpClientOwner):
 
     async def _answer_native(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
         """Sends `batch` as one native Jev request."""
+        self._last_call_latency_ms = None
         payload: dict[str, Any] = {
             "shared_context": dict(batch.shared_context),
             "questions": [_serialize_native_question(q) for q in batch.questions],
@@ -1213,6 +1228,7 @@ class JevHttpBackend(_HttpClientOwner):
         data = await self._post(
             self._endpoint_url, payload, await self._build_headers()
         )
+        self._record_server_latency(data)
         raw_answers = data.get("answers", data.get("questions", ()))
         return tuple(
             _apply_calibration(

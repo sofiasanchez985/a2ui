@@ -975,6 +975,12 @@ class DecisionSynthesizer:
         started = time.perf_counter()
         answers = await self.backend.answer(batch)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        reported_ms = getattr(self.backend, "last_call_latency_ms", None)
+        if (
+            isinstance(reported_ms, (int, float))
+            and 0.0 < float(reported_ms) < elapsed_ms
+        ):
+            elapsed_ms = float(reported_ms)
         timings = _DECISION_CALL_TIMINGS.get()
         if timings is not None:
             timings.append(elapsed_ms)
