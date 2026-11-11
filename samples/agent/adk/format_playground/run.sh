@@ -147,4 +147,4 @@ case "${PRESET}" in
     ;;
 esac
 
-exec "${UV_BIN}" run --no-sync . --mode "${RENDER_MODE}" "$@"
+exec "${UV_BIN}" run . --mode "${RENDER_MODE}" "$@"
