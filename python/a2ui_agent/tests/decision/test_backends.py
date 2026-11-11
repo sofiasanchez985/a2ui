@@ -927,3 +927,35 @@ def test_get_adc_token_sync_resolves_gcloud_via_which(
     monkeypatch.setattr(backends.shutil, "which", lambda name: "/opt/bin/gcloud")
     assert backends._get_adc_token_sync(3.0) == "gcloud-tok"
     assert calls == [["/opt/bin/gcloud", "auth", "print-access-token"]]
+
+
+@pytest.mark.asyncio
+async def test_jev_http_backend_records_server_reported_latency_ms() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if "questions" in body and isinstance(body["questions"], dict):
+            return httpx.Response(
+                200,
+                json={
+                    "answers": {"q": {"probabilities": {"a": 0.8, "b": 0.2}}},
+                    "ms": 112.4,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "answers": [{"id": "q", "probabilities": {"a": 0.7, "b": 0.3}}],
+                "model_ms": 48.5,
+            },
+        )
+
+    batch = _batch(_choice("q", "a", "b"))
+    async with _json_client(handler) as client:
+        sys1 = JevHttpBackend("http://local/v1/systemone", client=client)
+        assert sys1.last_call_latency_ms is None
+        await sys1.answer(batch)
+        assert sys1.last_call_latency_ms == pytest.approx(112.4)
+
+        native = JevHttpBackend("http://local/predict", client=client)
+        await native.answer(batch)
+        assert native.last_call_latency_ms == pytest.approx(48.5)
