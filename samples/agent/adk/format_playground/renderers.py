@@ -23,7 +23,6 @@ the sample clients render surfaces only.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 import json
@@ -246,7 +245,7 @@ class Renderers:
                 version, DirectJsonFormatFactory()
             )
 
-    def set_backend(self, backend: DecisionBackend) -> None:
+    async def set_backend(self, backend: DecisionBackend) -> None:
         """Replaces the active decision backend across all configured protocol versions."""
         old_factory = self._decision_factory
         self._raw_backend = backend
@@ -257,11 +256,7 @@ class Renderers:
             self._processors[(RenderMode.DECISION, DECISION_VERSION)] = (
                 self._build_processor(DECISION_VERSION, self._decision_factory)
             )
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(old_factory.aclose())
-        except RuntimeError:
-            pass
+        await old_factory.aclose()
 
     @staticmethod
     def _build_processor(version: str, factory: Any) -> A2uiRequestProcessor:

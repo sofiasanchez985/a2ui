@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Sequence
 import logging
@@ -165,7 +166,7 @@ class AdkLlmCaller:
             ),
         ):
             if event.content and event.content.parts:
-                chunks.extend(p.text for p in event.content.parts if p.text)
+                _append_part_texts(event.content.parts, chunks)
             usage = getattr(event, "usage_metadata", None)
             if usage is not None:
                 prompt_tokens = int(usage.prompt_token_count or 0)
@@ -205,27 +206,20 @@ class AdkLlmCaller:
             ),
         ):
             if event.content and event.content.parts:
-                for p in event.content.parts:
-                    if p.text:
-                        chunks.append(p.text)
-                    if hasattr(p, "function_call") and p.function_call:
-                        tool_name = p.function_call.name
-                        tool_args = dict(p.function_call.args or {})
-                    if hasattr(p, "function_response") and p.function_response:
-                        tool_result = p.function_response.response
+                tool_name, tool_args, tool_result = _collect_tool_event_parts(
+                    event.content.parts,
+                    chunks,
+                    tool_name,
+                    tool_args,
+                    tool_result,
+                )
             usage = getattr(event, "usage_metadata", None)
             if usage is not None:
                 prompt_tokens = int(usage.prompt_token_count or 0)
                 output_tokens += int(usage.candidates_token_count or 0)
 
         if tool_name and tool_result is None:
-            for t in tools:
-                if getattr(t, "__name__", None) == tool_name:
-                    try:
-                        tool_result = t(**tool_args)
-                    except Exception as exc:  # pylint: disable=broad-exception-caught
-                        logger.warning("Failed executing tool %s: %s", tool_name, exc)
-                    break
+            tool_result = _execute_fallback_tool(tools, tool_name, tool_args)
 
         return LlmToolTurn(
             tool_name=tool_name,
@@ -236,6 +230,50 @@ class AdkLlmCaller:
             latency_ms=(time.perf_counter() - started) * 1000.0,
             text="".join(chunks),
         )
+
+
+def _append_part_texts(parts: Sequence[Any], chunks: list[str]) -> None:
+    """Appends string `text` attributes from `parts` onto `chunks`."""
+    for part in parts:
+        p_text = getattr(part, "text", None)
+        if isinstance(p_text, str) and p_text:
+            chunks.append(p_text)
+
+
+def _collect_tool_event_parts(
+    parts: Sequence[Any],
+    chunks: list[str],
+    tool_name: str | None,
+    tool_args: dict[str, Any],
+    tool_result: Any,
+) -> tuple[str | None, dict[str, Any], Any]:
+    """Collects text chunks, function call args, and function responses from `parts`."""
+    for part in parts:
+        p_text = getattr(part, "text", None)
+        if isinstance(p_text, str):
+            chunks.append(p_text)
+        fn_call = getattr(part, "function_call", None)
+        if fn_call:
+            tool_name = fn_call.name
+            tool_args = dict(fn_call.args or {})
+        fn_resp = getattr(part, "function_response", None)
+        if fn_resp:
+            tool_result = fn_resp.response
+    return tool_name, tool_args, tool_result
+
+
+def _execute_fallback_tool(
+    tools: Sequence[Any], tool_name: str, tool_args: dict[str, Any]
+) -> Any:
+    """Invokes the matching callable in `tools` when the runner returned no response."""
+    for tool in tools:
+        if getattr(tool, "__name__", None) == tool_name:
+            try:
+                return tool(**tool_args)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.warning("Failed executing tool %s: %s", tool_name, exc)
+                return None
+    return None
 
 
 class PlaygroundAgent:
@@ -387,20 +425,20 @@ class PlaygroundAgent:
                     0, f"Unknown command `{command.argument[len('unknown:'):]}`."
                 )
         elif command.name == "backend":
-            lines = self._switch_backend(command.argument)
+            lines = await self._switch_backend(command.argument)
         elif command.name == "trace":
             lines = list(self._last_trace.get(session_id, ())) or [
                 "No decision turn yet. Render something in `decision` mode first."
             ]
         elif command.name == "rate":
-            lines = self._rate_turn(session_id, command.argument, command.text)
+            lines = await self._rate_turn(session_id, command.argument, command.text)
         elif command.name == "ratings":
-            lines = self._show_ratings()
+            lines = await self._show_ratings()
         else:
             lines = [reply or ""]
         return self._status(lines, new_settings, version)
 
-    def _switch_backend(self, argument: str | None) -> list[str]:
+    async def _switch_backend(self, argument: str | None) -> list[str]:
         if not argument:
             choices = ", ".join(DECISION_BACKENDS)
             return [
@@ -411,7 +449,7 @@ class PlaygroundAgent:
             backend = build_named_backend(argument)
         except ValueError as exc:
             return [str(exc)]
-        self.renderers.set_backend(backend)
+        await self.renderers.set_backend(backend)
         return [f"Decision backend set to `{self.renderers.backend_name}`."]
 
     async def _render_turn(
@@ -580,7 +618,7 @@ class PlaygroundAgent:
         )
         return parts
 
-    def _rate_turn(
+    async def _rate_turn(
         self, session_id: str, argument: str | None, comment: str | None
     ) -> list[str]:
         if not argument:
@@ -621,15 +659,15 @@ class PlaygroundAgent:
             candidates=candidate_dicts,
         )
         try:
-            append_rating(RATINGS_PATH, record)
+            await asyncio.to_thread(append_rating, RATINGS_PATH, record)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             logger.warning("Failed appending rating: %s", exc)
             return [f"Failed saving rating: {exc}"]
         suffix = f" with comment: {comment}" if comment else ""
         return [f"Recorded preference for `{winner}`{suffix}."]
 
-    def _show_ratings(self) -> list[str]:
-        wins = summarize_ratings(RATINGS_PATH)
+    async def _show_ratings(self) -> list[str]:
+        wins = await asyncio.to_thread(summarize_ratings, RATINGS_PATH)
         if not wins:
             return ["No ratings recorded yet. Use `/rate <mode> [comment]` to vote."]
         total = sum(wins.values())

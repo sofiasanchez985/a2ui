@@ -375,3 +375,39 @@ async def test_action_events_route_by_id_with_context() -> None:
     assert '"email": "alex@example.com"' in query
     parts = [Part(root=DataPart(data=event))]
     assert build_query(parts) == query
+
+
+async def test_set_backend_awaits_old_factory_aclose_and_skips_non_str_part_text() -> (
+    None
+):
+    from types import SimpleNamespace
+    from agent import _append_part_texts, _collect_tool_event_parts
+
+    local_renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
+    closed = False
+
+    async def fake_aclose() -> None:
+        nonlocal closed
+        closed = True
+
+    local_renderers._decision_factory.aclose = fake_aclose  # type: ignore[method-assign]
+    await local_renderers.set_backend(DeterministicMockBackend())
+    assert closed is True
+
+    chunks: list[str] = []
+    mixed_parts = [
+        SimpleNamespace(text="hello "),
+        SimpleNamespace(text=None),
+        SimpleNamespace(text=42),
+        SimpleNamespace(),
+        SimpleNamespace(text="world"),
+    ]
+    _append_part_texts(mixed_parts, chunks)
+    assert "".join(chunks) == "hello world"
+
+    tool_chunks: list[str] = []
+    name, args, resp = _collect_tool_event_parts(
+        mixed_parts, tool_chunks, None, {}, None
+    )
+    assert "".join(tool_chunks) == "hello world"
+    assert (name, args, resp) == (None, {}, None)
