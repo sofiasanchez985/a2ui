@@ -142,7 +142,7 @@ def test_decision_block_full_round_trip_every_field() -> None:
             "cancel": "Cancel",
         },
         "exclude": ["/internalToken", "/items/0/secret"],
-        "replace": True,
+        "replace": False,
         "region": "headline",
         "labels": {"/recipient": "Recipient name", "/amount": "Amount (USD)"},
         "template": "ignored_legacy_field",
@@ -157,7 +157,7 @@ def test_decision_block_full_round_trip_every_field() -> None:
     assert block.title == "Confirm transfer"
     assert block.summary == "Check the details before sending."
     assert block.exclude == ("/internalToken", "/items/0/secret")
-    assert block.replace is True
+    assert block.replace is False
     assert block.region == "headline"
     assert block.labels == {
         "/recipient": "Recipient name",
@@ -206,13 +206,22 @@ def test_decision_block_full_round_trip_every_field() -> None:
             "cancel": "Cancel",
         },
         "exclude": ["/internalToken", "/items/0/secret"],
-        "replace": True,
         "region": "headline",
         "labels": {"/recipient": "Recipient name", "/amount": "Amount (USD)"},
     }
 
     round_tripped = DecisionBlock.from_mapping(serialized)
     assert round_tripped == block
+
+    replace_block = DecisionBlock.from_mapping({
+        "intent": "Review and submit the transfer",
+        "payload": raw["payload"],
+        "surfaceId": "transfer_surface",
+        "replace": True,
+    })
+    assert replace_block.replace is True
+    assert replace_block.to_json()["replace"] is True
+    assert DecisionBlock.from_mapping(replace_block.to_json()) == replace_block
 
     kwargs = block.to_synthesis_kwargs(default_surface_id="default_main")
     assert kwargs == {
@@ -448,6 +457,16 @@ def test_decision_block_preserves_action_order_and_accepts_layout_brief() -> Non
             "region",
         ),
         (
+            {
+                "intent": "x",
+                "payload": {"a": 1},
+                "replace": True,
+                "region": "facts",
+            },
+            ValueError,
+            "DecisionBlock cannot combine replace=True with a region update",
+        ),
+        (
             {"intent": "Show", "payload": {}, "labels": ["bad"]},
             TypeError,
             "labels",
@@ -484,6 +503,29 @@ def test_decision_block_rejects_invalid_inputs(
 ) -> None:
     with pytest.raises(exc_type, match=pattern):
         DecisionBlock.from_mapping(raw)
+
+
+def test_decision_block_rejects_replace_with_region() -> None:
+    with pytest.raises(
+        ValueError,
+        match="DecisionBlock cannot combine replace=True with a region update",
+    ):
+        DecisionBlock(
+            intent="x",
+            payload={"a": 1},
+            replace=True,
+            region="facts",
+        )
+    with pytest.raises(
+        ValueError,
+        match="DecisionBlock cannot combine replace=True with a region update",
+    ):
+        DecisionBlock.from_mapping({
+            "intent": "x",
+            "payload": {"a": 1},
+            "replace": True,
+            "region": "facts",
+        })
 
 
 def test_decision_block_from_messages_reconstructs_surface_and_payload() -> None:
