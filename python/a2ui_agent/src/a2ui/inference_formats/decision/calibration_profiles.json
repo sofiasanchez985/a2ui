@@ -1,5 +1,11 @@
 {
   "jev/jev-v0": {
     "temperature": 4.0
+  },
+  "jev/jev-1.14.0": {
+    "temperature": 4.0
+  },
+  "jev/jev-latest": {
+    "temperature": 4.0
   }
 }

@@ -1181,8 +1181,14 @@ class JevHttpBackend(_HttpClientOwner):
         }
         data: Mapping[str, Any] = {}
         if wire_questions:
+            wire_model = (
+                "jev-1.14.0"
+                if self.model_id in ("jev-v0", "default")
+                and "api.typesafe.ai" in self._endpoint_url.lower()
+                else self.model_id
+            )
             payload = {
-                "model": self.model_id,
+                "model": wire_model,
                 "state": _build_systemone_state(batch.shared_context),
                 "questions": wire_questions,
             }
