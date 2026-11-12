@@ -28,27 +28,39 @@ BIN_DIR = Path(__file__).parent.resolve()
 if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 
-from report_evals import extract_run_labels, load_log_data, strategy_summary
+from report_evals import extract_run_labels, load_log_data, strategy_summary  # noqa: E402
 
 
 def find_eval_logs(paths: Sequence[str]) -> list[str]:
-    """Finds all .eval log files from a sequence of file or directory paths."""
+    """Finds all `.eval` log files from a sequence of file or directory paths.
+
+    Args:
+        paths: Sequence of `.eval` file paths or directory paths to scan.
+
+    Returns:
+        Sorted list of discovered `.eval` log file paths.
+    """
     eval_files: list[str] = []
-    for p in paths:
-        if os.path.isdir(p):
-            for root, _, files in os.walk(p):
-                for f in sorted(files):
-                    if f.endswith(".eval"):
-                        eval_files.append(os.path.join(root, f))
-        elif os.path.isfile(p) and p.endswith(".eval"):
-            eval_files.append(p)
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_dir():
+            eval_files.extend(str(child) for child in sorted(path.rglob("*.eval")))
+        elif path.is_file() and path.suffix == ".eval":
+            eval_files.append(str(path))
     return sorted(eval_files)
 
 
 def summarize_log_groups(
     log_paths: Sequence[str],
 ) -> list[dict[str, Any]]:
-    """Loads eval logs and groups summaries by (version, strategy, decision_backend)."""
+    """Loads eval logs and groups summaries by `(version, strategy, decision_backend)`.
+
+    Args:
+        log_paths: Sequence of `.eval` log file paths to load and aggregate.
+
+    Returns:
+        List of per-group summary dictionaries sorted by group key.
+    """
     groups: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
     for path in log_paths:
         try:
@@ -73,29 +85,38 @@ def summarize_log_groups(
     for (version, strategy, backend), samples in sorted(groups.items()):
         synthetic_log = {"samples": samples}
         summary = strategy_summary(synthetic_log)
-        rows.append({
-            "version": version,
-            "strategy": strategy,
-            "decision_backend": backend,
-            "decision_backend_kind": summary["decision_backend_kind"],
-            "decision_model_id": summary["decision_model_id"],
-            "total_samples": summary["total_samples"],
-            "algorithmic_pass_rate": summary["algorithmic_pass_rate"],
-            "judge_pass_rate": summary["judge_pass_rate"],
-            "combined_pass_rate": summary["combined_pass_rate"],
-            "median_input_tokens": summary["median_input_tokens"],
-            "median_output_tokens": summary["median_output_tokens"],
-            "median_duration_seconds": summary["median_duration_seconds"],
-            "median_decision_latency_ms": summary["median_decision_latency_ms"],
-            "round_trips_per_surface": summary["round_trips_per_surface"],
-            "fallback_rate": summary["fallback_rate"],
-            "cached": summary["cached"],
-        })
+        rows.append(
+            {
+                "version": version,
+                "strategy": strategy,
+                "decision_backend": backend,
+                "decision_backend_kind": summary["decision_backend_kind"],
+                "decision_model_id": summary["decision_model_id"],
+                "total_samples": summary["total_samples"],
+                "algorithmic_pass_rate": summary["algorithmic_pass_rate"],
+                "judge_pass_rate": summary["judge_pass_rate"],
+                "combined_pass_rate": summary["combined_pass_rate"],
+                "median_input_tokens": summary["median_input_tokens"],
+                "median_output_tokens": summary["median_output_tokens"],
+                "median_duration_seconds": summary["median_duration_seconds"],
+                "median_decision_latency_ms": summary["median_decision_latency_ms"],
+                "round_trips_per_surface": summary["round_trips_per_surface"],
+                "fallback_rate": summary["fallback_rate"],
+                "cached": summary["cached"],
+            }
+        )
     return rows
 
 
 def render_markdown_table(rows: Sequence[dict[str, Any]]) -> str:
-    """Formats comparison rows into a Markdown table."""
+    """Formats comparison rows into a Markdown table.
+
+    Args:
+        rows: Sequence of group summary dictionaries from `summarize_log_groups`.
+
+    Returns:
+        Formatted Markdown comparison table string.
+    """
     if not rows:
         return "No evaluation logs found."
 
@@ -143,7 +164,14 @@ def render_markdown_table(rows: Sequence[dict[str, Any]]) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entrypoint for compare_strategies."""
+    """Runs the CLI entrypoint for `compare_strategies`.
+
+    Args:
+        argv: Optional sequence of CLI argument tokens.
+
+    Returns:
+        Process exit code (`0` on success).
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Compare evaluation results across strategies from Inspect AI eval logs."

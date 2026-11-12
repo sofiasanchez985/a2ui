@@ -32,7 +32,6 @@ from a2ui.core import A2uiValidationError, CatalogApi
 from .archetypes import (
     ArchetypeGrammar,
     BlockSpec,
-    FALLBACK_TERMINALS,
     LayoutArchetype,
     MeasureSpec,
     ShapeFilter,
@@ -63,7 +62,14 @@ class PatternError(A2uiValidationError):
 
 @dataclass(frozen=True)
 class PatternVariant:
-    """One knob-selected component template tree within a catalog pattern."""
+    """One knob-selected component template tree within a catalog pattern.
+
+    Attributes:
+        when: Map from knob name to allowed knob option values.
+        root: Local root component identifier within `components`.
+        components: Template component dictionaries for this variant.
+        note: Authoring note explaining the variant's layout.
+    """
 
     when: Mapping[str, tuple[str, ...]] = field(default_factory=dict, hash=False)
     root: str = ""
@@ -92,7 +98,16 @@ def _normalize_when(raw: Mapping[str, Any] | None) -> dict[str, tuple[str, ...]]
 
 @dataclass(frozen=True)
 class CatalogPattern:
-    """How a catalog draws one abstract layout pattern."""
+    """How a catalog draws one abstract layout pattern.
+
+    Attributes:
+        name: Abstract pattern name (`headline`, `facts`, `collection`, etc.).
+        slots: Slot names accepted by this pattern definition.
+        knobs: Map of knob name to supported option strings.
+        variants: Ordered tuple of `PatternVariant` definitions.
+        field_variants: Map of field-variant name to component template dicts.
+        note: Authoring note explaining the pattern implementation.
+    """
 
     name: str
     slots: tuple[str, ...]
@@ -168,7 +183,12 @@ def _pattern_validator() -> Draft202012Validator:
 
 @dataclass(frozen=True)
 class PatternRef:
-    """A pattern name with an optional variant, written ``name:variant``."""
+    """A pattern name with an optional variant, written ``name:variant``.
+
+    Attributes:
+        name: Base abstract pattern name.
+        variant: Optional variant or knob suffix after the first colon.
+    """
 
     name: str
     variant: str | None = None
@@ -185,7 +205,12 @@ class PatternRef:
 
 @dataclass(frozen=True)
 class ResolvedPattern:
-    """The pattern a block will draw with, after walking its fallback chain."""
+    """The pattern a block will draw with, after walking its fallback chain.
+
+    Attributes:
+        pattern: Chosen abstract pattern name supported by the catalog.
+        knobs: Knob values implied by a ``name:variant`` fallback entry.
+    """
 
     pattern: str
     knobs: Mapping[str, str] = field(default_factory=dict, hash=False)
@@ -210,6 +235,7 @@ class PatternLibrary(PatternCapabilities):
         *,
         grammar_version: str = "1",
     ) -> None:
+        """Initializes a pattern library for `catalog_id`."""
         clean_id = str(catalog_id) if catalog_id else ""
         self.catalog_id: str = clean_id
         self.catalog_ids: tuple[str, ...] = (clean_id,) if clean_id else ()
@@ -313,6 +339,7 @@ class MergedPatternLibrary(PatternCapabilities):
     """Pattern libraries merged across multiple catalogs, primary catalog winning."""
 
     def __init__(self, libraries: Sequence[PatternLibrary]) -> None:
+        """Merges `libraries` in priority order so earlier catalogs take precedence."""
         self.libraries: tuple[PatternLibrary, ...] = tuple(libraries)
         merged: dict[str, CatalogPattern] = {}
         owners: dict[str, str] = {}
@@ -424,31 +451,35 @@ def resolve_fallback_pattern(
 
 # --- Eligibility & Shape Evaluation ---
 
-_IMAGE_KEY_HINTS = frozenset({
-    "image",
-    "img",
-    "photo",
-    "picture",
-    "thumbnail",
-    "thumb",
-    "avatar",
-    "logo",
-    "icon",
-    "poster",
-})
-_CURRENCY_KEY_HINTS = frozenset({
-    "amount",
-    "price",
-    "cost",
-    "fee",
-    "total",
-    "subtotal",
-    "rate",
-    "balance",
-    "currency",
-    "usd",
-    "eur",
-})
+_IMAGE_KEY_HINTS = frozenset(
+    {
+        "image",
+        "img",
+        "photo",
+        "picture",
+        "thumbnail",
+        "thumb",
+        "avatar",
+        "logo",
+        "icon",
+        "poster",
+    }
+)
+_CURRENCY_KEY_HINTS = frozenset(
+    {
+        "amount",
+        "price",
+        "cost",
+        "fee",
+        "total",
+        "subtotal",
+        "rate",
+        "balance",
+        "currency",
+        "usd",
+        "eur",
+    }
+)
 _STATUS_KEY_HINTS = frozenset({"status", "state", "health", "phase", "stage"})
 _TIME_KEY_HINTS = frozenset(
     {"date", "time", "datetime", "timestamp", "arrives", "created", "updated"}
@@ -464,46 +495,50 @@ _LOCATION_KEY_HINTS = frozenset(
     {"address", "coordinates", "coords", "lat", "lng", "latitude", "longitude"}
 )
 
-_NUMERIC_FAMILY = frozenset({
-    "number",
-    "integer",
-    "count",
-    "currency",
-    "percent",
-    "percentage",
-    "ratio",
-    "quantity",
-    "rating",
-    "bounded",
-    "duration",
-})
-_STRING_FAMILY = frozenset({
-    "string",
-    "long_text",
-    "markdown",
-    "code",
-    "name",
-    "title",
-    "identifier",
-    "email",
-    "phone",
-    "url",
-    "image_url",
-    "video_url",
-    "audio_url",
-    "document_url",
-    "place_name",
-    "address",
-    "date",
-    "time",
-    "datetime",
-    "duration",
-    "relative_time",
-    "date_range",
-    "enum",
-    "status",
-    "color",
-})
+_NUMERIC_FAMILY = frozenset(
+    {
+        "number",
+        "integer",
+        "count",
+        "currency",
+        "percent",
+        "percentage",
+        "ratio",
+        "quantity",
+        "rating",
+        "bounded",
+        "duration",
+    }
+)
+_STRING_FAMILY = frozenset(
+    {
+        "string",
+        "long_text",
+        "markdown",
+        "code",
+        "name",
+        "title",
+        "identifier",
+        "email",
+        "phone",
+        "url",
+        "image_url",
+        "video_url",
+        "audio_url",
+        "document_url",
+        "place_name",
+        "address",
+        "date",
+        "time",
+        "datetime",
+        "duration",
+        "relative_time",
+        "date_range",
+        "enum",
+        "status",
+        "color",
+    }
+)
 
 
 def _key_tokens(key: str) -> set[str]:
@@ -852,6 +887,7 @@ def _eval_text_directive(template: str, scope: _ExpansionScope) -> Any:
     has_pointer = False
 
     def _replace(match: re.Match[str]) -> str:
+        """Substitutes one ``{slot}`` or ``{$index1}`` placeholder token."""
         nonlocal has_pointer
         token = match.group(1)
         if token == "$index1":
@@ -912,16 +948,20 @@ def _instance_key_candidates(scope: _ExpansionScope, key: str) -> list[str]:
     """Builds candidate instance lookup keys in priority order."""
     candidates: list[str] = []
     for token in _item_identity_tokens(scope):
-        candidates.extend((
-            f"{key}:{token}",
-            f"{scope.block_id}.{key}:{token}",
-            f"instance:{scope.block_id}.{key}:{token}",
-        ))
-    candidates.extend((
-        key,
-        f"{scope.block_id}.{key}",
-        f"instance:{scope.block_id}.{key}",
-    ))
+        candidates.extend(
+            (
+                f"{key}:{token}",
+                f"{scope.block_id}.{key}:{token}",
+                f"instance:{scope.block_id}.{key}:{token}",
+            )
+        )
+    candidates.extend(
+        (
+            key,
+            f"{scope.block_id}.{key}",
+            f"instance:{scope.block_id}.{key}",
+        )
+    )
     return candidates
 
 
@@ -1369,6 +1409,7 @@ def _order_repeat_items(
         return indexed
 
     def _is_primary(pair: tuple[int, Mapping[str, SlotBinding]]) -> bool:
+        """Returns whether repeated item `pair` has a primary instance or knob."""
         idx, fields = pair
         sub_scope = _ExpansionScope(
             block_id=scope.block_id,
@@ -1835,7 +1876,7 @@ def _prune_empty_containers(
     """Removes non-root empty containers and unreachable components."""
     preserved = preserve_ids or set()
     by_id = {str(c["id"]): c for c in components if "id" in c}
-    removed_ids = _drop_empty_non_root_containers(by_id, root_id, preserved)
+    _drop_empty_non_root_containers(by_id, root_id, preserved)
 
     root_comp = by_id.get(root_id)
     if root_comp is not None and isinstance(root_comp.get("children"), list):

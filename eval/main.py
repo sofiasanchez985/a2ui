@@ -110,7 +110,14 @@ RUNTIME_PROFILES: dict[str, dict[str, int | bool | None]] = {
 
 
 def resolve_model_name(model_name: str) -> str:
-    """Resolves convenience aliases and provider conventions to fully qualified model IDs."""
+    """Resolves convenience aliases and provider conventions to qualified model IDs.
+
+    Args:
+        model_name: Raw model identifier or alias string from the CLI.
+
+    Returns:
+        Provider-prefixed model identifier recognized by Inspect AI.
+    """
     stripped = model_name.strip()
     lower = stripped.lower()
     if lower in MODEL_ALIASES:
@@ -131,7 +138,17 @@ def resolve_model_name(model_name: str) -> str:
 
 
 def _task_function(version: str) -> Callable[..., Task]:
-    """Returns the Inspect task function for a protocol version."""
+    """Returns the Inspect task function for a protocol version.
+
+    Args:
+        version: Normalized A2UI protocol version string (`0.9.1` or `1.0`).
+
+    Returns:
+        Inspect task builder callable for `version`.
+
+    Raises:
+        ValueError: If `version` is not supported.
+    """
     # Looked up at call time so that tests can patch the task functions.
     if version == "0.9.1":
         return a2ui_v0_9_1_eval
@@ -141,7 +158,14 @@ def _task_function(version: str) -> Callable[..., Task]:
 
 
 def default_protocol_version(strategy: str) -> str:
-    """Returns the protocol version a strategy runs under when none is given."""
+    """Returns the protocol version a strategy runs under when none is given.
+
+    Args:
+        strategy: Evaluation strategy name.
+
+    Returns:
+        Default protocol version string (`0.9.1` for `subagent_tool`, else `1.0`).
+    """
     return "0.9.1" if strategy == "subagent_tool" else "1.0"
 
 
@@ -185,13 +209,27 @@ def plan_protocol_versions(
 
 
 def _parse_version_arg(value: str) -> str:
-    """Normalizes the '--version' argument (e.g. 'v1.0' -> '1.0')."""
+    """Normalizes the `--version` argument (for example `'v1.0'` to `'1.0'`).
+
+    Args:
+        value: Raw `--version` CLI argument string.
+
+    Returns:
+        Normalized version string or `'auto'`.
+    """
     cleaned = value.strip().lower()
     return cleaned if cleaned == "auto" else normalize_protocol_version(cleaned)
 
 
 def _split_strategy_args(raw: list[str]) -> list[str]:
-    """Flattens repeated or comma-separated `--strategies` values."""
+    """Flattens repeated or comma-separated `--strategies` values.
+
+    Args:
+        raw: List of raw `--strategies` argument strings.
+
+    Returns:
+        Deduplicated list of strategy names in order of appearance.
+    """
     selected: list[str] = []
     for item in raw:
         for s in item.split(","):
@@ -206,6 +244,12 @@ def parse_strategies(raw: list[str] | None) -> list[str]:
 
     Without `--strategies`, returns `DEFAULT_STRATEGIES` (the production
     formats); experimental strategies must be named explicitly.
+
+    Args:
+        raw: Optional list of raw `--strategies` CLI argument strings.
+
+    Returns:
+        Validated list of evaluation strategy names to execute.
 
     Raises:
         ValueError: If a named strategy is unknown.
@@ -228,6 +272,12 @@ def resolve_runtime_settings(args: argparse.Namespace) -> dict[str, Any]:
 
     An explicit `--max-samples`, `--max-connections` or `--working-limit`
     overrides the profile; `--no-judge` turns the judge off for any profile.
+
+    Args:
+        args: Parsed CLI `argparse.Namespace`.
+
+    Returns:
+        Dictionary of resolved runtime concurrency and judge settings.
     """
     profile = dict(RUNTIME_PROFILES[args.profile])
     if args.max_samples is not None:
@@ -338,7 +388,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Decision backend to use for the decision strategy ('mock',"
-            " 'jev', 'systemone', 'step0')."
+            " 'jev', 'gemini', 'systemone', 'step0')."
         ),
     )
     parser.add_argument(
@@ -437,7 +487,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _filter_task_prompts(task_obj: Task, prompts: list[str] | None) -> None:
-    """Filters `task_obj.dataset` in place when `--prompt` filters are given."""
+    """Filters `task_obj.dataset` in place when `--prompt` filters are given.
+
+    Args:
+        task_obj: Inspect AI `Task` whose dataset should be filtered.
+        prompts: Optional list of substring filters matched against sample names
+            or inputs.
+    """
     if not prompts or getattr(task_obj, "dataset", None) is None:
         return
     prompt_list = [p.lower() for p in prompts]
@@ -463,7 +519,20 @@ def _build_single_task(
     runtime: dict[str, Any],
     tags: str | None,
 ) -> Task:
-    """Builds and filters a single Inspect `Task` for `(strat, task_version)`."""
+    """Builds and filters a single Inspect `Task` for `(strat, task_version)`.
+
+    Args:
+        strat: Evaluation strategy name.
+        task_version: A2UI protocol version string.
+        task_datasets: Dataset names assigned to this protocol version.
+        args: Parsed CLI arguments.
+        grading_model: Qualified LLM judge model identifier.
+        runtime: Resolved runtime concurrency and judge settings.
+        tags: Optional comma-separated tag filter string.
+
+    Returns:
+        Configured Inspect AI `Task` instance.
+    """
     task_func = _task_function(task_version)
     task_kwargs: dict[str, Any] = {
         "strategy": strat,
@@ -495,7 +564,17 @@ def _build_eval_set_kwargs(
     args: argparse.Namespace,
     runtime: dict[str, Any],
 ) -> dict[str, Any]:
-    """Builds keyword arguments forwarded to Inspect `eval_set`."""
+    """Builds keyword arguments forwarded to Inspect `eval_set`.
+
+    Args:
+        tasks: List of configured Inspect AI `Task` objects to evaluate.
+        model: Qualified generation model identifier.
+        args: Parsed CLI arguments.
+        runtime: Resolved runtime concurrency and judge settings.
+
+    Returns:
+        Keyword argument dictionary for `inspect_ai.eval_set`.
+    """
     kwargs: dict[str, Any] = {
         "tasks": tasks,
         "model": model,

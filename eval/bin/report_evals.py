@@ -28,23 +28,24 @@ JUDGE_SCORER = "measured_model_graded_qa"
 
 
 def a2ui_scorer_passed(sample: dict[str, Any]) -> bool:
-    """True when the sample's Stage 1/2 (`a2ui_scorer`) score is 1.0."""
+    """Returns True when the sample's Stage 1/2 (`a2ui_scorer`) score is 1.0."""
     scores = sample.get("scores", {}) or {}
     return (scores.get(A2UI_SCORER, {}) or {}).get("value") == 1.0
 
 
 def judge_grade(sample: dict[str, Any]) -> Any:
-    """The sample's judge grade ("C", "P" or "I"), or "N/A" when it is absent."""
+    """Returns the sample's judge grade ('C', 'P', or 'I'), or 'N/A' when absent."""
     scores = sample.get("scores", {}) or {}
     return (scores.get(JUDGE_SCORER, {}) or {}).get("value", "N/A")
 
 
 def sample_passed(sample: dict[str, Any]) -> bool:
-    """A sample passes when Stage 1/2 validated and the judge graded it "C"."""
+    """Returns True when Stage 1/2 validated and the judge graded the sample 'C'."""
     return a2ui_scorer_passed(sample) and judge_grade(sample) == "C"
 
 
 def _has_both_scores(sample: dict[str, Any]) -> bool:
+    """Returns True when `sample` carries both `a2ui_scorer` and judge scores."""
     scores = sample.get("scores", {}) or {}
     return A2UI_SCORER in scores and JUDGE_SCORER in scores
 
@@ -175,7 +176,7 @@ def print_results_summary(log_data: dict[str, Any]) -> None:
 
             if not passed_sample:
                 if not a2ui_passed:
-                    print(f"  [Algorithmic Failure Reason]:")
+                    print("  [Algorithmic Failure Reason]:")
                     expl = a2ui_score.get("explanation") or "No explanation provided."
                     for line in str(expl).splitlines():
                         print(f"    {line}")
@@ -262,7 +263,14 @@ def _count_fallbacks(samples: list[dict[str, Any]]) -> int:
 
 
 def strategy_summary(log_data: dict[str, Any]) -> dict[str, Any]:
-    """Computes aggregate performance metrics for a strategy run."""
+    """Computes aggregate performance metrics for a strategy run.
+
+    Args:
+        log_data: Parsed Inspect AI evaluation log dictionary.
+
+    Returns:
+        Dictionary of pass rates, median token counts, latencies, and decision metadata.
+    """
     samples = log_data.get("samples") or []
     total = len(samples)
     if not total:
@@ -430,13 +438,15 @@ def generate_markdown_summary(
             )
 
         if not passed_sample:
-            failures.append((
-                name,
-                a2ui_passed,
-                a2ui_score.get("explanation"),
-                qa_val,
-                qa_score.get("explanation"),
-            ))
+            failures.append(
+                (
+                    name,
+                    a2ui_passed,
+                    a2ui_score.get("explanation"),
+                    qa_val,
+                    qa_score.get("explanation"),
+                )
+            )
 
     lines.append("")
 

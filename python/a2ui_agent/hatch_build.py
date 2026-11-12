@@ -52,6 +52,7 @@ class DecisionAssetsBuildHook(BuildHookInterface):  # type: ignore[misc]
     PLUGIN_NAME = "custom"
 
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
+        """Populates `force_include` with repository catalog assets when present."""
         del version
         root = Path(self.root)
         for source, destination in _REPO_ASSETS.items():

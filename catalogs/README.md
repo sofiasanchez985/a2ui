@@ -45,10 +45,10 @@ catalogs/
 - `basic/v1/patterns.json` maps the 17 abstract block patterns (`page`, `banner`,
   `picture`, `media`, `filters`, `headline`, `facts`, `prose`, `collection`,
   `comparison`, `steps`, `form`, `groups`, `actions`, `outcome`, `conversation`,
-  `compose`) onto Basic Catalog components for decision-model layout synthesis,
-  while `decision/v1/archetypes.json` (with `archetype_definition.json` and
-  `pattern_definition.json`, documented in `decision/README.md`) defines the
-  catalog-agnostic layout archetype grammar (`ArchetypeGrammar`).
+  `compose`) onto Basic Catalog components for decision-model layout synthesis.
+  `decision/v1/archetypes.json` defines the catalog-agnostic layout archetype
+  grammar (`ArchetypeGrammar`), accompanied by `archetype_definition.json`,
+  `pattern_definition.json`, and `decision/README.md`.
 - For any custom catalog (inside this directory or in an external repository),
   use the [a2ui-generate-catalog-patterns](../.agents/skills/a2ui-generate-catalog-patterns/SKILL.md)
   skill and its CLI (`catalog_patterns_tool.py`) to inspect `catalog.json` and
@@ -56,8 +56,8 @@ catalogs/
   (fixed-surface `SurfaceTemplate` definitions), and `sample_payloads.json`
   alongside `catalog.json`.
   A catalog's `patterns.json` is part of the catalog: after any component
-  change, it must still validate (run the `a2ui-generate-catalog-patterns`
-  skill's `validate` command). These decision files are experimental.
+  change, it must still validate via the `a2ui-generate-catalog-patterns`
+  skill's `validate` command. These decision files are experimental.
 - `basic/` is versioned by catalog major version (`v1/`), which is independent
   of the protocol version. Newer catalogs start unversioned
   (`catalogs/<catalog>/catalog.json`) and add a version directory only when

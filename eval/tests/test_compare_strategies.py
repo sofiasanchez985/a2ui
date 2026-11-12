@@ -44,6 +44,7 @@ def _synthetic_log(
     s1_pass: bool = True,
     judge_grade: str = "C",
 ) -> dict[str, Any]:
+    """Builds a synthetic Inspect AI evaluation log dictionary for testing."""
     samples = []
     for i in range(samples_count):
         in_tok = input_tokens[i] if input_tokens else 500
@@ -68,11 +69,13 @@ def _synthetic_log(
             "a2ui_scorer": {"value": 1.0 if s1_pass else 0.0},
             "measured_model_graded_qa": {"value": judge_grade},
         }
-        samples.append({
-            "id": i + 1,
-            "metadata": meta,
-            "scores": scores,
-        })
+        samples.append(
+            {
+                "id": i + 1,
+                "metadata": meta,
+                "scores": scores,
+            }
+        )
 
     return {
         "eval": {
@@ -86,6 +89,7 @@ def _synthetic_log(
 
 
 def test_summarize_log_groups_and_metrics() -> None:
+    """Verifies summarize_log_groups groups logs by strategy and computes medians."""
     log_express = _synthetic_log(
         "express",
         "1.0",
@@ -138,6 +142,7 @@ def test_summarize_log_groups_and_metrics() -> None:
 
 
 def test_cached_row_omits_tokens_and_duration() -> None:
+    """Verifies cached generation runs omit median token and duration metrics."""
     cached_log = _synthetic_log(
         "decision",
         "1.0",
@@ -166,12 +171,16 @@ def test_cached_row_omits_tokens_and_duration() -> None:
 
 
 def test_compare_strategies_cli_json_export(tmp_path: Path) -> None:
+    """Verifies compare_strategies CLI writes JSON summary output when --json is passed."""
     log_data = _synthetic_log("decision", "1.0", decision_backend="mock")
     out_json = str(tmp_path / "out.json")
 
-    with patch(
-        "compare_strategies.find_eval_logs", return_value=["/fake/decision.eval"]
-    ), patch("compare_strategies.load_log_data", return_value=log_data):
+    with (
+        patch(
+            "compare_strategies.find_eval_logs", return_value=["/fake/decision.eval"]
+        ),
+        patch("compare_strategies.load_log_data", return_value=log_data),
+    ):
         exit_code = main(["/fake/decision.eval", "--json", out_json])
 
     assert exit_code == 0

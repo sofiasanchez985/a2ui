@@ -41,7 +41,12 @@ def ensure_scripts_on_path() -> None:
 
 
 def _design_system_components() -> dict[str, Any]:
-    """Returns component definitions for the composable design-system catalog."""
+    """Returns component definitions for the composable design-system catalog.
+
+    Returns:
+        A dictionary mapping component names (`Stack`, `Panel`, `Label`, `Figure`,
+        `Stat`, `Entry`, `Trigger`) to their JSON Schema definitions.
+    """
     return {
         "Stack": {
             "type": "object",
@@ -132,7 +137,12 @@ def _design_system_components() -> dict[str, Any]:
 
 
 def _fixed_forms_components() -> dict[str, Any]:
-    """Returns three monolithic form components with no child slots."""
+    """Returns three monolithic form components with no child slots.
+
+    Returns:
+        A dictionary mapping `OrderEntryTicket`, `WireTransferForm`, and
+        `TaxWithholdingForm` to their JSON Schema definitions.
+    """
     return {
         "OrderEntryTicket": {
             "type": "object",
@@ -194,7 +204,14 @@ def _fixed_forms_components() -> dict[str, Any]:
 
 
 def _standard_functions(protocol_version: str) -> dict[str, Any]:
-    """Returns `formatString` function schema so `$text` directives validate."""
+    """Returns the `formatString` function schema so `$text` directives validate.
+
+    Args:
+        protocol_version: Target A2UI protocol version string.
+
+    Returns:
+        A dictionary defining the `formatString` catalog function schema.
+    """
     is_v1 = protocol_version.lstrip("v").startswith("1.")
     call_key = "@call" if is_v1 else "call"
     return {
@@ -219,7 +236,14 @@ def _standard_functions(protocol_version: str) -> dict[str, Any]:
 def design_system_catalog_dict(
     protocol_version: str = "1.0",
 ) -> dict[str, Any]:
-    """Returns the raw `catalog.json` dictionary for the composable design-system catalog."""
+    """Returns the raw `catalog.json` dictionary for the composable design-system catalog.
+
+    Args:
+        protocol_version: Protocol version string for the catalog fixture.
+
+    Returns:
+        A raw `catalog.json` dictionary for the composable design-system fixture.
+    """
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "catalogId": DESIGN_SYSTEM_CATALOG_ID,
@@ -232,7 +256,14 @@ def design_system_catalog_dict(
 def fixed_forms_catalog_dict(
     protocol_version: str = "1.0",
 ) -> dict[str, Any]:
-    """Returns the raw `catalog.json` dictionary for the fixed-forms catalog."""
+    """Returns the raw `catalog.json` dictionary for the fixed-forms catalog.
+
+    Args:
+        protocol_version: Protocol version string for the catalog fixture.
+
+    Returns:
+        A raw `catalog.json` dictionary for the monolithic fixed-forms fixture.
+    """
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "catalogId": FIXED_FORMS_CATALOG_ID,
@@ -243,7 +274,14 @@ def fixed_forms_catalog_dict(
 
 
 def hybrid_catalog_dict(protocol_version: str = "1.0") -> dict[str, Any]:
-    """Returns a hybrid catalog combining composable primitives and `OrderEntryTicket`."""
+    """Returns a hybrid catalog combining composable primitives and `OrderEntryTicket`.
+
+    Args:
+        protocol_version: Protocol version string for the catalog fixture.
+
+    Returns:
+        A raw `catalog.json` dictionary for the hybrid catalog fixture.
+    """
     comps = _design_system_components()
     comps["OrderEntryTicket"] = _fixed_forms_components()["OrderEntryTicket"]
     return {
@@ -256,17 +294,38 @@ def hybrid_catalog_dict(protocol_version: str = "1.0") -> dict[str, Any]:
 
 
 def build_design_system_catalog(protocol_version: str = "1.0") -> Catalog:
-    """Builds the composable design-system `Catalog`."""
+    """Builds the composable design-system `Catalog`.
+
+    Args:
+        protocol_version: Protocol version string for the catalog fixture.
+
+    Returns:
+        The parsed `Catalog` instance for the composable design-system fixture.
+    """
     return Catalog.from_json(design_system_catalog_dict(protocol_version))
 
 
 def build_fixed_forms_catalog(protocol_version: str = "1.0") -> Catalog:
-    """Builds the monolithic fixed-forms `Catalog`."""
+    """Builds the monolithic fixed-forms `Catalog`.
+
+    Args:
+        protocol_version: Protocol version string for the catalog fixture.
+
+    Returns:
+        The parsed `Catalog` instance for the fixed-forms fixture.
+    """
     return Catalog.from_json(fixed_forms_catalog_dict(protocol_version))
 
 
 def build_hybrid_catalog(protocol_version: str = "1.0") -> Catalog:
-    """Builds the hybrid `Catalog`."""
+    """Builds the hybrid `Catalog`.
+
+    Args:
+        protocol_version: Protocol version string for the catalog fixture.
+
+    Returns:
+        The parsed `Catalog` instance for the hybrid catalog fixture.
+    """
     return Catalog.from_json(hybrid_catalog_dict(protocol_version))
 
 
@@ -404,12 +463,14 @@ DESIGN_SYSTEM_PATTERNS: dict[str, Any] = {
                 "prominence": ["mark", "supporting", "leading", "full"],
             },
             "root": "picture_fig",
-            "components": [{
-                "id": "picture_fig",
-                "component": "Figure",
-                "src": {"$slot": "picture"},
-                "caption": {"$slot": "caption", "$default": ""},
-            }],
+            "components": [
+                {
+                    "id": "picture_fig",
+                    "component": "Figure",
+                    "src": {"$slot": "picture"},
+                    "caption": {"$slot": "caption", "$default": ""},
+                }
+            ],
         },
         "collection": {
             "slots": ["items"],
@@ -418,41 +479,43 @@ DESIGN_SYSTEM_PATTERNS: dict[str, Any] = {
                 "leading": ["none"],
                 "trailing": ["none"],
             },
-            "variants": [{
-                "when": {"layout": "rows"},
-                "root": "coll_stack",
-                "components": [
-                    {
-                        "id": "coll_stack",
-                        "component": "Stack",
-                        "direction": "vertical",
-                        "children": {
-                            "$repeat": "items",
-                            "component": "coll_item",
+            "variants": [
+                {
+                    "when": {"layout": "rows"},
+                    "root": "coll_stack",
+                    "components": [
+                        {
+                            "id": "coll_stack",
+                            "component": "Stack",
+                            "direction": "vertical",
+                            "children": {
+                                "$repeat": "items",
+                                "component": "coll_item",
+                            },
                         },
-                    },
-                    {
-                        "id": "coll_item",
-                        "component": "Stack",
-                        "direction": "vertical",
-                        "children": [
-                            "coll_headline",
-                            {"$if": "supporting", "id": "coll_supporting"},
-                        ],
-                    },
-                    {
-                        "id": "coll_headline",
-                        "component": "Label",
-                        "text": {"$slot": "headline"},
-                    },
-                    {
-                        "id": "coll_supporting",
-                        "component": "Label",
-                        "text": {"$slot": "supporting"},
-                        "tone": "muted",
-                    },
-                ],
-            }],
+                        {
+                            "id": "coll_item",
+                            "component": "Stack",
+                            "direction": "vertical",
+                            "children": [
+                                "coll_headline",
+                                {"$if": "supporting", "id": "coll_supporting"},
+                            ],
+                        },
+                        {
+                            "id": "coll_headline",
+                            "component": "Label",
+                            "text": {"$slot": "headline"},
+                        },
+                        {
+                            "id": "coll_supporting",
+                            "component": "Label",
+                            "text": {"$slot": "supporting"},
+                            "tone": "muted",
+                        },
+                    ],
+                }
+            ],
         },
         "actions": {
             "slots": ["buttons"],
@@ -485,15 +548,17 @@ DESIGN_SYSTEM_PATTERNS: dict[str, Any] = {
         "form": {
             "slots": ["fields"],
             "root": "form_stack",
-            "components": [{
-                "id": "form_stack",
-                "component": "Stack",
-                "direction": "vertical",
-                "children": {
-                    "$repeat": "fields",
-                    "component": {"$byInstance": "control"},
-                },
-            }],
+            "components": [
+                {
+                    "id": "form_stack",
+                    "component": "Stack",
+                    "direction": "vertical",
+                    "children": {
+                        "$repeat": "fields",
+                        "component": {"$byInstance": "control"},
+                    },
+                }
+            ],
             "fieldVariants": {
                 "shortText": copy.deepcopy(_ENTRY_FIELD_VARIANT),
                 "longText": copy.deepcopy(_ENTRY_FIELD_VARIANT),
@@ -511,7 +576,12 @@ DESIGN_SYSTEM_PATTERNS: dict[str, Any] = {
 
 
 def build_broken_patterns() -> dict[str, Any]:
-    """Returns a copy of `DESIGN_SYSTEM_PATTERNS` with one schema and one expand defect."""
+    """Returns a copy of `DESIGN_SYSTEM_PATTERNS` with one schema and one expand defect.
+
+    Returns:
+        A mutated pattern library dictionary containing an invalid component type
+        and a missing root component ID.
+    """
     broken = copy.deepcopy(DESIGN_SYSTEM_PATTERNS)
     # 1. Schema defect: nonexistent component 'Gauge'
     broken["patterns"]["headline"]["components"][1]["component"] = "Gauge"
@@ -535,43 +605,47 @@ FIXED_FORMS_TEMPLATES: dict[str, Any] = {
             "surfaceId": "order_entry_surface",
             "requiredPointers": ["/symbol", "/shares"],
             "isMutable": True,
-            "components": [{
-                "id": "root",
-                "component": "OrderEntryTicket",
-                "symbol": {"@path": "/symbol"},
-                "shares": {"@path": "/shares"},
-                "submitOrder": {
-                    "event": {
-                        "name": "submit_order",
-                        "context": {
-                            "symbol": {"@path": "/symbol"},
-                            "shares": {"@path": "/shares"},
-                        },
-                    }
-                },
-            }],
+            "components": [
+                {
+                    "id": "root",
+                    "component": "OrderEntryTicket",
+                    "symbol": {"@path": "/symbol"},
+                    "shares": {"@path": "/shares"},
+                    "submitOrder": {
+                        "event": {
+                            "name": "submit_order",
+                            "context": {
+                                "symbol": {"@path": "/symbol"},
+                                "shares": {"@path": "/shares"},
+                            },
+                        }
+                    },
+                }
+            ],
         },
         "wire_transfer_form": {
             "description": "Wire transfer form for sending funds to a beneficiary.",
             "surfaceId": "wire_transfer_surface",
             "requiredPointers": ["/beneficiary", "/routingNumber", "/amount"],
             "isMutable": True,
-            "components": [{
-                "id": "root",
-                "component": "WireTransferForm",
-                "beneficiary": {"@path": "/beneficiary"},
-                "routingNumber": {"@path": "/routingNumber"},
-                "amount": {"@path": "/amount"},
-                "sendWire": {
-                    "event": {
-                        "name": "send_wire",
-                        "context": {
-                            "beneficiary": {"@path": "/beneficiary"},
-                            "amount": {"@path": "/amount"},
-                        },
-                    }
-                },
-            }],
+            "components": [
+                {
+                    "id": "root",
+                    "component": "WireTransferForm",
+                    "beneficiary": {"@path": "/beneficiary"},
+                    "routingNumber": {"@path": "/routingNumber"},
+                    "amount": {"@path": "/amount"},
+                    "sendWire": {
+                        "event": {
+                            "name": "send_wire",
+                            "context": {
+                                "beneficiary": {"@path": "/beneficiary"},
+                                "amount": {"@path": "/amount"},
+                            },
+                        }
+                    },
+                }
+            ],
         },
         "tax_withholding_form": {
             "description": (
@@ -581,33 +655,40 @@ FIXED_FORMS_TEMPLATES: dict[str, Any] = {
             "surfaceId": "tax_withholding_surface",
             "requiredPointers": ["/filingStatus", "/allowances"],
             "isMutable": True,
-            "components": [{
-                "id": "root",
-                "component": "TaxWithholdingForm",
-                "filingStatus": {"@path": "/filingStatus"},
-                "allowances": {"@path": "/allowances"},
-                "saveElection": {
-                    "event": {
-                        "name": "save_election",
-                        "context": {
-                            "filingStatus": {"@path": "/filingStatus"},
-                            "allowances": {"@path": "/allowances"},
-                        },
-                    }
-                },
-            }],
+            "components": [
+                {
+                    "id": "root",
+                    "component": "TaxWithholdingForm",
+                    "filingStatus": {"@path": "/filingStatus"},
+                    "allowances": {"@path": "/allowances"},
+                    "saveElection": {
+                        "event": {
+                            "name": "save_election",
+                            "context": {
+                                "filingStatus": {"@path": "/filingStatus"},
+                                "allowances": {"@path": "/allowances"},
+                            },
+                        }
+                    },
+                }
+            ],
         },
     },
 }
 
 
 def build_broken_templates() -> dict[str, Any]:
-    """Returns a copy of `FIXED_FORMS_TEMPLATES` with one schema and one payload defect."""
+    """Returns a copy of `FIXED_FORMS_TEMPLATES` with one schema and one payload defect.
+
+    Returns:
+        A mutated template registry dictionary containing an unknown component type
+        and an unmatched required pointer.
+    """
     broken = copy.deepcopy(FIXED_FORMS_TEMPLATES)
     # 1. Schema defect: nonexistent component 'UnknownTicket'
-    broken["templates"]["order_entry_ticket"]["components"][0][
-        "component"
-    ] = "UnknownTicket"
+    broken["templates"]["order_entry_ticket"]["components"][0]["component"] = (
+        "UnknownTicket"
+    )
     # 2. Payload defect: required pointer not present in FIXED_FORMS_SAMPLE_PAYLOADS
     broken["templates"]["tax_withholding_form"]["requiredPointers"] = [
         "/unmatchedPointer"
@@ -671,7 +752,16 @@ FIXED_FORMS_SAMPLE_PAYLOADS: dict[str, Any] = {
 
 
 def write_json(directory: Path, filename: str, data: Any) -> Path:
-    """Writes `data` as JSON to `directory / filename` and returns the path."""
+    """Writes `data` as JSON to `directory / filename` and returns the path.
+
+    Args:
+        directory: Target directory to create if needed.
+        filename: File basename inside `directory`.
+        data: JSON-serializable payload to write.
+
+    Returns:
+        The resolved `Path` to the written JSON file.
+    """
     target = directory / filename
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

@@ -87,7 +87,6 @@ def _kinds(dicts: list[dict[str, Any]]) -> list[str]:
 
 
 class _FailingBackend(DeterministicMockBackend):
-
     async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
         raise DecisionBackendError(
             "request timed out after 30 s", backend_kind="jev", model_id="jev-1.14.0"
@@ -207,10 +206,12 @@ def test_parser_compiles_several_blocks_with_default_ids() -> None:
     parser = _format().create_parser()
     dicts = to_message_dicts(
         parser.compile(
-            json.dumps([
-                {"intent": HOST.intent, "payload": HOST.payload},
-                {"intent": HOST.intent, "payload": HOST.payload},
-            ])
+            json.dumps(
+                [
+                    {"intent": HOST.intent, "payload": HOST.payload},
+                    {"intent": HOST.intent, "payload": HOST.payload},
+                ]
+            )
         )
     )
     created = [d["createSurface"]["surfaceId"] for d in dicts if "createSurface" in d]
@@ -308,3 +309,65 @@ async def test_render_tool_run_async_fallbacks_and_backend_errors() -> None:
     failing = DecisionRenderTool.create([CATALOG], backend=_FailingBackend())
     with pytest.raises(DecisionBackendError):
         await failing.run_async(BLOCK)
+
+
+@pytest.mark.asyncio
+async def test_render_tool_region_update_does_not_overwrite_cached_full_plan() -> None:
+    tool = DecisionRenderTool.create(
+        [CATALOG], backend=mock_backend(**HOST_SCRIPTED), surface_id="ops"
+    )
+    first = await tool.run_async({"intent": HOST.intent, "payload": dict(HOST.payload)})
+    assert first.cache_hit is False
+    assert any(
+        c.get("id") == "root"
+        for d in to_message_dicts(first.messages)
+        for c in d.get("updateComponents", {}).get("components", [])
+    )
+
+    region_out = await tool.run_async(
+        {
+            "intent": HOST.intent,
+            "payload": dict(HOST.payload),
+            "region": "headline",
+        }
+    )
+    assert region_out.cache_hit is False
+
+    # Hitting the full-surface tool cache and promoting still have `root`.
+    second = await tool.run_async(
+        {"intent": HOST.intent, "payload": {**HOST.payload, "cpu": 0.42}}
+    )
+    assert second.cache_hit is True
+    assert any(
+        c.get("id") == "root"
+        for d in to_message_dicts(second.messages)
+        for c in d.get("updateComponents", {}).get("components", [])
+    )
+
+    tpl = tool.promote("ops_full_tpl", "Full host template")
+    assert any(c.get("id") == "root" for c in tpl.components)
+
+
+def test_decision_format_conversation_states_lru_and_clear_conversation() -> None:
+    with pytest.raises(ValueError, match="max_conversations"):
+        DecisionFormat(
+            [CATALOG],
+            backend=mock_backend(**HOST_SCRIPTED),
+            max_conversations=0,
+        )
+    fmt = DecisionFormat(
+        [CATALOG],
+        backend=mock_backend(**HOST_SCRIPTED),
+        max_conversations=2,
+    )
+    s1 = fmt.state_for("c1")
+    s2 = fmt.state_for("c2")
+    assert fmt.state_for("c1") is s1
+    # Touching `c1` makes `c2` the oldest when `c3` is created.
+    s3 = fmt.state_for("c3")
+    assert fmt.state_for("c1") is s1
+    assert fmt.state_for("c3") is s3
+    assert fmt.state_for("c2") is not s2
+
+    fmt.clear_conversation("c1")
+    assert fmt.state_for("c1") is not s1

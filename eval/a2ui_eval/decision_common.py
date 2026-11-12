@@ -104,6 +104,7 @@ DECISION_METADATA_KEYS: tuple[str, ...] = (
     "decision_confidence",
     "decision_fit_score",
     "decision_cache_hit",
+    "decision_family",
     "decision_archetype",
     "decision_template_id",
     "decision_block",
@@ -145,7 +146,15 @@ DEFAULT_DECISION_BLOCK_EXAMPLES: tuple[DecisionBlock, ...] = (
 
 
 def is_transcrypt_ciphertext(path: str | Path) -> bool:
-    """Returns True when `path` appears to hold encrypted Transcrypt ciphertext."""
+    """Returns whether `path` appears to hold encrypted Transcrypt ciphertext.
+
+    Args:
+        path: File path to inspect for OpenSSL salted ciphertext prefixes or
+            non-UTF-8 binary header bytes.
+
+    Returns:
+        Whether the file exists and starts with a Transcrypt ciphertext header.
+    """
     file_path = Path(path)
     if not file_path.is_file():
         return False
@@ -153,6 +162,7 @@ def is_transcrypt_ciphertext(path: str | Path) -> bool:
         prefix = file_path.read_bytes()[:16]
     except OSError:
         return False
+    # OpenSSL salted ciphertexts start with base64 'U2FsdGVkX1' or raw 'Salted__'.
     if prefix.startswith(b"U2FsdGVkX1") or prefix.startswith(b"Salted__"):
         return True
     try:
@@ -163,12 +173,26 @@ def is_transcrypt_ciphertext(path: str | Path) -> bool:
 
 
 def p95_target_for_backend(backend_kind: str) -> float:
-    """Returns the default P95 latency target (in ms) for `backend_kind`."""
+    """Returns the default P95 latency target in milliseconds for `backend_kind`.
+
+    Args:
+        backend_kind: Canonical decision backend kind name.
+
+    Returns:
+        Target 95th-percentile latency in milliseconds.
+    """
     return DEFAULT_P95_TARGETS_MS.get(backend_kind.strip().lower(), 250.0)
 
 
 def rewrite_question_prompt(prompt: str) -> str:
-    """Rewrites `prompt` deterministically using `PARAPHRASE_PROMPT_TABLE`."""
+    """Rewrites `prompt` deterministically using `PARAPHRASE_PROMPT_TABLE`.
+
+    Args:
+        prompt: Original decision question prompt text.
+
+    Returns:
+        Deterministically paraphrased question prompt text.
+    """
     stripped = prompt.strip()
     if not stripped:
         return prompt
@@ -176,6 +200,7 @@ def rewrite_question_prompt(prompt: str) -> str:
     for src, dst in PARAPHRASE_PROMPT_TABLE:
         if src in updated:
             updated = updated.replace(src, dst)
+    # Fall back to a deterministic prefix when no table entry matched.
     if updated == stripped:
         body = stripped.rstrip("?.:")
         return f"Evaluate question: {body}."
@@ -186,26 +211,43 @@ class ParaphraseDecisionBackend(DecisionBackend):
     """Wraps a `DecisionBackend` and rewrites every question prompt before scoring."""
 
     def __init__(self, inner: DecisionBackend) -> None:
+        """Initializes the paraphrase wrapper around `inner`.
+
+        Args:
+            inner: Underlying decision backend that scores rewritten batches.
+        """
         self._inner = inner
 
     @property
     def backend_kind(self) -> str:
+        """Returns the underlying backend kind identifier."""
         return self._inner.backend_kind
 
     @property
     def model_id(self) -> str:
+        """Returns the underlying backend model identifier."""
         return self._inner.model_id
 
     @property
     def capabilities(self) -> BackendCapabilities:
+        """Returns the underlying backend capabilities."""
         return self._inner.capabilities
 
     @property
     def last_call_latency_ms(self) -> float | None:
+        """Returns the most recent call latency in milliseconds, if recorded."""
         val = getattr(self._inner, "last_call_latency_ms", None)
         return float(val) if isinstance(val, (int, float)) else None
 
     async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
+        """Rewrites all question prompts in `batch` and delegates to `_inner`.
+
+        Args:
+            batch: Decision batch containing shared context and questions.
+
+        Returns:
+            Tuple of decision answers returned by the wrapped backend.
+        """
         rewritten = tuple(
             replace(q, prompt=rewrite_question_prompt(q.prompt))
             for q in batch.questions
@@ -217,20 +259,31 @@ class ParaphraseDecisionBackend(DecisionBackend):
         return await self._inner.answer(paraphrased_batch)
 
     async def aclose(self) -> None:
+        """Closes the wrapped backend across all event loops."""
         await self._inner.aclose()
 
     async def aclose_current_loop(self) -> None:
+        """Closes resources bound to the active event loop on `_inner`."""
         await self._inner.aclose_current_loop()
 
     async def __aenter__(self) -> ParaphraseDecisionBackend:
+        """Enters the async context manager."""
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        """Closes the wrapped backend on context exit."""
         await self.aclose()
 
 
 def _has_jev_credentials(endpoint_url: str | None) -> bool:
-    """Checks whether Jev credentials or an explicit endpoint URL exist."""
+    """Checks whether Jev credentials or an explicit endpoint URL exist.
+
+    Args:
+        endpoint_url: Optional explicit HTTP endpoint URL override.
+
+    Returns:
+        Whether sufficient endpoint or API key configuration is present.
+    """
     if endpoint_url or os.environ.get("A2UI_DECISION_URL"):
         return True
     return bool(
@@ -242,7 +295,14 @@ def _has_jev_credentials(endpoint_url: str | None) -> bool:
 
 
 def _has_gemini_credentials(endpoint_url: str | None) -> bool:
-    """Checks whether Gemini Decisions API credentials or an explicit endpoint URL exist."""
+    """Checks whether Gemini Decisions API credentials or an endpoint URL exist.
+
+    Args:
+        endpoint_url: Optional explicit HTTP endpoint URL override.
+
+    Returns:
+        Whether sufficient endpoint or API key configuration is present.
+    """
     if endpoint_url or os.environ.get("A2UI_DECISION_URL"):
         return True
     return bool(
@@ -261,6 +321,16 @@ def build_decision_backend(
     calibration: Calibration | Path | None = None,
 ) -> DecisionBackend:
     """Instantiates a `DecisionBackend` explicitly or from `A2UI_DECISION_BACKEND`.
+
+    Args:
+        name: Optional backend preset name (`mock`, `jev`, `gemini`,
+            `systemone`, or `step0`).
+        endpoint_url: Optional endpoint URL override for HTTP backends.
+        model: Optional model identifier override.
+        calibration: Optional calibration profile instance or JSON path.
+
+    Returns:
+        Configured `DecisionBackend` instance.
 
     Raises:
         ValueError: If no backend is specified (neither `name` nor
@@ -315,26 +385,44 @@ def build_decision_backend(
 
 def _first_plan_info(
     outputs: Sequence[SynthesisOutput],
-) -> tuple[str | None, str | None, list[str], float | None]:
-    """Extracts `(archetype, template_id, block_ids, fit_score)` from `outputs`."""
+) -> tuple[str | None, str | None, str | None, list[str], float | None]:
+    """Extracts `(family, archetype, template_id, block_ids, fit_score)` from `outputs`.
+
+    Args:
+        outputs: Sequence of synthesis outputs produced for a turn.
+
+    Returns:
+        Tuple of `(family, archetype, template_id, block_ids, fit_score)` from
+        the first output with a template or layout plan.
+    """
     for out in outputs:
         fit = out.layout_plan.fit_score if out.layout_plan is not None else None
+        fam = out.layout_plan.family or None if out.layout_plan is not None else None
         if out.selected_template_id is not None:
-            return None, out.selected_template_id, [], fit
+            return fam, None, out.selected_template_id, [], fit
         if out.layout_plan is not None:
             return (
+                fam,
                 out.layout_plan.archetype or None,
                 out.layout_plan.template_id,
                 list(out.layout_plan.block_ids()),
                 fit,
             )
-    return None, None, [], None
+    return None, None, None, [], None
 
 
 def _first_fallback_info(
     outputs: Sequence[SynthesisOutput],
 ) -> tuple[str | None, str | None]:
-    """Extracts `(fallback_source, fallback_reason)` from `outputs`."""
+    """Extracts `(fallback_source, fallback_reason)` from `outputs`.
+
+    Args:
+        outputs: Sequence of synthesis outputs produced for a turn.
+
+    Returns:
+        Tuple of `(fallback_source, fallback_reason)` for the first output
+        that triggered a fallback, or `(None, None)`.
+    """
     for out in outputs:
         if out.fallback_source is not None or out.fallback_reason is not None:
             source = (
@@ -352,7 +440,16 @@ def decision_metadata(
     backend_name: str,
     block: DecisionBlock | None = None,
 ) -> dict[str, Any]:
-    """Aggregates metrics and diagnostics from synthesized outputs into task metadata."""
+    """Aggregates metrics and diagnostics from synthesized outputs into task metadata.
+
+    Args:
+        outputs: Sequence of synthesis outputs produced for a turn.
+        backend_name: Logical backend label configured for the evaluation run.
+        block: Optional parsed `DecisionBlock` from the first `<a2ui>` fence.
+
+    Returns:
+        Dictionary mapping `DECISION_METADATA_KEYS` to aggregated turn metrics.
+    """
     latency_ms = sum(out.decision_latency_ms for out in outputs)
     calls = sum(out.decision_calls for out in outputs)
     confidence = min((out.confidence for out in outputs), default=0.0)
@@ -364,7 +461,7 @@ def decision_metadata(
         first.backend_kind if first is not None and first.backend_kind else ""
     ) or backend_name
     model_id = first.model_id if first is not None else ""
-    archetype, template_id, blocks, fit_score = _first_plan_info(outputs)
+    family, archetype, template_id, blocks, fit_score = _first_plan_info(outputs)
     fallback_source, fallback_reason = _first_fallback_info(outputs)
     answers_count = sum(len(out.decision_answers) for out in outputs)
     block_dict = block.to_json() if block is not None else None
@@ -379,6 +476,7 @@ def decision_metadata(
         "decision_confidence": confidence,
         "decision_fit_score": fit_score,
         "decision_cache_hit": cache_hit,
+        "decision_family": family,
         "decision_archetype": archetype,
         "decision_template_id": template_id,
         "decision_block": block_dict,

@@ -545,7 +545,14 @@ _TITLE_KEY_HINTS = frozenset({
 
 
 def prose_length_level(word_count: int) -> str:
-    """Maps a word count to the `prose.measures.length` level name."""
+    """Maps a word count to the `prose.measures.length` level name.
+
+    Args:
+        word_count: Number of whitespace-separated words in the text.
+
+    Returns:
+        One of ``"line"``, ``"blurb"``, ``"summary"``, or ``"article"``.
+    """
     if word_count < 15:
         return "line"
     if word_count < 60:
@@ -571,6 +578,12 @@ def humanize_key(key: str) -> str:
 
     ``"priceFrom"`` becomes ``"Price from"`` and ``"skip_forward"`` becomes
     ``"Skip forward"``.
+
+    Args:
+        key: Raw JSON key or unescaped pointer segment.
+
+    Returns:
+        A sentence-cased display label, or ``""`` if `key` has no tokens.
     """
     tokens = _split_key_tokens(key)
     if not tokens:
@@ -981,13 +994,13 @@ def classify_scalar(
     `SemanticType.CURRENCY` before `SemanticType.INTEGER`.
 
     Args:
-      value: The runtime payload value at the pointer.
-      key: The unescaped JSON key or last pointer segment.
-      siblings: Optional parent mapping for sibling-aware rules (`bounded`
-        `min`/`max`, sibling `currency` or `unit`).
+        value: Runtime payload value at the pointer.
+        key: Unescaped JSON key or last pointer segment.
+        siblings: Optional parent mapping for sibling-aware rules (`bounded`
+            `min`/`max`, sibling `currency` or `unit`).
 
     Returns:
-      A ``(SemanticType, hints)`` pair.
+        A ``(SemanticType, hints)`` pair.
     """
     container_type = _classify_container(value)
     if container_type is not None:
@@ -1015,10 +1028,14 @@ def _non_empty_array_entries(
     values: Sequence[Any],
     siblings_per_item: Sequence[Mapping[str, Any]] | None,
 ) -> list[tuple[Any, Mapping[str, Any] | None]]:
-    """Filters out `None` and blank string entries while pairing item siblings."""
+    """Filters out `None`, blank strings, and empty containers while pairing siblings."""
     entries: list[tuple[Any, Mapping[str, Any] | None]] = []
     for idx, val in enumerate(values):
-        if val is None or (isinstance(val, str) and not val.strip()):
+        if (
+            val is None
+            or (isinstance(val, str) and not val.strip())
+            or _classify_container(val) is SemanticType.EMPTY
+        ):
             continue
         sib = (
             siblings_per_item[idx]
@@ -1030,7 +1047,9 @@ def _non_empty_array_entries(
 
 
 def _classify_string_array_column(
-    values: Sequence[str], first_type: SemanticType
+    values: Sequence[str],
+    first_type: SemanticType,
+    first_hints: Mapping[str, Any] | None = None,
 ) -> SemanticType:
     """Refines a string column into `STATUS` or `ENUM` using column statistics."""
     normalized = [v.strip().lower() for v in values]
@@ -1039,6 +1058,10 @@ def _classify_string_array_column(
     distinct = set(normalized)
     if 1 <= len(distinct) <= 12 and len(distinct) * 2 <= len(normalized):
         return SemanticType.ENUM
+    if first_type is SemanticType.STATUS and (
+        not first_hints or "keyHint" not in first_hints
+    ):
+        return SemanticType.STRING
     return first_type
 
 
@@ -1054,13 +1077,22 @@ def classify_array_field(
     `SemanticType.ENUM` (low distinct ratio `<= 12` distinct values with
     `<= 50%` uniqueness across non-empty string values) while delegating format
     and key-hint classification to `classify_scalar`.
+
+    Args:
+        values: Column values extracted across array elements.
+        key: Unescaped field key or array pointer segment.
+        siblings_per_item: Optional per-element sibling mappings parallel to
+            `values`.
+
+    Returns:
+        The resolved `SemanticType` for the column.
     """
     non_empty = _non_empty_array_entries(values, siblings_per_item)
     if not non_empty:
         return SemanticType.EMPTY
 
     first_val, first_sib = non_empty[0]
-    first_type, _ = classify_scalar(first_val, key, siblings=first_sib)
+    first_type, first_hints = classify_scalar(first_val, key, siblings=first_sib)
     raw_vals = [v for v, _ in non_empty]
 
     if all(isinstance(v, str) for v in raw_vals) and first_type in {
@@ -1068,7 +1100,9 @@ def classify_array_field(
         SemanticType.STATUS,
         SemanticType.ENUM,
     }:
-        return _classify_string_array_column([str(v) for v in raw_vals], first_type)
+        return _classify_string_array_column(
+            [str(v) for v in raw_vals], first_type, first_hints
+        )
 
     if first_type == SemanticType.INTEGER and any(
         isinstance(v, float) for v in raw_vals

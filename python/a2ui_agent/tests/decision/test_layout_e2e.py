@@ -304,11 +304,13 @@ def test_format_factory_through_request_processor_with_layout_brief() -> None:
         catalogs=[CATALOG],
         format_factory=DecisionFormatFactory(backend=mock_backend(**RESORT_SCRIPTED)),
     )
-    decision_json = json.dumps({
-        "intent": RESORT.intent,
-        "payload": RESORT.payload,
-        "layout": ["headline:priceFrom,rating", "prose:about"],
-    })
+    decision_json = json.dumps(
+        {
+            "intent": RESORT.intent,
+            "payload": RESORT.payload,
+            "layout": ["headline:priceFrom,rating", "prose:about"],
+        }
+    )
     parts = processor.parse_response(f"Resort:\n<a2ui>{decision_json}</a2ui>")
     a2ui_parts = [p for p in parts if isinstance(p, A2uiPart)]
     assert len(a2ui_parts) == 1
@@ -319,11 +321,13 @@ def test_render_tool_run_sync_with_layout_and_trace() -> None:
     synth = DecisionSynthesizer([CATALOG], mock_backend(**RESORT_SCRIPTED))
     tool = DecisionRenderTool(synth, include_trace=True)
     assert tool.parameters_json_schema()["properties"]["layout"]["maxItems"] == 6
-    out = tool.run_sync({
-        "intent": RESORT.intent,
-        "payload": RESORT.payload,
-        "layout": ["headline:priceFrom,rating", "prose:about"],
-    })
+    out = tool.run_sync(
+        {
+            "intent": RESORT.intent,
+            "payload": RESORT.payload,
+            "layout": ["headline:priceFrom,rating", "prose:about"],
+        }
+    )
     result = tool.format_result(out)
     assert result["stage"] == "archetype"
     assert result["layoutPlan"] == {
@@ -351,10 +355,12 @@ async def test_edge_cases_empty_identifiers_60_pointers_and_bad_answers() -> Non
 
     grammar = ArchetypeGrammar.default()
     lib = MergedPatternLibrary.for_catalogs([CATALOG])
-    id_ptrs = inspect_payload_pointers({
-        "id": "usr_12345",
-        "uuid": "550e8400-e29b-41d4-a716-446655440000",
-    })
+    id_ptrs = inspect_payload_pointers(
+        {
+            "id": "usr_12345",
+            "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        }
+    )
     el_ids = {a.id for a in eligible_archetypes(grammar, lib, id_ptrs)}
     assert "dashboard" not in el_ids and "feed" not in el_ids
 
@@ -366,7 +372,6 @@ async def test_edge_cases_empty_identifiers_60_pointers_and_bad_answers() -> Non
     assert state.budget_exhausted is True
 
     class TruncatedAnswerBackend(DeterministicMockBackend):
-
         async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
             return (await super().answer(batch))[:-1]
 
@@ -430,37 +435,43 @@ async def test_required_block_wins_markdown_escape_and_multi_catalog() -> None:
     heading = next(c for c in prose.components if "Section" in str(c.get("text", "")))
     assert "\n" not in heading["text"] and r"\#1" in heading["text"]
 
-    secondary = Catalog.from_json({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "catalogId": "https://example.com/catalogs/domain_sec/v1/catalog.json",
-        "protocolVersion": "1.0",
-        "components": {
-            "DomainBanner": {
-                "type": "object",
-                "properties": {
-                    "component": {"const": "DomainBanner"},
-                    "title": {"$ref": "common_types.json#/$defs/DynamicString"},
+    secondary = Catalog.from_json(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "catalogId": "https://example.com/catalogs/domain_sec/v1/catalog.json",
+            "protocolVersion": "1.0",
+            "components": {
+                "DomainBanner": {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "DomainBanner"},
+                        "title": {"$ref": "common_types.json#/$defs/DynamicString"},
+                    },
+                    "required": ["component", "title"],
                 },
-                "required": ["component", "title"],
             },
-        },
-    })
+        }
+    )
     basic_lib = MergedPatternLibrary.for_catalogs([CATALOG]).libraries[0]
-    sec_lib = PatternLibrary.from_json({
-        "grammarVersion": basic_lib.grammar_version,
-        "catalogId": secondary.catalog_id,
-        "patterns": {
-            "banner": {
-                "slots": ["title"],
-                "root": "sec_banner",
-                "components": [{
-                    "id": "sec_banner",
-                    "component": "DomainBanner",
-                    "title": {"$slot": "title"},
-                }],
+    sec_lib = PatternLibrary.from_json(
+        {
+            "grammarVersion": basic_lib.grammar_version,
+            "catalogId": secondary.catalog_id,
+            "patterns": {
+                "banner": {
+                    "slots": ["title"],
+                    "root": "sec_banner",
+                    "components": [
+                        {
+                            "id": "sec_banner",
+                            "component": "DomainBanner",
+                            "title": {"$slot": "title"},
+                        }
+                    ],
+                },
             },
-        },
-    })
+        }
+    )
     merged = MergedPatternLibrary([basic_lib, sec_lib])
     assert merged.owner_catalog_id("banner") == basic_lib.catalog_id
     multi_out = await DecisionSynthesizer(
@@ -478,10 +489,12 @@ def test_factory_compiles_from_several_threads() -> None:
 
     def compile_in_thread(idx: int) -> int:
         parser = factory.create_format([CATALOG]).create_parser()
-        raw = json.dumps({
-            "intent": HOST.intent,
-            "payload": {**HOST.payload, "host": f"prod-{idx}"},
-        })
+        raw = json.dumps(
+            {
+                "intent": HOST.intent,
+                "payload": {**HOST.payload, "host": f"prod-{idx}"},
+            }
+        )
         return len(parser.compile(f"<a2ui>{raw}</a2ui>"))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:

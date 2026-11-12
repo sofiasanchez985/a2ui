@@ -25,7 +25,6 @@ from a2ui.core import A2uiValidationError
 
 from .archetypes import (
     ABSTRACT_PATTERNS,
-    FALLBACK_TERMINALS,
     ArchetypeGrammar,
     BlockRef,
     BlockSpec,
@@ -63,59 +62,71 @@ from .template_registry import SurfaceTemplate
 
 _PATTERN_VARIANT_REQ_RE = re.compile(r"^pattern:([a-z_]+):([a-z_]+)$")
 
-_NUMERIC_SEMANTIC_TYPES: frozenset[str] = frozenset({
-    "number",
-    "integer",
-    "count",
-    "currency",
-    "percent",
-    "ratio",
-    "quantity",
-    "rating",
-    "bounded",
-    "duration",
-})
-_TEXT_FALLBACK_TYPES: frozenset[str] = frozenset({
-    "string",
-    "name",
-    "title",
-    "identifier",
-})
-_PAGE_TITLE_KEYS: frozenset[str] = frozenset({
-    "title",
-    "name",
-    "subject",
-    "heading",
-})
-_MARK_KEY_HINTS: frozenset[str] = frozenset({
-    "logo",
-    "icon",
-    "avatar",
-})
-_NON_FACT_SEMANTIC_TYPES: frozenset[str] = frozenset({
-    "image_url",
-    "video_url",
-    "audio_url",
-    "document_url",
-    "long_text",
-    "markdown",
-    "code",
-    "array",
-    "object",
-    "empty",
-})
+_NUMERIC_SEMANTIC_TYPES: frozenset[str] = frozenset(
+    {
+        "number",
+        "integer",
+        "count",
+        "currency",
+        "percent",
+        "ratio",
+        "quantity",
+        "rating",
+        "bounded",
+        "duration",
+    }
+)
+_TEXT_FALLBACK_TYPES: frozenset[str] = frozenset(
+    {
+        "string",
+        "name",
+        "title",
+        "identifier",
+    }
+)
+_PAGE_TITLE_KEYS: frozenset[str] = frozenset(
+    {
+        "title",
+        "name",
+        "subject",
+        "heading",
+    }
+)
+_MARK_KEY_HINTS: frozenset[str] = frozenset(
+    {
+        "logo",
+        "icon",
+        "avatar",
+    }
+)
+_NON_FACT_SEMANTIC_TYPES: frozenset[str] = frozenset(
+    {
+        "image_url",
+        "video_url",
+        "audio_url",
+        "document_url",
+        "long_text",
+        "markdown",
+        "code",
+        "array",
+        "object",
+        "empty",
+    }
+)
 _OPTIONAL_TEXT_KEYS: Mapping[str, frozenset[str]] = {
     "caption": frozenset({"caption", "alt", "subtitle", "title"}),
     "heading": frozenset({"heading", "title", "header", "subject"}),
-    "text": frozenset({
-        "text",
-        "message",
-        "detail",
-        "description",
-        "summary",
-        "body",
-        "reason",
-    }),
+    "text": frozenset(
+        {
+            "text",
+            "message",
+            "detail",
+            "description",
+            "summary",
+            "body",
+            "reason",
+        }
+    ),
 }
 
 
@@ -123,13 +134,43 @@ class _AllCapabilities:
     """Default `PatternCapabilities` used when no catalog capabilities are passed."""
 
     def has_pattern(self, name: str, variant: str | None = None) -> bool:
+        """Returns whether `name` is one of the grammar's `ABSTRACT_PATTERNS`."""
         del variant
         return name in ABSTRACT_PATTERNS
 
 
 @dataclass
 class PlannerState:
-    """State carried from `LayoutPlanner.build_batch` into `read`."""
+    """State carried from `LayoutPlanner.build_batch` into `read`.
+
+    Attributes:
+        intent: Natural-language intent describing the surface to render.
+        pointers: Normalized payload pointer summaries available for binding.
+        eligible: Ordered tuple of eligible `LayoutArchetype` candidates.
+        prior_archetypes: Archetype IDs selected within the speculative pair budget.
+        brief: Optional `LayoutBrief` pinning roles to payload pointers.
+        batch: Compiled `DecisionBatch` of questions sent to the decision backend.
+        payload: Raw data model dictionary being bound.
+        derived_anatomy: Deterministic `(block_id, knob_name)` answers bypassed from batching.
+        budget_exhausted: Whether the speculative pair budget was reached during batch compilation.
+        trace: Chronological list of `DecisionRecord` entries accumulated during planning.
+        answers_by_id: Map of question ID to `DecisionAnswer` returned by the backend.
+        salience_scores: Map of `"<block_id>:<pointer>"` to salience score.
+        gate_probabilities: Map of block ID to gate `yes` probability.
+        selected_archetype: Winning `LayoutArchetype`, once chosen.
+        page_claimed_pointers: Pointers claimed by the page frame (title, subtitle, mark).
+        action_gate_blocked: Whether the `action-gate` rule vetoed an `act` plan.
+        required_block_missing: Whether a required block (`!`) failed to bind or resolve.
+        copy: Optional `AuthoredCopy` (surface title and summary).
+        templates: Registered `SurfaceTemplate` entries matching the payload's pointers.
+        actions: Declared `ActionSpec` items from the decision block.
+        labels: Agent-supplied display labels keyed by normalized JSON Pointer.
+        exclude: JSON Pointers excluded from rendering and orphan recovery.
+        orphan_pointers: Pointers placed by `apply_no_orphaned_pointers` during `read`.
+        region_plan: Cached `LayoutPlan` when planning a single-block region update.
+        region_block_id: Target block ID when planning a single-block region update.
+        region_used_pointers: Pointers already bound outside `region_block_id` on `region_plan`.
+    """
 
     intent: str
     pointers: tuple[PointerSummary, ...]
@@ -1051,10 +1092,14 @@ def _bind_groups_slot(
             }
             for row in child_rows
         )
-        group_items.append({
-            "heading": SlotBinding(literal=obj_ptr.label or humanize_key(obj_ptr.key)),
-            "rows": SlotBinding(items=row_items),
-        })
+        group_items.append(
+            {
+                "heading": SlotBinding(
+                    literal=obj_ptr.label or humanize_key(obj_ptr.key)
+                ),
+                "rows": SlotBinding(items=row_items),
+            }
+        )
     if not group_items:
         return SlotBinding()
     return SlotBinding(items=tuple(group_items))
@@ -1189,10 +1234,10 @@ def _resolve_block_pattern(
     spec: BlockSpec, capabilities: PatternCapabilities
 ) -> tuple[str, dict[str, str]] | None:
     """Walks `spec.fallback` against `capabilities`, returning ``(pattern, preset_knobs)``."""
+    # Check every candidate (including terminal patterns) against capabilities
+    # so custom catalogs that omit `prose` or `facts` return None cleanly.
     candidates = (spec.pattern, *spec.fallback)
     for entry in candidates:
-        if entry in FALLBACK_TERMINALS:
-            return entry, {}
         pat_name, _, knob_val = entry.partition(":")
         if knob_val:
             if capabilities.has_pattern(pat_name, knob_val):
@@ -2121,7 +2166,7 @@ def _reorder_and_enforce_actions(block: PlannedBlock, stakes: float) -> PlannedB
         return block
     records = _extract_button_records(buttons.items, block.instances, stakes)
     sort_idx = 4 if (stakes >= 2.0 and any(r[4] for r in records)) else 3
-    records.sort(key=lambda r: (1 if r[sort_idx] else 0))
+    records.sort(key=lambda r: 1 if r[sort_idx] else 0)
     new_items = tuple(r[0] for r in records)
     new_instances: dict[str, dict[str, str]] = {}
     for idx, (_, act_id, label, is_prim, is_dest) in enumerate(records):
@@ -2184,8 +2229,10 @@ def apply_urgency_terse(
     caps = capabilities or _AllCapabilities()
     has_page = caps.has_pattern("page")
     archetype = state.selected_archetype
+    # Keep `prose` when it is required or when dropping it would violate `archetype.at_least`.
     prose_req = (
         archetype.requirement_of("prose") == "required"
+        or len(plan.blocks) <= archetype.at_least
         if archetype is not None
         else False
     )
@@ -2306,6 +2353,7 @@ class LayoutPlanner:
         *,
         capabilities: PatternCapabilities | None = None,
     ) -> None:
+        """Initializes a layout planner with a grammar, config, and pattern capabilities."""
         self._grammar = grammar or ArchetypeGrammar.default()
         self._config = config or SynthesisConfig()
         self._capabilities: PatternCapabilities = (
@@ -2517,6 +2565,7 @@ class LayoutPlanner:
         grammar_order = {a.id: idx for idx, a in enumerate(self._grammar.archetypes)}
 
         def _sort_key(arch: LayoutArchetype) -> tuple[int, int, int]:
+            """Scores `arch` by brief pin priority, satisfied block shapes, and grammar order."""
             is_pinned = 0
             if arch.family in pinned_families:
                 is_pinned = 2
@@ -2765,13 +2814,14 @@ class LayoutPlanner:
         return True
 
     def _pinned_families(self, state: PlannerState) -> list[str]:
-        """Returns non-`none` family roles pinned by `state.brief`."""
+        """Returns non-`none` eligible family roles pinned by `state.brief`."""
         if state.brief is None:
             return []
+        eligible_fams = {a.family for a in state.eligible}
         return [
             r
             for r in state.brief.roles()
-            if r != "none" and r in self._grammar.families()
+            if r != "none" and r in self._grammar.families() and r in eligible_fams
         ]
 
     def _append_template_question(
@@ -3967,7 +4017,9 @@ class LayoutPlanner:
     def _read_family(self, state: PlannerState) -> str | None:
         """Resolves the winning family ID from `brief` or the `family` answer."""
         pinned_fam = self._brief_pinned_family(state.brief)
-        if pinned_fam is not None:
+        if pinned_fam is not None and any(
+            a.family == pinned_fam for a in state.eligible
+        ):
             return pinned_fam
         q_map = {q.id: q for q in state.batch.questions}
         fam_q = q_map.get("family")
@@ -4075,7 +4127,10 @@ class LayoutPlanner:
         state: PlannerState,
     ) -> bool:
         """Checks whether cumulative two-stage `none` probability exceeds the no-fit limit."""
-        if self._brief_pinned_family(state.brief) is not None:
+        pinned_fam = self._brief_pinned_family(state.brief)
+        if pinned_fam is not None and any(
+            a.family == pinned_fam for a in state.eligible
+        ):
             return False
         fam_none = (
             fam_ans.distribution.probabilities.get("none", 0.0)

@@ -25,17 +25,19 @@ from a2ui.inference_formats.decision import (
     DeterministicMockBackend,
 )
 
-HOST_BLOCK: str = json.dumps({
-    "intent": "Show CPU utilization for prod-1",
-    "payload": {
-        "host": "prod-1",
-        "cpu": 0.78,
-        "cpuDelta": 0.12,
-        "status": "degraded",
-        "uptimeHours": 412,
-    },
-    "layout": ["headline:cpu,cpuDelta,status", "facts:host,uptimeHours"],
-})
+HOST_BLOCK: str = json.dumps(
+    {
+        "intent": "Show CPU utilization for prod-1",
+        "payload": {
+            "host": "prod-1",
+            "cpu": 0.78,
+            "cpuDelta": 0.12,
+            "status": "degraded",
+            "uptimeHours": 412,
+        },
+        "layout": ["headline:cpu,cpuDelta,status", "facts:host,uptimeHours"],
+    }
+)
 
 HOST_DECISION_BLOCK: DecisionBlock = DecisionBlock.from_mapping(json.loads(HOST_BLOCK))
 
@@ -57,21 +59,23 @@ HOST_ANSWERS: dict[str, Any] = {
     "instance:headline.state_tone:/status": ("warning", 0.80),
 }
 
-TRANSFER_BLOCK: str = json.dumps({
-    "intent": "Confirm sending $50 to Alex before it goes through",
-    "payload": {
-        "amount": 50,
-        "currency": "USD",
-        "recipient": "Alex Chen",
-        "fee": 0.5,
-        "arrives": "2026-10-24",
-    },
-    "actions": {
-        "send": "Send",
-        "cancel": "Cancel",
-    },
-    "layout": ["facts:amount,recipient,fee,arrives"],
-})
+TRANSFER_BLOCK: str = json.dumps(
+    {
+        "intent": "Confirm sending $50 to Alex before it goes through",
+        "payload": {
+            "amount": 50,
+            "currency": "USD",
+            "recipient": "Alex Chen",
+            "fee": 0.5,
+            "arrives": "2026-10-24",
+        },
+        "actions": {
+            "send": "Send",
+            "cancel": "Cancel",
+        },
+        "layout": ["facts:amount,recipient,fee,arrives"],
+    }
+)
 
 TRANSFER_DECISION_BLOCK: DecisionBlock = DecisionBlock.from_mapping(
     json.loads(TRANSFER_BLOCK)
@@ -93,20 +97,22 @@ TRANSFER_ANSWERS: dict[str, Any] = {
     "salience:/arrives": 1.7,
 }
 
-SETTINGS_BLOCK: str = json.dumps({
-    "intent": "Playback and notification settings",
-    "payload": {
-        "playback": {
-            "skipForward": "30 seconds",
-            "autoDownload": True,
-            "speed": 1.25,
+SETTINGS_BLOCK: str = json.dumps(
+    {
+        "intent": "Playback and notification settings",
+        "payload": {
+            "playback": {
+                "skipForward": "30 seconds",
+                "autoDownload": True,
+                "speed": 1.25,
+            },
+            "notifications": {"newEpisodes": True, "digest": False},
+            "account": {"signOut": "Sign out"},
         },
-        "notifications": {"newEpisodes": True, "digest": False},
-        "account": {"signOut": "Sign out"},
-    },
-    "layout": ["groups:/playback,/notifications,/account"],
-    "mutablePaths": ["/playback", "/notifications", "/account"],
-})
+        "layout": ["groups:/playback,/notifications,/account"],
+        "mutablePaths": ["/playback", "/notifications", "/account"],
+    }
+)
 
 SETTINGS_DECISION_BLOCK: DecisionBlock = DecisionBlock.from_mapping(
     json.loads(SETTINGS_BLOCK)

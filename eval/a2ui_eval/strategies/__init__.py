@@ -49,6 +49,7 @@ def _format_strategy(format_name: str) -> Callable[..., list[Solver]]:
     """Builds the factory for a strategy that is one inference format."""
 
     def build(version: str, **options: Any) -> list[Solver]:
+        """Constructs the solver chain for `format_name` at `version`."""
         return format_solver(
             format_name,
             version,
@@ -60,6 +61,7 @@ def _format_strategy(format_name: str) -> Callable[..., list[Solver]]:
 
 
 def _subagent_strategy(version: str, **options: Any) -> list[Solver]:
+    """Constructs the subagent tool strategy solver chain."""
     return subagent_tool_strategy(
         version,
         subagent_format=options.get("subagent_format") or "direct_json",
@@ -68,6 +70,7 @@ def _subagent_strategy(version: str, **options: Any) -> list[Solver]:
 
 
 def _skill_mode(version: str, **options: Any) -> list[Solver]:
+    """Constructs the skill mode strategy solver chain."""
     return skill_mode_strategy(
         "express",
         version,
@@ -76,6 +79,7 @@ def _skill_mode(version: str, **options: Any) -> list[Solver]:
 
 
 def _decision_strategy(version: str, **options: Any) -> list[Solver]:
+    """Constructs the decision strategy solver chain."""
     return decision_solver(
         version,
         decision_backend=options.get("decision_backend"),

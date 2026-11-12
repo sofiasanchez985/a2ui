@@ -52,7 +52,7 @@ def _version_to_dir_name(version: str) -> str:
 
 # Catalogs that moved from `specification/<version>/catalogs/` to the top-level
 # `catalogs/` directory. Dataset entries (including the encrypted ones) may still
-# use the old location, so both spellings resolve to the same file.
+# use the old location, so both paths resolve to the same file.
 _MOVED_CATALOG_PREFIXES = {
     "specification/v1_0/catalogs/basic/": "catalogs/basic/v1/",
 }
@@ -88,26 +88,32 @@ def _normalize_catalog_specs(
     """
     raw_specs = item.get("catalogs")
     if not raw_specs:
-        raw_specs = [{
-            "path": item.get("catalog") or default_catalog_path or DEFAULT_CATALOG_PATH,
-            "examples": item.get("examples") or [],
-        }]
+        raw_specs = [
+            {
+                "path": item.get("catalog")
+                or default_catalog_path
+                or DEFAULT_CATALOG_PATH,
+                "examples": item.get("examples") or [],
+            }
+        ]
     specs: list[dict[str, Any]] = []
     for raw in raw_specs:
-        specs.append({
-            "path": _interpolate_version(raw["path"], version),
-            "catalog_id": raw.get("catalog_id"),
-            "allowed_components": raw.get("allowed_components"),
-            "allowed_functions": raw.get("allowed_functions"),
-            "examples": [
-                _interpolate_version(e, version) for e in raw.get("examples") or []
-            ],
-        })
+        specs.append(
+            {
+                "path": _interpolate_version(raw["path"], version),
+                "catalog_id": raw.get("catalog_id"),
+                "allowed_components": raw.get("allowed_components"),
+                "allowed_functions": raw.get("allowed_functions"),
+                "examples": [
+                    _interpolate_version(e, version) for e in raw.get("examples") or []
+                ],
+            }
+        )
     return specs
 
 
 def _matches_tags(item: dict[str, Any], tags: list[str] | None) -> bool:
-    """True when no tag filter is set or the item carries one of the tags."""
+    """Returns True when no tag filter is set or the item carries one of `tags`."""
     if not tags:
         return True
     return bool(set(item.get("tags") or ()) & set(tags))
@@ -227,6 +233,12 @@ def load_a2ui_dataset(
             workflow descriptions.
         tags: Tag(s) a sample must carry to be kept, as a list or
             comma-separated string. None keeps every sample.
+
+    Returns:
+        An Inspect AI `MemoryDataset` containing the loaded `Sample` objects.
+
+    Raises:
+        FileNotFoundError: If `file_path` does not exist.
     """
     with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
         schema = json.load(f)

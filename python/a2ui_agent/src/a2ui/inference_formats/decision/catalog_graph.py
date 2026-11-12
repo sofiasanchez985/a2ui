@@ -69,7 +69,7 @@ def _combinator_objects(schema: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _is_child_list_schema(prop_schema: Mapping[str, Any], refs: Sequence[str]) -> bool:
-    """Checks if a property schema represents an A2UI `ChildList`."""
+    """Returns whether a property schema represents an A2UI `ChildList`."""
     if _ref_matches(refs, ("ChildList",)):
         return True
     for sub in _combinator_objects(prop_schema):
@@ -80,7 +80,7 @@ def _is_child_list_schema(prop_schema: Mapping[str, Any], refs: Sequence[str]) -
 
 
 def _is_action_schema(prop_schema: Mapping[str, Any], refs: Sequence[str]) -> bool:
-    """Checks if a property schema represents an A2UI `Action`."""
+    """Returns whether a property schema represents an A2UI `Action`."""
     if _ref_matches(refs, ("Action",)):
         return True
     for sub in _combinator_objects(prop_schema):
@@ -366,9 +366,21 @@ def _function_return_type(
 
 
 class CatalogDecisionGraph:
-    """Catalog-agnostic component and function decision graph."""
+    """Catalog-agnostic component and function decision graph.
+
+    Attributes:
+        protocol_version: Normalized A2UI protocol version string (prefixed
+            with ``"v"``).
+        surface_catalog_id: Default catalog ID for single-catalog surfaces, or
+            None when multiple catalogs are combined.
+    """
 
     def __init__(self, catalogs: Sequence[CatalogApi]) -> None:
+        """Initializes a catalog decision graph from one or more catalogs.
+
+        Args:
+            catalogs: Validated catalogs sharing a single protocol version.
+        """
         self._catalogs = check_mixed_catalogs(catalogs)
         self._helpers = build_catalog_helpers(self._catalogs)
         first_ver = self._catalogs[0].protocol_version
@@ -387,12 +399,19 @@ class CatalogDecisionGraph:
                     )
 
     def get_component(self, name: str) -> ComponentNodeSpec | None:
-        """Returns the `ComponentNodeSpec` for `name`, or None if unknown."""
+        """Returns the `ComponentNodeSpec` for `name`, or None if unknown.
+
+        Args:
+            name: Component type name in the catalog.
+
+        Returns:
+            The matching `ComponentNodeSpec`, or None if not registered.
+        """
         return self._components.get(name)
 
     @property
     def catalogs(self) -> tuple[CatalogApi, ...]:
-        """Returns the validated catalogs backing this decision graph."""
+        """The validated catalogs backing this decision graph."""
         return tuple(self._catalogs)
 
     def helpers(self) -> Mapping[str, CatalogSchemaHelper]:

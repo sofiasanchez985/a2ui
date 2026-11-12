@@ -47,30 +47,32 @@ CASES: list[dict[str, Any]] = yaml.safe_load(_FIXTURE_PATH.read_text(encoding="u
 
 def _two_component_catalog() -> Catalog:
     """Two-component domain catalog (`TelemetryBadge`, `AlertFrame`)."""
-    return Catalog.from_json({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "catalogId": "https://example.com/catalogs/telemetry/v1/catalog.json",
-        "protocolVersion": "1.0",
-        "components": {
-            "TelemetryBadge": {
-                "type": "object",
-                "properties": {
-                    "component": {"const": "TelemetryBadge"},
-                    "metric": {"$ref": "common_types.json#/$defs/DynamicString"},
+    return Catalog.from_json(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "catalogId": "https://example.com/catalogs/telemetry/v1/catalog.json",
+            "protocolVersion": "1.0",
+            "components": {
+                "TelemetryBadge": {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "TelemetryBadge"},
+                        "metric": {"$ref": "common_types.json#/$defs/DynamicString"},
+                    },
+                    "required": ["component", "metric"],
                 },
-                "required": ["component", "metric"],
-            },
-            "AlertFrame": {
-                "type": "object",
-                "properties": {
-                    "component": {"const": "AlertFrame"},
-                    "child": {"$ref": "common_types.json#/$defs/ComponentId"},
+                "AlertFrame": {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "AlertFrame"},
+                        "child": {"$ref": "common_types.json#/$defs/ComponentId"},
+                    },
+                    "required": ["component", "child"],
                 },
-                "required": ["component", "child"],
             },
-        },
-        "functions": {},
-    })
+            "functions": {},
+        }
+    )
 
 
 def _coerce_scripted(raw: Mapping[str, Any]) -> dict[str, ScriptedValue]:

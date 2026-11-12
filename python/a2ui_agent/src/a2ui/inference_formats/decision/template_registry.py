@@ -67,6 +67,7 @@ class _SurfaceEnvelopes:
 
 
 def _mapping_or_none(value: Any) -> Mapping[str, Any] | None:
+    """Returns `value` if it is a `Mapping`, or `None` otherwise."""
     return value if isinstance(value, Mapping) else None
 
 
@@ -193,7 +194,7 @@ def _parse_required_pointers(template_id: str, raw_pointers: Any) -> tuple[str, 
 
 
 def _plan_pointers(plan: LayoutPlan) -> tuple[str, ...]:
-    """Every absolute pointer a plan binds, in first-use order, without repeats."""
+    """Returns every absolute pointer `plan` binds, in first-use order."""
     page = plan.page
     found = [*page.title.pointers(), *page.subtitle.pointers(), *page.mark.pointers()]
     for block in plan.blocks:
@@ -203,7 +204,18 @@ def _plan_pointers(plan: LayoutPlan) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class SurfaceTemplate:
-    """Pre-validated A2UI surface template parameterized by JSON Pointer paths."""
+    """Pre-validated A2UI surface template parameterized by JSON Pointer paths.
+
+    Attributes:
+        template_id: Unique identifier of the template in a `TemplateRegistry`.
+        description: Human-readable summary used as the option text in template questions.
+        surface_id: Default surface identifier when rendering the template.
+        catalog_id: Target catalog identifier, or None for multi-catalog templates.
+        protocol_version: A2UI protocol version string (for example `1.0`).
+        components: Frozen tuple of pre-validated A2UI component dictionaries.
+        required_pointers: Absolute JSON Pointers that a payload must provide.
+        is_mutable: Whether the template contains user-editable bindings (`sendDataModel`).
+    """
 
     template_id: str
     description: str
@@ -215,10 +227,26 @@ class SurfaceTemplate:
     is_mutable: bool = False
 
     def matches_payload(self, available_pointers: Collection[str]) -> bool:
-        """Returns whether all required JSON Pointers are present in the payload."""
+        """Returns whether all required JSON Pointers are present in the payload.
+
+        An array pointer such as ``"/steps"`` also satisfies unrolled array
+        element pointers such as ``"/steps/0/title"``, whereas parent object
+        prefixes without a numeric array index segment do not match.
+
+        Args:
+            available_pointers: JSON Pointers present in the candidate payload.
+
+        Returns:
+            Whether every pointer in `required_pointers` is satisfied by
+            `available_pointers`.
+        """
         return all(
             req in available_pointers
-            or any(req.startswith(f"{avail}/") for avail in available_pointers)
+            or any(
+                req.startswith(f"{avail}/")
+                and req[len(avail) + 1 :].split("/", 1)[0].isdigit()
+                for avail in available_pointers
+            )
             for req in self.required_pointers
         )
 
@@ -238,7 +266,19 @@ class SurfaceTemplate:
         *,
         surface_id: str | None = None,
     ) -> list[AgentToRendererMessage]:
-        """Renders and validates A2UI wire messages for this surface template."""
+        """Renders and validates A2UI wire messages for this surface template.
+
+        Args:
+            payload: Data model payload emitted in `updateDataModel` when
+                non-empty.
+            surface_id: Optional override for `self.surface_id`.
+
+        Returns:
+            Validated `AgentToRendererMessage` instances for the surface.
+
+        Raises:
+            A2uiValidationError: If the surface ID or component list is invalid.
+        """
         target_surface_id = surface_id if surface_id is not None else self.surface_id
         if not isinstance(target_surface_id, str) or not target_surface_id.strip():
             raise A2uiValidationError("Surface ID must be a non-empty string.")
@@ -270,14 +310,16 @@ class SurfaceTemplate:
             },
         ]
         if payload:
-            raw_messages.append({
-                "version": wire_version,
-                "updateDataModel": {
-                    "surfaceId": target_surface_id,
-                    "path": "/",
-                    "value": dict(payload),
-                },
-            })
+            raw_messages.append(
+                {
+                    "version": wire_version,
+                    "updateDataModel": {
+                        "surfaceId": target_surface_id,
+                        "path": "/",
+                        "value": dict(payload),
+                    },
+                }
+            )
 
         return to_message_models(raw_messages)
 
@@ -290,7 +332,22 @@ class SurfaceTemplate:
         default_catalog_id: str | None = None,
         default_protocol_version: str = "1.0",
     ) -> SurfaceTemplate:
-        """Constructs a `SurfaceTemplate` from a JSON object."""
+        """Constructs a `SurfaceTemplate` from a JSON object.
+
+        Args:
+            template_id: Unique identifier for the template.
+            data: Raw template mapping from `templates.json`.
+            default_catalog_id: Fallback catalog ID if omitted from `data`.
+            default_protocol_version: Fallback protocol version if omitted from
+                `data`.
+
+        Returns:
+            A validated `SurfaceTemplate`.
+
+        Raises:
+            A2uiValidationError: If `template_id`, `description`, `components`,
+                or `requiredPointers` are missing or malformed.
+        """
         if not isinstance(template_id, str) or not template_id.strip():
             raise A2uiValidationError("Template ID must be a non-empty string.")
         if not isinstance(data, Mapping):
@@ -361,12 +418,34 @@ class TemplateRegistry:
         self._templates: dict[str, SurfaceTemplate] = {}
 
     def register(self, template: SurfaceTemplate) -> None:
-        """Validates and registers a surface template by its template ID."""
+        """Validates and registers a surface template by its template ID.
+
+        Args:
+            template: The `SurfaceTemplate` to validate and store.
+
+        Raises:
+            A2uiValidationError: If the template ID, description, required
+                pointers, or rendered messages fail validation.
+        """
+        if not isinstance(template.template_id, str) or not template.template_id.strip():
+            raise A2uiValidationError("Template ID must be a non-empty string.")
+        if not isinstance(template.description, str) or not template.description.strip():
+            raise A2uiValidationError(
+                f"Template '{template.template_id}' must define a non-empty 'description'."
+            )
+        _parse_required_pointers(template.template_id, template.required_pointers)
         template.render_messages({})
         self._templates[template.template_id] = template
 
     def get(self, template_id: str) -> SurfaceTemplate | None:
-        """Returns the registered template for `template_id`, or None if absent."""
+        """Returns the registered template for `template_id`, or None if absent.
+
+        Args:
+            template_id: Identifier of the template to look up.
+
+        Returns:
+            The matching `SurfaceTemplate`, or None if not registered.
+        """
         return self._templates.get(template_id)
 
     def list_templates(self) -> tuple[SurfaceTemplate, ...]:
@@ -376,7 +455,14 @@ class TemplateRegistry:
     def matching_templates(
         self, available_pointers: Collection[str]
     ) -> tuple[SurfaceTemplate, ...]:
-        """Returns registered templates whose required pointers match the payload."""
+        """Returns registered templates whose required pointers match the payload.
+
+        Args:
+            available_pointers: JSON Pointers available in the payload.
+
+        Returns:
+            Registered templates whose `required_pointers` are all present.
+        """
         return tuple(
             template
             for template in self._templates.values()
@@ -396,8 +482,20 @@ class TemplateRegistry:
 
         Accepts v0.9, v1.0, and v0.8 message envelopes (see `_extract_envelopes`).
 
+        Args:
+            template_id: Identifier for the new template.
+            description: Summary of what the template renders.
+            output: Synthesized output containing A2UI messages.
+            required_pointers: Absolute JSON Pointers required by the template.
+            is_mutable: Whether the template's data is user-editable.
+
+        Returns:
+            The newly registered `SurfaceTemplate`.
+
         Raises:
-            ValueError: If the messages define no components.
+            A2uiValidationError: If `template_id`, `description`, or
+                `required_pointers` are invalid.
+            ValueError: If `output.messages` define no components.
         """
         if not isinstance(template_id, str) or not template_id.strip():
             raise A2uiValidationError("Template ID must be a non-empty string.")

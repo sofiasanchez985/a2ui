@@ -60,7 +60,15 @@ DEFAULT_DATASET_DIR = GIT_ROOT / "eval" / "datasets" / "decision_plans"
 
 @dataclass
 class SplitRunBundle:
-    """Results for one dataset split (`tuning` or `heldout`)."""
+    """Results for one dataset split (`tuning` or `heldout`).
+
+    Attributes:
+        split_name: Dataset split identifier (`tuning` or `heldout`).
+        summary: Primary benchmark summary for the evaluated backend.
+        mock_baseline: Optional `mock/mock` baseline summary on the same split.
+        paraphrase: Optional paraphrase sensitivity comparison on the split.
+        template_arm: Optional promoted `SurfaceTemplate` comparison on the split.
+    """
 
     split_name: str
     summary: BenchmarkSummary
@@ -70,6 +78,14 @@ class SplitRunBundle:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parses command-line arguments for `decision_bench`.
+
+    Args:
+        argv: Optional list of CLI argument tokens.
+
+    Returns:
+        Parsed `argparse.Namespace` configuration.
+    """
     parser = argparse.ArgumentParser(
         description="Benchmark decision backend latency, accuracy, and Wave 6 metrics.",
     )
@@ -167,7 +183,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _load_split_groups(
     cases_path: Path, args: argparse.Namespace
 ) -> list[tuple[str, list[PlanCase]]]:
-    """Loads `(split_name, cases)` groups according to `args.split`."""
+    """Loads `(split_name, cases)` groups according to `args.split`.
+
+    Args:
+        cases_path: Path to a dataset directory or YAML file.
+        args: Parsed CLI arguments containing `split`, `tags`, and
+            `include_unverified`.
+
+    Returns:
+        Ordered list of `(split_name, cases)` pairs to evaluate.
+    """
     if args.split == "tuning":
         loaded = load_plan_cases(
             cases_path,
@@ -211,7 +236,17 @@ async def _run_split_bundle(
     cases: list[PlanCase],
     args: argparse.Namespace,
 ) -> SplitRunBundle:
-    """Runs benchmark, optional mock baseline, paraphrase, and template arm for one split."""
+    """Runs benchmark, optional mock baseline, paraphrase, and template arm for one split.
+
+    Args:
+        synth: Configured `DecisionSynthesizer` under evaluation.
+        split_name: Dataset split identifier (`tuning` or `heldout`).
+        cases: Loaded `PlanCase` definitions for `split_name`.
+        args: Parsed CLI arguments controlling optional comparison passes.
+
+    Returns:
+        `SplitRunBundle` aggregating all requested evaluation passes.
+    """
     fit_t = args.fit_temperature and split_name == "tuning"
     summary = await run_benchmark(
         synth,
@@ -257,7 +292,14 @@ async def _run_split_bundle(
 
 
 def _render_bundle_markdown(bundle: SplitRunBundle) -> str:
-    """Formats Markdown sections for one `SplitRunBundle`."""
+    """Formats Markdown sections for one `SplitRunBundle`.
+
+    Args:
+        bundle: Evaluated `SplitRunBundle` for one split.
+
+    Returns:
+        Combined Markdown report string for `bundle`.
+    """
     label = f"{bundle.summary.backend_kind}/{bundle.summary.model_id}"
     sections = [render_markdown(bundle.summary, backend_name=label)]
     if bundle.mock_baseline is not None:
@@ -272,7 +314,14 @@ def _render_bundle_markdown(bundle: SplitRunBundle) -> str:
 
 
 def _serialize_bundle(bundle: SplitRunBundle) -> dict[str, Any]:
-    """Serializes one `SplitRunBundle` for JSON output."""
+    """Serializes one `SplitRunBundle` for JSON output.
+
+    Args:
+        bundle: Evaluated `SplitRunBundle` to serialize.
+
+    Returns:
+        JSON-serializable dictionary representation of `bundle`.
+    """
     out = serialize_benchmark_summary(bundle.summary)
     if bundle.mock_baseline is not None:
         out["mock_baseline"] = serialize_benchmark_summary(bundle.mock_baseline)
@@ -299,6 +348,14 @@ def _serialize_bundle(bundle: SplitRunBundle) -> dict[str, Any]:
 
 
 async def _async_main(args: argparse.Namespace) -> int:
+    """Executes the async benchmark workflow for `args`.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code (`0` on success, `1` when no matching cases exist).
+    """
     cases_path = Path(args.cases)
     if not cases_path.is_absolute():
         cases_path = GIT_ROOT / cases_path
@@ -346,6 +403,14 @@ async def _async_main(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for `decision_bench`.
+
+    Args:
+        argv: Optional list of CLI argument tokens.
+
+    Returns:
+        Process exit code (`0` on success).
+    """
     args = parse_args(argv)
     return asyncio.run(_async_main(args))
 

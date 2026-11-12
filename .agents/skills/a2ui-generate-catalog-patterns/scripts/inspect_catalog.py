@@ -32,20 +32,22 @@ from _common import LoadedCatalog, render_markdown_table
 
 _CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
 
-_NUMERIC_TYPES: frozenset[str] = frozenset({
-    "number",
-    "integer",
-    "count",
-    "currency",
-    "percent",
-    "percentage",
-    "ratio",
-    "quantity",
-    "rating",
-    "bounded",
-    "duration",
-    "distance",
-})
+_NUMERIC_TYPES: frozenset[str] = frozenset(
+    {
+        "number",
+        "integer",
+        "count",
+        "currency",
+        "percent",
+        "percentage",
+        "ratio",
+        "quantity",
+        "rating",
+        "bounded",
+        "duration",
+        "distance",
+    }
+)
 
 _IMAGE_KEYWORDS: frozenset[str] = frozenset(
     {"image", "figure", "photo", "picture", "avatar", "icon", "src", "img"}
@@ -57,7 +59,20 @@ _MEDIA_KEYWORDS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class ComponentSummary:
-    """Structural summary of one component in a catalog."""
+    """Summarizes the structural capabilities and slots of one catalog component.
+
+    Attributes:
+        name: Component type identifier in the catalog.
+        description: Human-readable description from the component schema.
+        is_container: Whether the component accepts child component IDs.
+        has_child_list: Whether the component has a multi-child list slot.
+        child_slots: Slot names that hold single or multiple child component IDs.
+        data_slots: Mapping from data slot name to its value type string.
+        enum_slots: Mapping from static enum slot name to allowed enum values.
+        action_slots: Slot names that dispatch interactive action events.
+        required: Slot names marked as required in the component schema.
+        supports_checks: Whether the component schema includes `Checkable` validation rules.
+    """
 
     name: str
     description: str
@@ -73,7 +88,16 @@ class ComponentSummary:
 
 @dataclass(frozen=True)
 class BlockCandidates:
-    """Candidate components in the catalog for one layout grammar block."""
+    """Lists full and partial catalog component candidates for one layout grammar block.
+
+    Attributes:
+        block_id: Grammar block identifier (for example, `"banner"` or `"collection"`).
+        pattern: Primary pattern name referenced by the grammar block.
+        fallback: Ordered fallback pattern names when the primary pattern is omitted.
+        slot_requirements: Mapping from required slot or field path to its structural capability label.
+        candidates: Component names that satisfy all structural requirements of the block directly.
+        partial: Mapping from partially matching component name to its unmet capability labels.
+    """
 
     block_id: str
     pattern: str
@@ -85,7 +109,17 @@ class BlockCandidates:
 
 @dataclass(frozen=True)
 class TemplateCandidate:
-    """Candidate monolithic component for a `SurfaceTemplate` in `templates.json`."""
+    """Describes a monolithic component suited for a `SurfaceTemplate` in `templates.json`.
+
+    Attributes:
+        component: Catalog component name.
+        suggested_template_id: Default `snake_case` template identifier for `templates.json`.
+        description: Component description from the catalog schema.
+        required_slots: Mapping from required slot name to its value or slot kind label.
+        optional_slots: Mapping from optional slot name to its value or slot kind label.
+        suggested_required_pointers: Default root JSON Pointers derived from required data slots.
+        is_mutable: Whether the template accepts user edits or interactive action submissions.
+    """
 
     component: str
     suggested_template_id: str
@@ -98,7 +132,22 @@ class TemplateCandidate:
 
 @dataclass(frozen=True)
 class InspectReport:
-    """Complete structural inspection report for a custom catalog."""
+    """Holds the complete structural inspection report for a custom catalog.
+
+    Attributes:
+        catalog_id: Canonical catalog URI from `catalog.json`.
+        protocol_version: A2UI protocol version inferred by `CatalogDecisionGraph`.
+        grammar_version: Version string of the loaded `ArchetypeGrammar`.
+        target_dir: Resolved directory where generated sidecars should be written.
+        recommended_files: Sidecar file paths recommended for the detected synthesis mode.
+        mode: Detected synthesis mode (`"composable"`, `"fixed_surface"`, or `"hybrid"`).
+        page_candidates: Container component names eligible to serve as the `"page"` root.
+        components: Structural summaries for all root-eligible catalog components.
+        blocks: Candidate component mappings for each layout grammar block.
+        template_candidates: Monolithic component candidates for Stage 1 `templates.json`.
+        patterns_scaffold: Top-level JSON scaffold for `patterns.json`.
+        notes: Actionable authoring notes for missing capabilities or composed molecules.
+    """
 
     catalog_id: str
     protocol_version: str
@@ -115,13 +164,27 @@ class InspectReport:
 
 
 def _to_snake_case(name: str) -> str:
-    """Converts a PascalCase or camelCase identifier to `snake_case`."""
+    """Converts a PascalCase or camelCase identifier to `snake_case`.
+
+    Args:
+        name: Identifier string to normalize.
+
+    Returns:
+        The lowercase `snake_case` identifier.
+    """
     s1 = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", name)
     return re.sub(r"[^a-zA-Z0-9]+", "_", s1).strip("_").lower()
 
 
 def summarize_component(spec: ComponentNodeSpec) -> ComponentSummary:
-    """Folds `spec.slots` by `SlotKind` into a `ComponentSummary`."""
+    """Folds `spec.slots` by `SlotKind` into a `ComponentSummary`.
+
+    Args:
+        spec: Component node specification extracted from `CatalogDecisionGraph`.
+
+    Returns:
+        A `ComponentSummary` partitioning the component's child, data, enum, and action slots.
+    """
     child_slots: list[str] = []
     has_child_list = False
     data_slots: dict[str, str] = {}
@@ -162,7 +225,15 @@ def summarize_component(spec: ComponentNodeSpec) -> ComponentSummary:
 
 
 def _classify_slot_need(slot: SlotSpec) -> str:
-    """Maps one `SlotSpec` to a concise structural capability label."""
+    """Maps one `SlotSpec` to a concise structural capability label.
+
+    Args:
+        slot: Grammar slot specification to classify.
+
+    Returns:
+        Capability label such as `"action"`, `"mutable string"`, `"children"`,
+        `"boolean"`, `"number"`, or `"string"`.
+    """
     from_set = set(slot.from_types)
     if "action" in from_set:
         return "action"
@@ -178,7 +249,13 @@ def _classify_slot_need(slot: SlotSpec) -> str:
 
 
 def _record_field_slot_needs(reqs: dict[str, str], name: str, slot: SlotSpec) -> None:
-    """Records structural needs for a slot that defines nested `fields`."""
+    """Records structural needs for a slot that defines nested `fields`.
+
+    Args:
+        reqs: Mutable dictionary mapping slot paths to capability labels.
+        name: Parent slot name on the grammar block.
+        slot: Parent `SlotSpec` containing nested `fields`.
+    """
     if slot.repeat and ("array" in slot.from_types or "object" in slot.from_types):
         reqs[name] = "children"
     elif "action" in slot.from_types:
@@ -191,7 +268,14 @@ def _record_field_slot_needs(reqs: dict[str, str], name: str, slot: SlotSpec) ->
 
 
 def slot_requirements(block: BlockSpec) -> dict[str, str]:
-    """Maps a grammar block's slots (and required nested item fields) to structural needs."""
+    """Maps a grammar block's slots and required nested fields to structural needs.
+
+    Args:
+        block: Layout grammar block specification.
+
+    Returns:
+        An ordered dictionary mapping slot or `slot.field` names to capability labels.
+    """
     reqs: dict[str, str] = {}
     for name, slot in block.slots.items():
         if slot.fields:
@@ -202,14 +286,30 @@ def slot_requirements(block: BlockSpec) -> dict[str, str]:
 
 
 def _component_tokens(comp: ComponentSummary) -> set[str]:
-    """Returns lowercase keyword tokens from a component's name, slots, and description."""
+    """Returns lowercase keyword tokens from a component's name, slots, and description.
+
+    Args:
+        comp: Component summary to tokenize.
+
+    Returns:
+        Set of lowercase alphanumeric word tokens.
+    """
     raw = " ".join([comp.name, comp.description, *comp.data_slots.keys()])
     expanded = _CAMEL_BOUNDARY_RE.sub(r"\1 \2", raw).lower()
     return set(re.findall(r"[a-z0-9]+", expanded))
 
 
 def _matches_media_block(comp: ComponentSummary, block_id: str) -> bool | None:
-    """Checks keyword matches when `block_id` is `'picture'` or `'media'`."""
+    """Checks keyword matches when `block_id` is `'picture'` or `'media'`.
+
+    Args:
+        comp: Candidate component summary.
+        block_id: Target grammar block identifier.
+
+    Returns:
+        Whether `comp` matches image or media keywords for `'picture'` or `'media'`,
+        or `None` for all other block IDs.
+    """
     if block_id == "picture":
         return bool(_component_tokens(comp) & _IMAGE_KEYWORDS) and bool(comp.data_slots)
     if block_id == "media":
@@ -218,7 +318,16 @@ def _matches_media_block(comp: ComponentSummary, block_id: str) -> bool | None:
 
 
 def _can_satisfy_need(comp: ComponentSummary, need: str, *, block_id: str) -> bool:
-    """Returns whether `comp` can structurally satisfy `need` for `block_id`."""
+    """Returns whether `comp` can structurally satisfy `need` for `block_id`.
+
+    Args:
+        comp: Component summary being evaluated.
+        need: Required structural capability label.
+        block_id: Grammar block identifier for media keyword disambiguation.
+
+    Returns:
+        Whether `comp` provides the required child, action, mutable, media, or data slot.
+    """
     if need == "children":
         return comp.has_child_list
     if need == "action":
@@ -242,8 +351,18 @@ def block_candidates(
     *,
     has_page_container: bool = True,
 ) -> BlockCandidates:
-    """Finds full and partial component candidates for `block`."""
+    """Finds full and partial component candidates for `block`.
+
+    Args:
+        block: Grammar block specification to match against `components`.
+        components: Summarized catalog components.
+        has_page_container: Whether the catalog has at least one page-level container.
+
+    Returns:
+        A `BlockCandidates` record listing full single-component matches and partial matches.
+    """
     reqs = slot_requirements(block)
+    # Without a multi-child page container, Stage 2A block composition cannot run.
     if not has_page_container:
         return BlockCandidates(
             block_id=block.id,
@@ -265,6 +384,7 @@ def block_candidates(
             for need in distinct_needs
             if not _can_satisfy_need(comp, need, block_id=block.id)
         ]
+        # A single non-container leaf needs at least one data slot per required scalar field.
         if (
             not unmet
             and len(scalar_reqs) >= 2
@@ -288,7 +408,14 @@ def block_candidates(
 
 
 def _build_template_candidate(comp: ComponentSummary) -> TemplateCandidate:
-    """Constructs a `TemplateCandidate` from a `ComponentSummary`."""
+    """Constructs a `TemplateCandidate` from a `ComponentSummary`.
+
+    Args:
+        comp: Monolithic component summary to convert into a template candidate.
+
+    Returns:
+        A `TemplateCandidate` with suggested template ID, required pointers, and mutability.
+    """
     req_set = set(comp.required)
     all_slots: dict[str, str] = {}
     for name, vtype in comp.data_slots.items():
@@ -325,7 +452,15 @@ def extract_template_candidates(
     *,
     has_page_container: bool,
 ) -> tuple[TemplateCandidate, ...]:
-    """Identifies monolithic components suited for `SurfaceTemplate` entries in `templates.json`."""
+    """Identifies monolithic components suited for `SurfaceTemplate` entries in `templates.json`.
+
+    Args:
+        components: Summarized catalog components.
+        has_page_container: Whether the catalog also includes composable page containers.
+
+    Returns:
+        A tuple of `TemplateCandidate` entries for Stage 1 template synthesis.
+    """
     candidates: list[TemplateCandidate] = []
     for comp in components:
         if not has_page_container:
@@ -336,6 +471,8 @@ def extract_template_candidates(
             and bool(comp.action_slots)
             and len(comp.data_slots) >= 2
         ):
+            # In a composable catalog, non-container leaves with actions and multiple
+            # data fields represent self-contained widgets (hybrid mode).
             candidates.append(_build_template_candidate(comp))
     return tuple(candidates)
 
@@ -347,7 +484,19 @@ def _collect_notes(
     blocks: Sequence[BlockCandidates],
     template_candidates: Sequence[TemplateCandidate],
 ) -> tuple[str, ...]:
-    """Builds actionable guidance notes for the skill agent."""
+    """Builds actionable guidance notes for the skill agent.
+
+    Args:
+        mode: Detected synthesis mode (`"composable"`, `"fixed_surface"`, or `"hybrid"`).
+        page_candidates: Component names eligible for the `"page"` container pattern.
+        components: Summarized catalog components.
+        blocks: Per-block candidate evaluations.
+        template_candidates: Monolithic template candidates.
+
+    Returns:
+        A tuple of human-readable guidance notes.
+    """
+    del components
     notes: list[str] = []
     if mode == "fixed_surface":
         notes.append(
@@ -387,7 +536,14 @@ def _collect_notes(
 
 
 def inspect_catalog(loaded: LoadedCatalog) -> InspectReport:
-    """Runs structural analysis on `loaded` and returns an `InspectReport`."""
+    """Runs structural analysis on `loaded` and returns an `InspectReport`.
+
+    Args:
+        loaded: Loaded catalog bundle containing the catalog, decision graph, and grammar.
+
+    Returns:
+        The populated `InspectReport` classifying the catalog and recommending sidecars.
+    """
     summaries = tuple(
         summarize_component(spec) for spec in loaded.graph.root_candidates()
     )
@@ -443,7 +599,14 @@ def inspect_catalog(loaded: LoadedCatalog) -> InspectReport:
 
 
 def report_to_dict(report: InspectReport) -> dict[str, Any]:
-    """Serializes `report` to a JSON-compatible dictionary."""
+    """Serializes `report` to a JSON-compatible dictionary.
+
+    Args:
+        report: Structural inspection report to serialize.
+
+    Returns:
+        A camelCase dictionary suitable for JSON serialization.
+    """
     return {
         "catalogId": report.catalog_id,
         "protocolVersion": report.protocol_version,
@@ -496,7 +659,14 @@ def report_to_dict(report: InspectReport) -> dict[str, Any]:
 
 
 def _component_row(comp: ComponentSummary) -> list[str]:
-    """Formats one `ComponentSummary` row for the Markdown table."""
+    """Formats one `ComponentSummary` row for the Markdown table.
+
+    Args:
+        comp: Component summary to render.
+
+    Returns:
+        List of six Markdown table cells.
+    """
     return [
         f"`{comp.name}`",
         "yes" if comp.is_container else "no",
@@ -508,7 +678,14 @@ def _component_row(comp: ComponentSummary) -> list[str]:
 
 
 def _template_candidate_row(tpl: TemplateCandidate) -> list[str]:
-    """Formats one `TemplateCandidate` row for the Markdown table."""
+    """Formats one `TemplateCandidate` row for the Markdown table.
+
+    Args:
+        tpl: Template candidate to render.
+
+    Returns:
+        List of five Markdown table cells.
+    """
     return [
         f"`{tpl.component}`",
         f"`{tpl.suggested_template_id}`",
@@ -519,7 +696,14 @@ def _template_candidate_row(tpl: TemplateCandidate) -> list[str]:
 
 
 def _block_candidate_row(block: BlockCandidates) -> list[str]:
-    """Formats one `BlockCandidates` row for the Markdown table."""
+    """Formats one `BlockCandidates` row for the Markdown table.
+
+    Args:
+        block: Block candidates entry to render.
+
+    Returns:
+        List of five Markdown table cells.
+    """
     return [
         f"`{block.block_id}`",
         f"`{block.pattern}`",
@@ -530,7 +714,14 @@ def _block_candidate_row(block: BlockCandidates) -> list[str]:
 
 
 def report_to_markdown(report: InspectReport) -> str:
-    """Renders `report` as a human- and agent-readable Markdown summary."""
+    """Renders `report` as a human- and agent-readable Markdown summary.
+
+    Args:
+        report: Inspection report to format.
+
+    Returns:
+        The formatted Markdown report ending with a newline.
+    """
     lines: list[str] = [
         f"# Catalog Inspection: `{report.catalog_id}`",
         "",
@@ -574,37 +765,41 @@ def report_to_markdown(report: InspectReport) -> str:
     ]
 
     if report.template_candidates:
-        lines.extend([
+        lines.extend(
+            [
+                "",
+                "## Surface Template Candidates (Stage 1)",
+                "",
+                render_markdown_table(
+                    [
+                        "Component",
+                        "Template ID",
+                        "Suggested Required Pointers",
+                        "Mutable",
+                        "Required Slots",
+                    ],
+                    [_template_candidate_row(t) for t in report.template_candidates],
+                ),
+            ]
+        )
+
+    lines.extend(
+        [
             "",
-            "## Surface Template Candidates (Stage 1)",
+            "## Layout Grammar Block Candidates (Stage 2A)",
             "",
             render_markdown_table(
                 [
-                    "Component",
-                    "Template ID",
-                    "Suggested Required Pointers",
-                    "Mutable",
-                    "Required Slots",
+                    "Block",
+                    "Pattern",
+                    "Slot Needs",
+                    "Direct Candidates",
+                    "Fallback Chain",
                 ],
-                [_template_candidate_row(t) for t in report.template_candidates],
+                [_block_candidate_row(b) for b in report.blocks],
             ),
-        ])
-
-    lines.extend([
-        "",
-        "## Layout Grammar Block Candidates (Stage 2A)",
-        "",
-        render_markdown_table(
-            [
-                "Block",
-                "Pattern",
-                "Slot Needs",
-                "Direct Candidates",
-                "Fallback Chain",
-            ],
-            [_block_candidate_row(b) for b in report.blocks],
-        ),
-    ])
+        ]
+    )
 
     if report.notes:
         lines.extend(["", "## Notes", ""])

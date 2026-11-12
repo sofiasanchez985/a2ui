@@ -39,6 +39,12 @@ def dataset_protocol_version(dataset_name: str) -> str | None:
     Datasets whose name ends in a version suffix (e.g. 'core_v0_9_1' or
     'core_v1_0') only run under that protocol version. Other datasets run under
     any version.
+
+    Args:
+        dataset_name: Logical dataset identifier string.
+
+    Returns:
+        Pinned protocol version (`'0.9.1'` or `'1.0'`), or `None`.
     """
     if dataset_name.endswith("v0_9_1"):
         return "0.9.1"
@@ -48,7 +54,14 @@ def dataset_protocol_version(dataset_name: str) -> str | None:
 
 
 def split_dataset_names(dataset: str | Sequence[str] | None) -> list[str]:
-    """Splits a comma-separated dataset string or list into dataset names."""
+    """Splits a comma-separated dataset string or sequence into dataset names.
+
+    Args:
+        dataset: Optional comma-separated string or sequence of dataset names.
+
+    Returns:
+        List of trimmed non-empty dataset name strings.
+    """
     if not dataset:
         return []
     raw = dataset.split(",") if isinstance(dataset, str) else dataset
@@ -57,6 +70,10 @@ def split_dataset_names(dataset: str | Sequence[str] | None) -> list[str]:
 
 def _check_task_inputs(version: str, dataset: str | Sequence[str] | None) -> None:
     """Validates the protocol version and datasets of a task.
+
+    Args:
+        version: Target A2UI protocol version string.
+        dataset: Optional dataset filter string or sequence of dataset names.
 
     Raises:
         ValueError: If the protocol version is unsupported, or a requested
@@ -77,7 +94,10 @@ def _check_task_inputs(version: str, dataset: str | Sequence[str] | None) -> Non
 
 @scorer(metrics=[])
 def dummy_scorer() -> Scorer:
+    """Returns a no-op Inspect AI scorer that always passes."""
+
     async def score(state: TaskState, target: Target) -> Score:  # pylint: disable=unused-argument
+        """Returns a constant passing `Score`."""
         return Score(value=1.0, explanation="Dummy pass")
 
     return score
@@ -148,7 +168,7 @@ def build_task(
         max_validation_retries: Validation self-retries per sample (Pass@K).
         subagent_format: Inference format of the `subagent_tool` specialist.
         decision_backend: Short name of the decision backend
-            ('mock', 'jev', 'systemone', 'step0').
+            ('mock', 'jev', 'gemini', 'systemone', 'step0').
         cache_generations: Whether to cache LLM generations across runs.
     """
     _check_task_inputs(active_version, dataset)
@@ -226,7 +246,7 @@ def a2ui_v0_9_1_eval(
         max_validation_retries: Validation self-retries per sample (Pass@K).
         subagent_format: Inference format of the `subagent_tool` specialist.
         decision_backend: Short name of the decision backend
-            ('mock', 'jev', 'systemone', 'step0').
+            ('mock', 'jev', 'gemini', 'systemone', 'step0').
         cache_generations: Whether to cache LLM generations across runs.
 
     Returns:
@@ -274,7 +294,7 @@ def a2ui_v1_0_eval(
         max_validation_retries: Validation self-retries per sample (Pass@K).
         subagent_format: Inference format of the `subagent_tool` specialist.
         decision_backend: Short name of the decision backend
-            ('mock', 'jev', 'systemone', 'step0').
+            ('mock', 'jev', 'gemini', 'systemone', 'step0').
         cache_generations: Whether to cache LLM generations across runs.
 
     Returns:
