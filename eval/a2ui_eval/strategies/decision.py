@@ -32,6 +32,7 @@ from inspect_ai.model import CachePolicy, ChatMessageSystem
 from inspect_ai.solver import Generate, Solver, TaskState, solver
 
 from ..decision_common import (
+    DECISION_METADATA_KEYS,
     DEFAULT_DECISION_BLOCK_EXAMPLES,
     build_decision_backend,
     decision_metadata,
@@ -54,9 +55,22 @@ _SURFACE_ID_PATTERN = re.compile(
     r"['\"]surfaceId['\"]\s*:\s*['\"]([^'\"]+)['\"]", re.IGNORECASE
 )
 
+_CUMULATIVE_DECISION_KEYS: frozenset[str] = frozenset(
+    {"decision_latency_ms", "decision_calls"}
+)
+
 
 def _find_surface_id(completion: str, allowed_surface_ids: list[str]) -> str:
-    """The surface ID named in the decision block, or the first allowed one."""
+    """Returns the surface ID named in `completion`, or the first allowed ID.
+
+    Args:
+        completion: Raw model completion string containing a decision block.
+        allowed_surface_ids: List of surface IDs permitted by the sample.
+
+    Returns:
+        Matched surface ID if permitted, otherwise the first allowed ID or
+        `'main'`.
+    """
     default_surface_id = allowed_surface_ids[0] if allowed_surface_ids else "main"
     match = _SURFACE_ID_PATTERN.search(completion)
     if match and match.group(1) in allowed_surface_ids:
@@ -65,7 +79,14 @@ def _find_surface_id(completion: str, allowed_surface_ids: list[str]) -> str:
 
 
 def _decision_retry_prompt(error: str) -> str:
-    """Builds a corrective prompt when decision block synthesis fails."""
+    """Builds a corrective prompt when decision block synthesis fails.
+
+    Args:
+        error: Error message from synthesis or A2UI schema validation.
+
+    Returns:
+        User-turn corrective prompt instructing the model how to fix the block.
+    """
     if "could not choose components" in error or "abstained" in error:
         return (
             "The layout engine could not choose components for this block; restate the"
@@ -78,8 +99,25 @@ def _decision_retry_prompt(error: str) -> str:
     )
 
 
+def _clear_non_cumulative_decision_metadata(state: TaskState) -> None:
+    """Removes per-attempt decision metadata keys while keeping cumulative totals.
+
+    Args:
+        state: Inspect AI task state whose metadata is being updated.
+    """
+    for key in DECISION_METADATA_KEYS:
+        if key not in _CUMULATIVE_DECISION_KEYS:
+            state.metadata.pop(key, None)
+
+
 def _accumulate_decision_metadata(state: TaskState, meta: dict[str, Any]) -> None:
-    """Accumulates decision latency and call counts across validation retries."""
+    """Accumulates decision latency and call counts across validation retries.
+
+    Args:
+        state: Inspect AI task state receiving the aggregated metadata.
+        meta: Decision metadata dictionary produced for the current attempt.
+    """
+    _clear_non_cumulative_decision_metadata(state)
     state.metadata["decision_latency_ms"] = (
         state.metadata.get("decision_latency_ms") or 0.0
     ) + meta.get("decision_latency_ms", 0.0)
@@ -87,15 +125,23 @@ def _accumulate_decision_metadata(state: TaskState, meta: dict[str, Any]) -> Non
         state.metadata.get("decision_calls") or 0
     ) + meta.get("decision_calls", 0)
     for k, v in meta.items():
-        if k not in ("decision_latency_ms", "decision_calls"):
+        if k not in _CUMULATIVE_DECISION_KEYS:
             state.metadata[k] = v
 
 
 @solver
 def decision_system_prompt(version: str) -> Solver:
-    """Injects system prompt instructions using the decision inference format."""
+    """Injects system prompt instructions using the decision inference format.
+
+    Args:
+        version: A2UI protocol version string (for example `'1.0'`).
+
+    Returns:
+        Inspect AI solver that prepends the decision system prompt message.
+    """
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:  # pylint: disable=unused-argument
+        """Prepends the decision format system prompt to `state.messages`."""
         catalog_path = state.metadata["catalog"]
         resolved_catalog_path = str(GIT_ROOT / catalog_path)
         options = runner_options_from_metadata(state.metadata, resolved_catalog_path)
@@ -130,7 +176,24 @@ async def _synthesize_completion(
     allowed_surface_ids: list[str],
     options: Any,
 ) -> _CompileResult:
-    """Synthesizes and validates one model completion containing `<a2ui>` blocks."""
+    """Synthesizes and validates one model completion containing `<a2ui>` blocks.
+
+    Args:
+        state: Inspect AI task state for the active sample.
+        completion: Raw model completion string to parse and synthesize.
+        format_obj: Configured `DecisionFormat` instance.
+        backend_label: Logical decision backend name for metadata attribution.
+        version: A2UI protocol version string.
+        resolved_catalog_path: Absolute path to the catalog directory or file.
+        allowed_surface_ids: List of surface IDs permitted for this sample.
+        options: Optional runner validation options.
+
+    Returns:
+        `_CompileResult` holding either the validated JSON payload or an error.
+    """
+    # Clear per-attempt plan/fallback attributes so an early failure on a retry
+    # attempt does not leave stale metadata from an earlier discarded attempt.
+    _clear_non_cumulative_decision_metadata(state)
     surface_id = _find_surface_id(completion, allowed_surface_ids)
     parser = format_obj.create_parser(conversation_id=str(state.sample_id))
     try:
@@ -195,10 +258,20 @@ def compile_decision_payload(
     explicitly configured backend (`decision_backend` or `A2UI_DECISION_BACKEND`),
     validates the resulting A2UI messages, and stores the compiled messages and
     decision metadata on the task state.
+
+    Args:
+        version: A2UI protocol version string.
+        decision_backend: Optional decision backend preset name.
+        max_validation_retries: Maximum number of corrective retry turns when
+            synthesis or validation fails.
+
+    Returns:
+        Inspect AI solver that compiles and validates decision blocks.
     """
     measured = measured_generate()
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
+        """Compiles `<a2ui>` decision blocks in `state.output.completion`."""
         if not state.output or not state.output.completion:
             return state
 
@@ -224,6 +297,7 @@ def compile_decision_payload(
             format_obj = factory.create_format(catalogs)
 
             async def attempt_synthesize(completion: str) -> _CompileResult:
+                """Runs one synthesis and validation attempt on `completion`."""
                 return await _synthesize_completion(
                     state,
                     completion,
@@ -258,7 +332,17 @@ def decision_solver(
     max_validation_retries: int = 0,
     cache: bool | CachePolicy = False,
 ) -> list[Solver]:
-    """Assembles the solver chain for the decision inference strategy."""
+    """Assembles the solver chain for the decision inference strategy.
+
+    Args:
+        version: A2UI protocol version string.
+        decision_backend: Optional decision backend preset name.
+        max_validation_retries: Maximum number of corrective validation retries.
+        cache: Inspect AI prompt cache policy or boolean flag.
+
+    Returns:
+        Ordered list of Inspect AI solvers for the decision strategy.
+    """
     return [
         decision_system_prompt(version),
         measured_generate(cache=cache),

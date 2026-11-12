@@ -156,6 +156,7 @@ def test_decision_metadata_aggregation() -> None:
     assert meta["decision_latency_ms"] == 37.5
     assert meta["decision_calls"] == 3
     assert meta["decision_confidence"] == 0.85
+    assert meta["decision_family"] == "monitor"
     assert meta["decision_archetype"] == "dashboard"
     assert meta["decision_blocks"] == ["headline", "facts"]
     assert meta["decision_answers"] == 0
@@ -193,10 +194,12 @@ _HELDOUT_PATH = _DATASETS_DIR / "heldout_v1.yaml"
 
 
 def _load_schema() -> dict[str, Any]:
+    """Loads the JSON Schema for decision plan YAML datasets."""
     return dict(json.loads(_SCHEMA_PATH.read_text(encoding="utf-8")))
 
 
 def _load_decrypted_yaml(path: Path) -> list[dict[str, Any]]:
+    """Loads a decrypted decision plan YAML file or skips if encrypted."""
     if not path.is_file() or is_transcrypt_ciphertext(path):
         pytest.skip(f"Dataset file {path.name} is encrypted or absent.")
     return list(yaml.safe_load(path.read_text(encoding="utf-8")) or [])
@@ -270,19 +273,21 @@ def test_decision_plans_schema_validates_synthetic_wave6_cases(
 
 
 def _has_large_array(payload: dict[str, Any], min_len: int = 100) -> bool:
+    """Returns True when `payload` contains any list with at least `min_len` items."""
     return any(
         isinstance(val, list) and len(val) >= min_len for val in payload.values()
     )
 
 
 def _assert_no_family_word_in_case(case: dict[str, Any]) -> None:
+    """Asserts that `case['intent']` and turn intents do not contain the expected family word."""
     family = case["expected"]["family"]
     if family == "none":
         return
     pattern = re.compile(rf"\b{re.escape(family)}\b", re.IGNORECASE)
-    assert not pattern.search(
-        case["intent"]
-    ), f"Case {case['name']} intent leaks family word {family!r}: {case['intent']!r}"
+    assert not pattern.search(case["intent"]), (
+        f"Case {case['name']} intent leaks family word {family!r}: {case['intent']!r}"
+    )
     for turn in case.get("turns", []):
         assert not pattern.search(turn["intent"]), (
             f"Case {case['name']} turn intent leaks family word {family!r}:"
@@ -291,6 +296,7 @@ def _assert_no_family_word_in_case(case: dict[str, Any]) -> None:
 
 
 def _assert_heldout_counts(heldout_cases: list[dict[str, Any]]) -> None:
+    """Asserts that `heldout_cases` meets Wave 6 slice minimums."""
     assert len(heldout_cases) >= 100
     assert sum(1 for c in heldout_cases if c["expected"]["family"] == "none") >= 30
     assert sum(1 for c in heldout_cases if "turns" in c) >= 10
@@ -302,6 +308,7 @@ def _assert_heldout_counts(heldout_cases: list[dict[str, Any]]) -> None:
 def _assert_zero_overlap(
     v1_cases: list[dict[str, Any]], heldout_cases: list[dict[str, Any]]
 ) -> None:
+    """Asserts zero case name or `(intent, payload)` overlap between tuning and heldout splits."""
     v1_names = {c["name"] for c in v1_cases}
     heldout_names = {c["name"] for c in heldout_cases}
     assert len(heldout_names) == len(heldout_cases)

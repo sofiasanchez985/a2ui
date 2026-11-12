@@ -83,6 +83,7 @@ _HOST_PLAN_CASE = PlanCase(
 
 
 def _write_synthetic_tuning_yaml(path: Path) -> Path:
+    """Writes a two-case synthetic tuning dataset YAML file to `path`."""
     path.write_text(
         """
 - name: host_health
@@ -126,6 +127,7 @@ def _write_synthetic_tuning_yaml(path: Path) -> Path:
 
 
 def test_synthetic_schema_validation(tmp_path: Path) -> None:
+    """Verifies synthetic YAML cases validate against schema.json and parse cleanly."""
     sample_yaml = _write_synthetic_tuning_yaml(tmp_path / "plans.yaml")
     synthetic_cases = load_plan_cases(sample_yaml, schema_path=SCHEMA_FILE)
     assert len(synthetic_cases) == 2
@@ -137,6 +139,7 @@ def test_synthetic_schema_validation(tmp_path: Path) -> None:
 
 
 def test_real_v1_yaml_validation_or_skip_if_encrypted() -> None:
+    """Validates on-disk v1.yaml tuning cases when decrypted."""
     if not CASES_FILE.is_file():
         pytest.skip("Decision plan dataset file is absent.")
     if is_transcrypt_ciphertext(CASES_FILE):
@@ -166,6 +169,7 @@ def test_real_v1_yaml_validation_or_skip_if_encrypted() -> None:
 
 
 def test_load_plan_cases_rejects_ciphertext(tmp_path: Path) -> None:
+    """Verifies load_plan_cases raises RuntimeError on Transcrypt-encrypted files."""
     encrypted_file = tmp_path / "encrypted.yaml"
     encrypted_file.write_bytes(b"U2FsdGVkX1+ciphertextbytes")
     with pytest.raises(RuntimeError, match="encrypted with Transcrypt"):
@@ -174,6 +178,7 @@ def test_load_plan_cases_rejects_ciphertext(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_scripted_backend_host_case_scores_perfect() -> None:
+    """Verifies a scripted backend achieves 100% accuracy on the host health case."""
     backend = scripted_backend(HOST_ANSWERS, model_id="mock-v1")
     synth = DecisionSynthesizer([BasicCatalog("v1.0")], backend)
 
@@ -192,6 +197,7 @@ async def test_scripted_backend_host_case_scores_perfect() -> None:
 async def test_run_benchmark_reports_backend_model_round_trips_and_fallback(
     tmp_path: Path,
 ) -> None:
+    """Verifies run_benchmark and render_markdown report backend identity and fallback rates."""
     sample_yaml = _write_synthetic_tuning_yaml(tmp_path / "plans.yaml")
     cases = load_plan_cases(sample_yaml, schema_path=SCHEMA_FILE)
 
@@ -217,6 +223,7 @@ async def test_run_benchmark_reports_backend_model_round_trips_and_fallback(
 
 @pytest.mark.asyncio
 async def test_scripted_transfer_actions_case_scores_perfect(tmp_path: Path) -> None:
+    """Verifies a scripted backend achieves 100% accuracy on an action-bearing transfer case."""
     sample_yaml = _write_synthetic_tuning_yaml(tmp_path / "plans.yaml")
     cases = load_plan_cases(sample_yaml, schema_path=SCHEMA_FILE)
     transfer_case = cases[1]
@@ -232,6 +239,7 @@ async def test_scripted_transfer_actions_case_scores_perfect(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_array_only_abstention_records_abstain_without_crashing() -> None:
+    """Verifies abstaining on an array-only payload records an abstention cleanly."""
     array_case = PlanCase(
         name="resort_list",
         intent="Browse available ski resorts",
@@ -256,6 +264,7 @@ async def test_array_only_abstention_records_abstain_without_crashing() -> None:
 
 @pytest.mark.asyncio
 async def test_deliberately_wrong_script_scores_zero() -> None:
+    """Verifies an intentionally misclassified job family scores 0.0 accuracy."""
     wrong_answers = dict(HOST_ANSWERS)
     wrong_answers["family"] = ("input", 0.99)
     backend = scripted_backend(wrong_answers)
@@ -266,6 +275,7 @@ async def test_deliberately_wrong_script_scores_zero() -> None:
 
 
 def test_brier_and_ece_computation() -> None:
+    """Verifies Brier score and 10-bin Expected Calibration Error calculations."""
     wrong_pairs = [(1.0, 0.0), (1.0, 0.0)]
     assert brier_score(wrong_pairs) == 1.0
     assert expected_calibration_error(wrong_pairs, num_bins=10) == 1.0
@@ -280,6 +290,7 @@ def test_brier_and_ece_computation() -> None:
 
 
 def test_fit_temperature_returns_1_for_calibrated_inputs() -> None:
+    """Verifies fit_temperature selects T=1.0 for already-calibrated probability pairs."""
     calibrated_data = [(0.8, 1.0)] * 8 + [(0.8, 0.0)] * 2
     t = fit_temperature(calibrated_data)
     assert t == 1.0
@@ -289,19 +300,22 @@ def test_fit_temperature_returns_1_for_calibrated_inputs() -> None:
 def test_calibrate_decision_backend_writes_loadable_profile(
     tmp_path: Path,
 ) -> None:
+    """Verifies calibrate_decision_backend writes a JSON profile loadable by Calibration."""
     sample_yaml = _write_synthetic_tuning_yaml(tmp_path / "tuning.yaml")
     cal_out = tmp_path / "cal.json"
 
-    rc = calibrate_decision_backend.main([
-        "--backend",
-        "mock",
-        "--model",
-        "mock",
-        "--cases",
-        str(sample_yaml),
-        "--out",
-        str(cal_out),
-    ])
+    rc = calibrate_decision_backend.main(
+        [
+            "--backend",
+            "mock",
+            "--model",
+            "mock",
+            "--cases",
+            str(sample_yaml),
+            "--out",
+            str(cal_out),
+        ]
+    )
     assert rc == 0
     assert cal_out.is_file()
 
@@ -312,6 +326,7 @@ def test_calibrate_decision_backend_writes_loadable_profile(
 def test_calibrate_decision_backend_refuses_heldout_cases(
     tmp_path: Path,
 ) -> None:
+    """Verifies calibrate_decision_backend refuses held-out splits and held-out tags."""
     heldout_split_yaml = tmp_path / "heldout_split.yaml"
     heldout_split_yaml.write_text(
         """
@@ -335,16 +350,18 @@ def test_calibrate_decision_backend_refuses_heldout_cases(
             heldout_split_yaml, schema_path=SCHEMA_FILE
         )
 
-    rc_split = calibrate_decision_backend.main([
-        "--backend",
-        "mock",
-        "--model",
-        "mock",
-        "--cases",
-        str(heldout_split_yaml),
-        "--out",
-        str(cal_out),
-    ])
+    rc_split = calibrate_decision_backend.main(
+        [
+            "--backend",
+            "mock",
+            "--model",
+            "mock",
+            "--cases",
+            str(heldout_split_yaml),
+            "--out",
+            str(cal_out),
+        ]
+    )
     assert rc_split == 1
     assert not cal_out.exists()
 
@@ -363,21 +380,24 @@ def test_calibrate_decision_backend_refuses_heldout_cases(
 """,
         encoding="utf-8",
     )
-    rc_tag = calibrate_decision_backend.main([
-        "--backend",
-        "mock",
-        "--model",
-        "mock",
-        "--cases",
-        str(heldout_tag_yaml),
-        "--out",
-        str(cal_out),
-    ])
+    rc_tag = calibrate_decision_backend.main(
+        [
+            "--backend",
+            "mock",
+            "--model",
+            "mock",
+            "--cases",
+            str(heldout_tag_yaml),
+            "--out",
+            str(cal_out),
+        ]
+    )
     assert rc_tag == 1
     assert not cal_out.exists()
 
 
 def test_compute_bayes_optimal_threshold() -> None:
+    """Verifies Bayes-optimal threshold computation and input validation."""
     assert calibrate_decision_backend.compute_bayes_optimal_threshold(
         1.0, 20.0
     ) == pytest.approx(0.95)
@@ -389,19 +409,22 @@ def test_compute_bayes_optimal_threshold() -> None:
 
 
 def test_plan_case_from_dict_handles_explicit_nulls() -> None:
-    case = PlanCase.from_dict({
-        "name": "null_case",
-        "intent": "test",
-        "payload": None,
-        "mutable_paths": None,
-        "tags": None,
-        "expected": {
-            "family": None,
-            "archetypes": None,
-            "blocks": None,
-            "action_gate": None,
-        },
-    })
+    """Verifies PlanCase.from_dict normalizes explicit None values to defaults."""
+    case = PlanCase.from_dict(
+        {
+            "name": "null_case",
+            "intent": "test",
+            "payload": None,
+            "mutable_paths": None,
+            "tags": None,
+            "expected": {
+                "family": None,
+                "archetypes": None,
+                "blocks": None,
+                "action_gate": None,
+            },
+        }
+    )
     assert case.payload == {}
     assert case.expected_archetypes == []
     assert case.required_blocks == []
@@ -411,22 +434,27 @@ def test_plan_case_from_dict_handles_explicit_nulls() -> None:
 def test_seed_script_creates_unverified_stubs_skipped_by_default(
     tmp_path: Path,
 ) -> None:
+    """Verifies seed_cases_from_logs writes unverified stubs that validate against schema.json."""
     fake_log = {
-        "samples": [{
-            "id": "sample_123",
-            "input": "Show server stats",
-            "metadata": {
-                "decision_block": json.dumps({
-                    "intent": "Show server stats",
-                    "payload": {"server": "web-1", "load": 0.42},
-                    "actions": {"restart": "Restart Server"},
-                    "mutablePaths": ["/load"],
-                }),
-                "decision_archetype": "dashboard",
-                "decision_stage": "monitor",
-                "decision_blocks": ["headline_row", "facts_card"],
-            },
-        }]
+        "samples": [
+            {
+                "id": "sample_123",
+                "input": "Show server stats",
+                "metadata": {
+                    "decision_block": json.dumps(
+                        {
+                            "intent": "Show server stats",
+                            "payload": {"server": "web-1", "load": 0.42},
+                            "actions": {"restart": "Restart Server"},
+                            "mutablePaths": ["/load"],
+                        }
+                    ),
+                    "decision_archetype": "dashboard",
+                    "decision_stage": "monitor",
+                    "decision_blocks": ["headline_row", "facts_card"],
+                },
+            }
+        ]
     }
 
     target_seeded = (
@@ -467,6 +495,7 @@ def test_seed_script_creates_unverified_stubs_skipped_by_default(
 
 @pytest.mark.asyncio
 async def test_collect_calibration_pairs_preserves_alignment_on_empty_score() -> None:
+    """Verifies _collect_calibration_pairs skips empty CaseScore objects without misalignment."""
     from a2ui_eval.decision_bench import CaseScore
 
     synth = DecisionSynthesizer(
@@ -481,18 +510,23 @@ async def test_collect_calibration_pairs_preserves_alignment_on_empty_score() ->
         expected_archetypes=["article"],
         required_blocks=["nonexistent_block"],
     )
-    pairs_with_empty = calibrate_decision_backend._collect_calibration_pairs([
-        CaseScore(case=empty_case, repeats=1, evaluations=[]),
-        host_score,
-    ])
-    pairs_direct = calibrate_decision_backend._collect_calibration_pairs([
-        host_score,
-    ])
+    pairs_with_empty = calibrate_decision_backend._collect_calibration_pairs(
+        [
+            CaseScore(case=empty_case, repeats=1, evaluations=[]),
+            host_score,
+        ]
+    )
+    pairs_direct = calibrate_decision_backend._collect_calibration_pairs(
+        [
+            host_score,
+        ]
+    )
     assert pairs_with_empty == pairs_direct
 
 
 @pytest.mark.asyncio
 async def test_wave6_forced_fit_and_false_no_fit_rates() -> None:
+    """Verifies forced-fit and false no-fit rates across in-grammar and out-of-grammar cases."""
     none_case = PlanCase(
         name="chess_board_canvas",
         intent="Render an interactive 8x8 chess board with drag-and-drop moves",
@@ -531,6 +565,7 @@ async def test_wave6_forced_fit_and_false_no_fit_rates() -> None:
 
 @pytest.mark.asyncio
 async def test_wave6_slot_bindings_sensitive_leaks_and_action_accuracy() -> None:
+    """Verifies slot binding recall, action binding accuracy, and sensitive pointer leak detection."""
     safe_case = PlanCase(
         name="host_with_action_and_secret",
         intent="Show server record for prod-1",
@@ -597,6 +632,7 @@ async def test_wave6_slot_bindings_sensitive_leaks_and_action_accuracy() -> None
 
 @pytest.mark.asyncio
 async def test_wave6_multi_turn_cache_hits_and_operation_accuracy() -> None:
+    """Verifies multi-turn surface lifecycle operation scoring and plan cache hit rates."""
     mt_case = PlanCase(
         name="host_lifecycle",
         intent="Display server metrics",
@@ -647,6 +683,7 @@ async def test_wave6_multi_turn_cache_hits_and_operation_accuracy() -> None:
 
 @pytest.mark.asyncio
 async def test_wave6_paraphrase_and_template_arm_modes() -> None:
+    """Verifies paraphrase sensitivity and tool-mode promoted template arm benchmarks."""
     tool_case = PlanCase(
         name="host_tool",
         intent="Show CPU and host metrics",
@@ -662,8 +699,10 @@ async def test_wave6_paraphrase_and_template_arm_modes() -> None:
     inner = scripted_backend(HOST_ANSWERS, model_id="mock-para")
 
     class _SpyBackend(ParaphraseDecisionBackend):
+        """Records rewritten decision question prompts during paraphrase evaluation."""
 
         async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
+            """Forwards `batch` to `super().answer` and records rewritten prompts."""
             res = await super().answer(batch)
             seen_prompts.extend(
                 rewrite_question_prompt(q.prompt) for q in batch.questions
@@ -695,6 +734,7 @@ async def test_wave6_paraphrase_and_template_arm_modes() -> None:
 def test_decision_bench_cli_required_flags_and_heldout_unfrozen_notice(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Verifies decision_bench CLI required flags and unfrozen heldout banner rendering."""
     with pytest.raises(SystemExit):
         decision_bench_cli.parse_args([])
 
@@ -717,20 +757,22 @@ def test_decision_bench_cli_required_flags_and_heldout_unfrozen_notice(
         encoding="utf-8",
     )
     json_out = tmp_path / "bench_out.json"
-    rc = decision_bench_cli.main([
-        "--backend",
-        "mock",
-        "--model",
-        "mock",
-        "--dataset",
-        str(ds_dir),
-        "--split",
-        "all",
-        "--paraphrase",
-        "--template-arm",
-        "--json",
-        str(json_out),
-    ])
+    rc = decision_bench_cli.main(
+        [
+            "--backend",
+            "mock",
+            "--model",
+            "mock",
+            "--dataset",
+            str(ds_dir),
+            "--split",
+            "all",
+            "--paraphrase",
+            "--template-arm",
+            "--json",
+            str(json_out),
+        ]
+    )
     assert rc == 0
     captured = capsys.readouterr().out
     assert "[UNFROZEN HELDOUT]" in captured
@@ -744,12 +786,14 @@ def test_decision_bench_cli_required_flags_and_heldout_unfrozen_notice(
 
 @pytest.mark.asyncio
 async def test_paraphrase_backend_and_recorder_use_server_reported_latency() -> None:
+    """Verifies ParaphraseDecisionBackend forwards last_call_latency_ms to the recorder."""
     import asyncio
 
     inner = scripted_backend(HOST_ANSWERS, model_id="mock-lat")
     orig_answer = inner.answer
 
     async def delayed_answer(batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
+        """Adds an artificial client sleep before returning the scripted answer."""
         await asyncio.sleep(0.02)
         return await orig_answer(batch)
 
@@ -767,3 +811,209 @@ async def test_paraphrase_backend_and_recorder_use_server_reported_latency() -> 
     synth = DecisionSynthesizer([BasicCatalog("v1.0")], wrapped)
     summary = await run_benchmark(synth, [case], repeat=1)
     assert summary.p50_latency_ms == pytest.approx(1.5)
+
+
+@pytest.mark.asyncio
+async def test_plan_turn_forwards_layout_title_summary_and_fallback_dsl() -> None:
+    """Verifies PlanTurn parses and forwards layout, title, summary, and fallback_dsl."""
+    turn = PlanTurn.from_dict(
+        {
+            "intent": "Display server metrics",
+            "payload": dict(HOST_DECISION_BLOCK.payload),
+            "layout": ["headline:cpu", "facts:host"],
+            "title": "Custom Turn Title",
+            "summary": "Custom Turn Summary",
+            "fallback_dsl": "Text: Custom Turn Fallback",
+        }
+    )
+    assert turn.layout == ["headline:cpu", "facts:host"]
+    assert turn.title == "Custom Turn Title"
+    assert turn.summary == "Custom Turn Summary"
+    assert turn.fallback_dsl == "Text: Custom Turn Fallback"
+
+    captured_kwargs: dict[str, object] = {}
+    synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")], scripted_backend(HOST_ANSWERS, model_id="mock-turn")
+    )
+    orig_synthesize = synth.synthesize
+
+    async def spy_synthesize(*args: object, **kwargs: object) -> object:
+        """Captures keyword arguments forwarded by _run_single_turn_step."""
+        captured_kwargs.update(kwargs)
+        return await orig_synthesize(*args, **kwargs)  # type: ignore[arg-type]
+
+    synth.synthesize = spy_synthesize  # type: ignore[method-assign]
+    mt_case = PlanCase(
+        name="host_turn_fields",
+        intent="Display server metrics",
+        payload=dict(HOST_DECISION_BLOCK.payload),
+        expected_family="monitor",
+        expected_archetypes=["dashboard"],
+        turns=[turn],
+    )
+    await run_case(synth, mt_case, repeat=1)
+    assert captured_kwargs["layout"] == ["headline:cpu", "facts:host"]
+    assert captured_kwargs["title"] == "Custom Turn Title"
+    assert captured_kwargs["summary"] == "Custom Turn Summary"
+    assert captured_kwargs["fallback_dsl"] == "Text: Custom Turn Fallback"
+
+
+def test_seed_script_infers_family_from_decision_family_or_archetype_grammar(
+    tmp_path: Path,
+) -> None:
+    """Verifies seed_cases_from_logs produces schema-valid families across synthesis stages."""
+    fake_log = {
+        "samples": [
+            {
+                "id": "s_browse",
+                "input": "Browse resorts",
+                "metadata": {
+                    "decision_block": {
+                        "intent": "Browse resorts",
+                        "payload": {"resorts": [{"name": "Alta"}]},
+                    },
+                    "decision_archetype": "feed",
+                    "decision_stage": "archetype",
+                    "decision_blocks": ["collection"],
+                },
+            },
+            {
+                "id": "s_tpl",
+                "input": "Confirm payment",
+                "metadata": {
+                    "decision_block": {
+                        "intent": "Confirm payment",
+                        "payload": {"amount": 50},
+                    },
+                    "decision_family": "act",
+                    "decision_archetype": "confirm",
+                    "decision_stage": "template_select",
+                    "decision_blocks": ["actions"],
+                },
+            },
+            {
+                "id": "s_inspect",
+                "input": "Inspect cluster node",
+                "metadata": {
+                    "decision_block": {
+                        "intent": "Inspect cluster node",
+                        "payload": {"node": "worker-1", "status": "Ready"},
+                    },
+                    "decision_archetype": "detail",
+                    "decision_stage": "blocks",
+                    "decision_blocks": ["prose", "facts"],
+                },
+            },
+        ]
+    }
+    target_seeded = (
+        GIT_ROOT
+        / "eval"
+        / "datasets"
+        / "decision_plans"
+        / "test_tmp_seeded_stages.yaml"
+    )
+    if target_seeded.is_file():
+        target_seeded.unlink()
+    fake_log_file = tmp_path / "stages.eval"
+    fake_log_file.write_text("{}", encoding="utf-8")
+
+    try:
+        with patch("seed_decision_plans.load_log_data", return_value=fake_log):
+            added = seed_cases_from_logs([fake_log_file], target_seeded)
+            assert added == 3
+
+        loaded = load_plan_cases(
+            target_seeded, include_unverified=True, schema_path=SCHEMA_FILE
+        )
+        by_name = {c.name: c for c in loaded}
+        assert by_name["s_browse_feed"].expected_family == "browse"
+        assert by_name["s_tpl_confirm"].expected_family == "act"
+        assert by_name["s_inspect_detail"].expected_family == "inspect"
+    finally:
+        if target_seeded.is_file():
+            target_seeded.unlink()
+
+
+@pytest.mark.asyncio
+async def test_calibration_pairs_exclude_out_of_grammar_archetype_points() -> None:
+    """Verifies _collect_calibration_pairs omits archetype points on out-of-grammar abstentions."""
+    none_case = PlanCase(
+        name="out_of_grammar_none",
+        intent="Draw an interactive 3D shader canvas",
+        payload={"fps": 60},
+        expected_family="none",
+        expected_archetypes=[],
+        split="tuning",
+        verified=True,
+    )
+    synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")],
+        scripted_backend({"family": ("none", 0.90)}, model_id="mock-none"),
+    )
+    score = await run_case(synth, none_case, repeat=1)
+    pairs = calibrate_decision_backend._collect_calibration_pairs([score])
+    # Only the family decision question was asked; no archetype question was answered.
+    assert len(pairs) == 1
+    assert pairs[0] == pytest.approx((0.90, 1.0))
+
+
+@pytest.mark.asyncio
+async def test_out_of_grammar_only_benchmark_reports_zero_in_grammar_accuracy() -> None:
+    """Verifies out-of-grammar-only benchmark slices report 0.0 in-grammar accuracy."""
+    none_case = PlanCase(
+        name="out_of_grammar_only",
+        intent="Draw an interactive 3D shader canvas",
+        payload={"fps": 60},
+        expected_family="none",
+        expected_archetypes=[],
+        split="heldout",
+        verified=True,
+    )
+    synth = DecisionSynthesizer(
+        [BasicCatalog("v1.0")],
+        scripted_backend({"family": ("none", 0.90)}, model_id="mock-none"),
+    )
+    summary = await run_benchmark(synth, [none_case], repeat=1)
+    assert summary.in_grammar_count == 0
+    assert summary.out_of_grammar_count == 1
+    assert summary.forced_fit_rate == 0.0
+    assert summary.family_accuracy == 0.0
+    assert summary.archetype_accuracy == 0.0
+
+
+def test_load_tuning_cases_defaults_to_tuning_split_and_rejects_other_splits(
+    tmp_path: Path,
+) -> None:
+    """Verifies load_tuning_cases isolates v1.yaml by default and rejects non-tuning splits."""
+    ds_dir = tmp_path / "decision_plans"
+    ds_dir.mkdir()
+    _write_synthetic_tuning_yaml(ds_dir / "v1.yaml")
+    (ds_dir / "heldout_v1.yaml").write_text(
+        """
+- name: secret_heldout
+  intent: "Show CPU utilization"
+  payload:
+    cpu: 0.5
+  expected:
+    family: "monitor"
+    archetypes: ["dashboard"]
+  split: "heldout"
+  verified: true
+""",
+        encoding="utf-8",
+    )
+    cases = calibrate_decision_backend.load_tuning_cases(
+        ds_dir, split=None, schema_path=SCHEMA_FILE
+    )
+    assert len(cases) == 2
+    assert all(not c.is_heldout for c in cases)
+
+    with pytest.raises(ValueError, match="only 'tuning' is allowed"):
+        calibrate_decision_backend.load_tuning_cases(
+            ds_dir, split="heldout", schema_path=SCHEMA_FILE
+        )
+    with pytest.raises(ValueError, match="only 'tuning' is allowed"):
+        calibrate_decision_backend.load_tuning_cases(
+            ds_dir, split="all", schema_path=SCHEMA_FILE
+        )

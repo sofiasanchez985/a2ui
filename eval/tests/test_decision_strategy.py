@@ -55,6 +55,7 @@ def _make_state(
     completion: str | None = None,
     messages: list[Any] | None = None,
 ) -> TaskState:
+    """Constructs a synthetic Inspect AI TaskState for solver unit tests."""
     output = (
         ModelOutput(
             model="mock/model",
@@ -77,11 +78,14 @@ def _make_state(
 
 
 async def _dummy_generate(state: TaskState, *args: Any, **kwargs: Any) -> TaskState:
+    """No-op generate callback that returns `state` unchanged."""
+    del args, kwargs
     return state
 
 
 @pytest.mark.asyncio
 async def test_decision_system_prompt_injection() -> None:
+    """Verifies decision_system_prompt injects the role and `<a2ui>` decision schema."""
     state = _make_state(
         metadata={
             "catalog": "catalogs/basic/v1/catalog.json",
@@ -99,6 +103,7 @@ async def test_decision_system_prompt_injection() -> None:
 
 @pytest.mark.asyncio
 async def test_decision_solver_scripted_success() -> None:
+    """Verifies compile_decision_payload synthesizes A2UI JSON and populates metadata."""
     backend = scripted_backend(HOST_ANSWERS, model_id="mock-v1")
     valid_completion = f"<a2ui>\n{HOST_BLOCK}\n</a2ui>"
     state = _make_state(
@@ -126,6 +131,7 @@ async def test_decision_solver_scripted_success() -> None:
     for key in DECISION_METADATA_KEYS:
         assert key in state.metadata, f"Missing decision metadata key: {key}"
     assert state.metadata["decision_stage"] == "archetype"
+    assert state.metadata["decision_family"] == "monitor"
     assert state.metadata["decision_archetype"] == "dashboard"
     assert state.metadata["decision_backend"] == "mock"
     assert state.metadata["decision_backend_kind"] == "mock"
@@ -141,6 +147,7 @@ async def test_decision_solver_scripted_success() -> None:
 
 @pytest.mark.asyncio
 async def test_decision_solver_actions_map_and_exclude_round_trip() -> None:
+    """Verifies actions map compilation and excluded pointer omission."""
     backend = scripted_backend(TRANSFER_ANSWERS, model_id="mock-act")
     block_dict = json.loads(TRANSFER_BLOCK)
     block_dict["payload"]["internalDebugToken"] = "secret-debug"
@@ -175,6 +182,7 @@ async def test_decision_solver_actions_map_and_exclude_round_trip() -> None:
 async def test_decision_solver_requires_explicit_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verifies compile_decision_payload raises ValueError when no backend is selected."""
     monkeypatch.delenv("A2UI_DECISION_BACKEND", raising=False)
     state = _make_state(
         metadata={
@@ -190,6 +198,7 @@ async def test_decision_solver_requires_explicit_backend(
 
 @pytest.mark.asyncio
 async def test_decision_solver_unscripted_abstain_fails() -> None:
+    """Verifies an empty payload abstention marks pass_at_1 False."""
     # Unparseable tag / empty payload with no fallback messages
     invalid_completion = '<a2ui>\n{"intent": "Unknown intent", "payload": {}}\n</a2ui>'
     state = _make_state(
@@ -213,11 +222,14 @@ async def test_decision_solver_unscripted_abstain_fails() -> None:
 
 @pytest.mark.asyncio
 async def test_decision_solver_validation_retries() -> None:
+    """Verifies validation retry re-prompts the host LLM and succeeds on attempt 2."""
     backend = scripted_backend(HOST_ANSWERS)
     call_count = 0
 
     async def retry_generate(st: TaskState, *args: Any, **kwargs: Any) -> TaskState:
+        """Replaces the invalid attempt-1 output with a valid `<a2ui>` block."""
         nonlocal call_count
+        del args, kwargs
         call_count += 1
         st.output = ModelOutput(
             model="mock/model",
@@ -256,7 +268,60 @@ async def test_decision_solver_validation_retries() -> None:
     assert any("Validation failed:" in str(m.content) for m in state.messages)
 
 
+@pytest.mark.asyncio
+async def test_decision_solver_clears_stale_metadata_across_retry_attempts() -> None:
+    """Verifies per-attempt decision metadata is cleared on retry while calls accumulate."""
+    backend = scripted_backend(HOST_ANSWERS, model_id="mock-retry")
+
+    async def retry_with_malformed_json(
+        st: TaskState, *args: Any, **kwargs: Any
+    ) -> TaskState:
+        """Emits malformed `<a2ui>` JSON on attempt 2 so parsing fails before synthesis."""
+        del args, kwargs
+        st.output = ModelOutput(
+            model="mock/model",
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatMessageAssistant(content="<a2ui>{bad json</a2ui>")
+                )
+            ],
+        )
+        return st
+
+    state = _make_state(
+        metadata={"catalog": "catalogs/basic/v1/catalog.json"},
+        completion=f"<a2ui>\n{HOST_BLOCK}\n</a2ui>",
+    )
+
+    # Attempt 1 synthesizes and records decision metadata, then fails schema
+    # validation; attempt 2 fails JSON parsing before synthesis.
+    with (
+        patch(
+            "a2ui_eval.strategies.decision.build_decision_backend",
+            return_value=backend,
+        ),
+        patch(
+            "a2ui_eval.strategies.decision.parse_and_validate",
+            side_effect=ValueError("forced validation error after synthesis"),
+        ),
+    ):
+        step = compile_decision_payload(
+            "1.0", decision_backend="mock", max_validation_retries=1
+        )
+        state = await step(state, retry_with_malformed_json)
+
+    assert state.metadata.get("pass_at_1") is False
+    assert state.metadata.get("pass_at_k") is False
+    # Stale per-attempt keys from attempt 1 must be cleared when attempt 2 fails early,
+    # while cumulative decision_calls and decision_latency_ms remain intact.
+    assert "decision_archetype" not in state.metadata
+    assert "decision_family" not in state.metadata
+    assert "decision_stage" not in state.metadata
+    assert state.metadata.get("decision_calls", 0) > 0
+
+
 def test_build_decision_backend_jev_missing_key() -> None:
+    """Verifies build_decision_backend('jev') raises ValueError when API keys are absent."""
     with patch.dict(os.environ, {}, clear=True):
         with pytest.raises(ValueError, match="JEV_API_KEY"):
             build_decision_backend("jev")
@@ -266,18 +331,23 @@ def test_build_decision_backend_jev_missing_key() -> None:
 async def test_compile_decision_payload_closes_factory_if_create_format_raises() -> (
     None
 ):
+    """Verifies compile_decision_payload closes the factory even when create_format fails."""
     closed = False
 
     class _BoomFactory:
+        """Test stub that raises from create_format and tracks aclose calls."""
 
         def __init__(self, **kwargs: object) -> None:
+            """Ignores constructor keyword arguments."""
             del kwargs
 
         def create_format(self, catalogs: object) -> object:
+            """Raises RuntimeError to simulate format initialization failure."""
             del catalogs
             raise RuntimeError("create_format boom")
 
         async def aclose(self) -> None:
+            """Marks the factory as closed."""
             nonlocal closed
             closed = True
 
@@ -287,6 +357,7 @@ async def test_compile_decision_payload_closes_factory_if_create_format_raises()
     )
 
     async def noop_generate(st: object) -> object:
+        """Returns `st` unchanged."""
         return st
 
     with (

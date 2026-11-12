@@ -30,6 +30,7 @@ import decision_scorecard
 
 
 def _write_scorecard_datasets(ds_dir: Path) -> None:
+    """Writes synthetic tuning (`v1.yaml`) and heldout (`heldout_v1.yaml`) datasets."""
     ds_dir.mkdir(parents=True, exist_ok=True)
     (ds_dir / "v1.yaml").write_text(
         """
@@ -86,6 +87,7 @@ def _write_scorecard_datasets(ds_dir: Path) -> None:
 
 
 def test_ensure_mock_baseline_and_yaml_config_loading(tmp_path: Path) -> None:
+    """Verifies scorecard YAML configuration parsing and mock baseline injection."""
     cfg_path = tmp_path / "backends.yaml"
     cfg_path.write_text(
         """
@@ -116,6 +118,7 @@ backends:
 def test_decision_scorecard_generates_markdown_and_json_across_splits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Verifies decision_scorecard CLI emits Markdown and JSON reports across splits."""
     monkeypatch.delenv("JEV_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("A2UI_DECISION_URL", raising=False)
@@ -141,20 +144,22 @@ backends:
     md_out = tmp_path / "scorecard.md"
     json_out = tmp_path / "scorecard.json"
 
-    rc = decision_scorecard.main([
-        "--config",
-        str(cfg_path),
-        "--dataset",
-        str(ds_dir),
-        "--split",
-        "all",
-        "--paraphrase",
-        "--template-arm",
-        "--out",
-        str(md_out),
-        "--json",
-        str(json_out),
-    ])
+    rc = decision_scorecard.main(
+        [
+            "--config",
+            str(cfg_path),
+            "--dataset",
+            str(ds_dir),
+            "--split",
+            "all",
+            "--paraphrase",
+            "--template-arm",
+            "--out",
+            str(md_out),
+            "--json",
+            str(json_out),
+        ]
+    )
     assert rc == 0
     md_text = md_out.read_text(encoding="utf-8")
     assert "# A2UI Decision Model Scorecard" in md_text
@@ -174,11 +179,13 @@ backends:
     assert len(parsed["skipped_backends"]) == 1
 
     # `--strict` exits 1 when `jev_hosted` lacks credentials
-    rc_strict = decision_scorecard.main([
-        "--config",
-        str(cfg_path),
-        "--dataset",
-        str(ds_dir),
-        "--strict",
-    ])
+    rc_strict = decision_scorecard.main(
+        [
+            "--config",
+            str(cfg_path),
+            "--dataset",
+            str(ds_dir),
+            "--strict",
+        ]
+    )
     assert rc_strict == 1

@@ -61,6 +61,7 @@ _FORMAT_PTR_RE = re.compile(r"\$\{(/[^}]+)\}")
 
 
 def _normalize_ptr(raw: str) -> str:
+    """Normalizes a JSON Pointer string so non-empty paths begin with `/`."""
     cleaned = raw.strip()
     if not cleaned:
         return ""
@@ -102,7 +103,26 @@ def _parse_expected_actions(raw: Any) -> dict[str, list[str]]:
 
 @dataclass(frozen=True)
 class PlanTurn:
-    """One turn in a multi-turn `PlanCase` sequence."""
+    """Represents one turn in a multi-turn `PlanCase` sequence.
+
+    Attributes:
+        intent: Natural-language rendering intent for this turn.
+        payload: Structured JSON payload for this turn.
+        surface_id: Target A2UI surface identifier.
+        actions: Declared action specifications keyed by action identifier.
+        exclude: JSON Pointers excluded from planning for this turn.
+        replace: Whether this turn forces a full surface replacement.
+        region: Optional surface sub-region identifier to update.
+        labels: Optional human-readable field label overrides.
+        mutable_paths: JSON Pointers that accept two-way user input.
+        layout: Optional explicit block layout hints for this turn.
+        title: Optional explicit page title override for this turn.
+        summary: Optional explicit page summary override for this turn.
+        fallback_dsl: Optional A2UI Express fallback DSL for this turn.
+        expected_operation: Expected surface operation (`create`, `update_root`,
+            `update_region`, or `replace`).
+        expected_cache_hit: Whether this turn is expected to hit the plan cache.
+    """
 
     intent: str
     payload: dict[str, Any]
@@ -113,10 +133,15 @@ class PlanTurn:
     region: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     mutable_paths: list[str] = field(default_factory=list)
+    layout: list[str] = field(default_factory=list)
+    title: str | None = None
+    summary: str | None = None
+    fallback_dsl: str | None = None
     expected_operation: str | None = None
     expected_cache_hit: bool | None = None
 
     def action_specs(self) -> tuple[ActionSpec, ...]:
+        """Parses `self.actions` map entries into `ActionSpec` instances."""
         return tuple(
             ActionSpec.from_block_value(str(act_id), val)
             for act_id, val in self.actions.items()
@@ -124,7 +149,18 @@ class PlanTurn:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PlanTurn:
+        """Constructs a `PlanTurn` from a raw YAML turn mapping.
+
+        Args:
+            data: Raw dictionary parsed from a multi-turn case entry.
+
+        Returns:
+            A validated `PlanTurn` instance.
+        """
         raw_labels = data.get("labels") or {}
+        fb_dsl = data.get("fallback_dsl")
+        if fb_dsl is None:
+            fb_dsl = data.get("fallbackDsl")
         return cls(
             intent=str(data["intent"]),
             payload=dict(data.get("payload") or {}),
@@ -137,6 +173,10 @@ class PlanTurn:
             mutable_paths=list(
                 data.get("mutable_paths") or data.get("mutablePaths") or []
             ),
+            layout=_seq_list(data.get("layout")),
+            title=data.get("title"),
+            summary=data.get("summary"),
+            fallback_dsl=fb_dsl,
             expected_operation=(
                 str(data["expected_operation"]).strip().lower()
                 if data.get("expected_operation") is not None
@@ -152,7 +192,38 @@ class PlanTurn:
 
 @dataclass(frozen=True)
 class PlanCase:
-    """A single ground-truth decision evaluation case."""
+    """Represents a single ground-truth decision evaluation case.
+
+    Attributes:
+        name: Unique case identifier within its split.
+        intent: Natural-language rendering intent.
+        payload: Structured JSON payload passed to the synthesizer.
+        expected_family: Ground-truth job family (`none` for out-of-grammar cases).
+        expected_archetypes: Acceptable ground-truth archetype identifiers.
+        mode: Execution mode (`chat` or `tool`).
+        tool_name: Optional tool name override when `mode == 'tool'`.
+        actions: Declared action specifications keyed by action identifier.
+        exclude: JSON Pointers excluded from planning.
+        replace: Whether this case requests a full surface replacement.
+        region: Optional surface sub-region identifier.
+        labels: Optional human-readable field label overrides.
+        mutable_paths: JSON Pointers that accept two-way user input.
+        layout: Optional explicit block layout hints.
+        title: Optional explicit page title override.
+        summary: Optional explicit page summary override.
+        fallback_dsl: Optional A2UI Express fallback DSL.
+        sensitive: JSON Pointers that must never appear in rendered output.
+        turns: Optional sequence of turns for multi-turn evaluation.
+        required_blocks: Block identifiers that must appear in the layout plan.
+        forbidden_blocks: Block identifiers that must not appear in the layout plan.
+        expected_action_gate: Expected action-gate outcome (`pass`, `abstain`, or `any`).
+        expected_bindings: Expected slot-to-pointer bindings (`<block>.<slot>`).
+        expected_actions: Expected action identifiers and bound context keys/paths.
+        split: Dataset split (`tuning` or `heldout`).
+        tags: Case tags used for filtering.
+        verified: Whether a human reviewer has verified the case labels.
+        source: Optional provenance metadata dictionary.
+    """
 
     name: str
     intent: str
@@ -185,7 +256,7 @@ class PlanCase:
 
     @property
     def is_heldout(self) -> bool:
-        """Whether this case belongs to the held-out evaluation split."""
+        """Returns whether this case belongs to the held-out evaluation split."""
         if self.split and self.split.strip().lower() == "heldout":
             return True
         lowered = {t.strip().lower() for t in self.tags}
@@ -193,12 +264,12 @@ class PlanCase:
 
     @property
     def is_out_of_grammar(self) -> bool:
-        """Whether this case expects the planner to report `no_fit` (`none`)."""
+        """Returns whether this case expects the planner to report `no_fit` (`none`)."""
         return self.expected_family.strip().lower() == "none"
 
     @property
     def effective_tool_name(self) -> str:
-        """Tool identifier used when `self.mode == 'tool'`."""
+        """Returns the tool identifier used when `self.mode == 'tool'`."""
         return self.tool_name or f"render_{self.name}"
 
     def action_specs(self) -> tuple[ActionSpec, ...]:
@@ -210,6 +281,14 @@ class PlanCase:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PlanCase:
+        """Constructs a `PlanCase` from a raw YAML case mapping.
+
+        Args:
+            data: Raw dictionary parsed from a decision plan dataset YAML file.
+
+        Returns:
+            A validated `PlanCase` instance.
+        """
         expected = dict(data.get("expected") or {})
         blocks = dict(expected.get("blocks") or {})
         raw_labels = dict(data.get("labels") or {})
@@ -354,7 +433,23 @@ def load_plan_cases(
     include_unverified: bool = False,
     schema_path: str | Path | None = None,
 ) -> list[PlanCase]:
-    """Loads and validates decision plan cases from a YAML file or dataset directory."""
+    """Loads and validates decision plan cases from a YAML file or dataset directory.
+
+    Args:
+        cases_path: Path to a YAML file or dataset directory containing `v1.yaml`
+            and `heldout_v1.yaml`.
+        tags: Optional comma-separated string or sequence of tags to keep.
+        split: Optional split filter (`tuning`, `heldout`, or `all`).
+        include_unverified: Whether to include cases marked `verified: false`.
+        schema_path: Optional explicit JSON Schema file path.
+
+    Returns:
+        The list of `PlanCase` instances matching the requested filters.
+
+    Raises:
+        FileNotFoundError: If `cases_path` is a non-existent file path.
+        RuntimeError: If the target dataset files are Transcrypt-encrypted.
+    """
     path = Path(cases_path)
     if path.is_dir():
         files = _resolve_directory_files(path, split)
@@ -380,7 +475,14 @@ def load_plan_cases(
 
 
 def is_action_gate_blocked(output: SynthesisOutput) -> bool:
-    """Checks whether the synthesis run was blocked by an action gate."""
+    """Checks whether the synthesis run was blocked by an action gate.
+
+    Args:
+        output: Synthesis output returned by `DecisionSynthesizer`.
+
+    Returns:
+        True when synthesis abstained or fell back due to an action-gate check.
+    """
     if output.stage is not SynthesisStage.ABSTAIN_FALLBACK:
         return False
     if output.fallback_reason == "action_gate" or "(action_gate)" in (
@@ -394,7 +496,14 @@ def is_action_gate_blocked(output: SynthesisOutput) -> bool:
 
 
 def is_no_fit_output(output: SynthesisOutput) -> bool:
-    """Checks whether the planner reported `no_fit` (`family == 'none'`)."""
+    """Checks whether the planner reported `no_fit` (`family == 'none'`).
+
+    Args:
+        output: Synthesis output returned by `DecisionSynthesizer`.
+
+    Returns:
+        True when the planner selected `none` (`no_fit`).
+    """
     reason = (output.fallback_reason or "").strip().lower()
     if reason == "no_fit" or "(no_fit)" in reason:
         return True
@@ -403,7 +512,36 @@ def is_no_fit_output(output: SynthesisOutput) -> bool:
 
 @dataclass(frozen=True)
 class CaseEvaluation:
-    """Evaluation metrics for a single case execution (single-turn or multi-turn)."""
+    """Stores evaluation metrics for a single case execution.
+
+    Attributes:
+        output: Raw `SynthesisOutput` emitted by the synthesizer.
+        wall_time_ms: Total end-to-end wall-clock execution time in milliseconds.
+        family_correct: Whether the predicted family matched ground truth.
+        archetype_correct: Whether the predicted archetype matched ground truth.
+        block_precision: Precision over planned block identifiers.
+        block_recall: Recall over required block identifiers.
+        forbidden_block_count: Count of forbidden blocks present in the plan.
+        action_gate_outcome: Observed action-gate outcome (`pass` or `abstain`).
+        abstained: Whether synthesis abstained or fell back without a direct plan.
+        used_fallback: Whether fallback messages were emitted.
+        out_of_grammar: Whether the evaluated case expects `family == 'none'`.
+        forced_fit: Whether an out-of-grammar case produced a forced layout plan.
+        is_no_fit: Whether the planner reported `no_fit`.
+        slot_binding_hits: Count of expected slot bindings satisfied.
+        slot_binding_total: Total expected slot bindings declared on the case.
+        has_sensitive: Whether the case declared sensitive JSON Pointers.
+        sensitive_leaked: Whether any sensitive pointer or value leaked into output.
+        action_hits: Count of expected action specifications satisfied.
+        action_total: Total expected action specifications declared on the case.
+        surface_calls: Number of decision backend round trips executed.
+        surface_count: Number of surface turns evaluated in this run.
+        turn_latencies_ms: Per-turn decision backend latencies in milliseconds.
+        multi_turn_cache_hits: Count of multi-turn follow-up turns hitting cache.
+        multi_turn_cache_opportunities: Count of multi-turn follow-up cache opportunities.
+        multi_turn_op_hits: Count of multi-turn steps matching expected operation.
+        multi_turn_op_total: Count of multi-turn steps declaring an expected operation.
+    """
 
     output: SynthesisOutput
     wall_time_ms: float
@@ -434,12 +572,19 @@ class CaseEvaluation:
 
     @property
     def host_overhead_ms(self) -> float:
+        """Returns host synthesis overhead in milliseconds (`wall_time - decision_latency`)."""
         return max(0.0, self.wall_time_ms - self.output.decision_latency_ms)
 
 
 @dataclass
 class CaseScore:
-    """Aggregated score for a case across repeats."""
+    """Aggregates evaluation metrics for a single case across repeat runs.
+
+    Attributes:
+        case: The ground-truth `PlanCase` evaluated.
+        repeats: Number of repeat runs requested for this case.
+        evaluations: Collected per-run `CaseEvaluation` instances.
+    """
 
     case: PlanCase
     repeats: int
@@ -447,6 +592,7 @@ class CaseScore:
 
     @property
     def family_accuracy(self) -> float:
+        """Returns the fraction of runs that predicted the expected job family."""
         if not self.evaluations:
             return 0.0
         return sum(1.0 for e in self.evaluations if e.family_correct) / len(
@@ -455,6 +601,7 @@ class CaseScore:
 
     @property
     def archetype_accuracy(self) -> float:
+        """Returns the fraction of runs that predicted an expected archetype."""
         if not self.evaluations:
             return 0.0
         return sum(1.0 for e in self.evaluations if e.archetype_correct) / len(
@@ -463,24 +610,28 @@ class CaseScore:
 
     @property
     def block_precision(self) -> float:
+        """Returns mean block precision across runs."""
         if not self.evaluations:
             return 0.0
         return sum(e.block_precision for e in self.evaluations) / len(self.evaluations)
 
     @property
     def block_recall(self) -> float:
+        """Returns mean block recall across runs."""
         if not self.evaluations:
             return 0.0
         return sum(e.block_recall for e in self.evaluations) / len(self.evaluations)
 
     @property
     def abstain_rate(self) -> float:
+        """Returns the fraction of runs that abstained or fell back."""
         if not self.evaluations:
             return 0.0
         return sum(1.0 for e in self.evaluations if e.abstained) / len(self.evaluations)
 
     @property
     def fallback_rate(self) -> float:
+        """Returns the fraction of runs that used a fallback path."""
         if not self.evaluations:
             return 0.0
         return sum(1.0 for e in self.evaluations if e.used_fallback) / len(
@@ -489,6 +640,7 @@ class CaseScore:
 
     @property
     def forced_fit_rate(self) -> float:
+        """Returns the fraction of out-of-grammar runs that produced a forced plan."""
         if not self.evaluations or not self.case.is_out_of_grammar:
             return 0.0
         return sum(1.0 for e in self.evaluations if e.forced_fit) / len(
@@ -497,12 +649,14 @@ class CaseScore:
 
     @property
     def false_no_fit_rate(self) -> float:
+        """Returns the fraction of in-grammar runs that erroneously reported `no_fit`."""
         if not self.evaluations or self.case.is_out_of_grammar:
             return 0.0
         return sum(1.0 for e in self.evaluations if e.is_no_fit) / len(self.evaluations)
 
     @property
     def slot_binding_accuracy(self) -> float:
+        """Returns micro-averaged slot binding recall across runs."""
         total = sum(e.slot_binding_total for e in self.evaluations)
         if total == 0:
             return 1.0
@@ -510,6 +664,7 @@ class CaseScore:
 
     @property
     def action_accuracy(self) -> float:
+        """Returns micro-averaged action binding accuracy across runs."""
         total = sum(e.action_total for e in self.evaluations)
         if total == 0:
             return 1.0
@@ -517,6 +672,7 @@ class CaseScore:
 
     @property
     def sensitive_leak_rate(self) -> float:
+        """Returns the fraction of sensitive-pointer runs that leaked sensitive data."""
         sens = [e for e in self.evaluations if e.has_sensitive]
         if not sens:
             return 0.0
@@ -524,6 +680,7 @@ class CaseScore:
 
     @property
     def action_gate_match(self) -> bool:
+        """Returns whether all runs matched `case.expected_action_gate`."""
         if not self.evaluations:
             return False
         expected = self.case.expected_action_gate
@@ -533,26 +690,31 @@ class CaseScore:
 
     @property
     def decision_latency_p50(self) -> float:
+        """Returns median decision backend latency in milliseconds across runs."""
         latencies = sorted(e.output.decision_latency_ms for e in self.evaluations)
         return _percentile(latencies, 0.50)
 
     @property
     def decision_latency_p95(self) -> float:
+        """Returns 95th-percentile decision backend latency in milliseconds across runs."""
         latencies = sorted(e.output.decision_latency_ms for e in self.evaluations)
         return _percentile(latencies, 0.95)
 
     @property
     def host_overhead_p50(self) -> float:
+        """Returns median host overhead in milliseconds across runs."""
         overheads = sorted(e.host_overhead_ms for e in self.evaluations)
         return _percentile(overheads, 0.50)
 
     @property
     def host_overhead_p95(self) -> float:
+        """Returns 95th-percentile host overhead in milliseconds across runs."""
         overheads = sorted(e.host_overhead_ms for e in self.evaluations)
         return _percentile(overheads, 0.95)
 
     @property
     def round_trips_per_surface(self) -> float:
+        """Returns mean decision backend round trips per evaluated surface turn."""
         surfaces = sum(e.surface_count for e in self.evaluations)
         if surfaces == 0:
             return 0.0
@@ -560,10 +722,12 @@ class CaseScore:
 
     @property
     def mean_decision_calls(self) -> float:
+        """Returns an alias for `round_trips_per_surface`."""
         return self.round_trips_per_surface
 
 
 def _percentile(sorted_values: list[float], q: float) -> float:
+    """Computes linear-interpolated quantile `q` over pre-sorted `sorted_values`."""
     if not sorted_values:
         return 0.0
     idx = (len(sorted_values) - 1) * q
@@ -576,7 +740,14 @@ def _percentile(sorted_values: list[float], q: float) -> float:
 
 
 def brier_score(pairs: Sequence[tuple[float, float]]) -> float:
-    """Computes the mean squared error (Brier score) for probability pairs."""
+    """Computes the mean squared error (Brier score) for probability pairs.
+
+    Args:
+        pairs: Sequence of `(predicted_probability, binary_label)` pairs.
+
+    Returns:
+        The mean squared calibration error in `[0.0, 1.0]`.
+    """
     if not pairs:
         return 0.0
     return sum((p - y) ** 2 for p, y in pairs) / len(pairs)
@@ -592,7 +763,15 @@ def _bin_bounds_match(p: float, low: float, high: float, is_last: bool) -> bool:
 def expected_calibration_error(
     pairs: Sequence[tuple[float, float]], num_bins: int = 10
 ) -> float:
-    """Computes Expected Calibration Error (ECE) across `num_bins` equal bins."""
+    """Computes Expected Calibration Error (ECE) across `num_bins` equal bins.
+
+    Args:
+        pairs: Sequence of `(predicted_probability, binary_label)` pairs.
+        num_bins: Number of equal-width probability bins across `[0.0, 1.0]`.
+
+    Returns:
+        The weighted average absolute difference between bin confidence and accuracy.
+    """
     if not pairs or num_bins <= 0:
         return 0.0
     bin_size = 1.0 / num_bins
@@ -646,7 +825,15 @@ def fit_temperature(
     calibration_data: Sequence[tuple[float, float]],
     candidates: Sequence[float] | None = None,
 ) -> float:
-    """Finds temperature `T` in `candidates` that minimizes Expected Calibration Error."""
+    """Finds temperature `T` in `candidates` that minimizes Expected Calibration Error.
+
+    Args:
+        calibration_data: Sequence of `(predicted_probability, binary_label)` pairs.
+        candidates: Optional candidate temperature grid; defaults to `TEMPERATURE_GRID`.
+
+    Returns:
+        The positive temperature value minimizing ECE (ties prefer `1.0`).
+    """
     if not calibration_data:
         return 1.0
     grid = candidates or TEMPERATURE_GRID
@@ -670,7 +857,45 @@ def fit_temperature(
 
 @dataclass
 class BenchmarkSummary:
-    """Complete Wave 6 summary of a golden plan benchmark run."""
+    """Stores the complete Wave 6 summary of a golden plan benchmark run.
+
+    Attributes:
+        cases_count: Number of distinct `PlanCase` entries evaluated.
+        total_runs: Total case executions (`cases_count * repeat`).
+        backend_kind: Decision backend kind identifier.
+        model_id: Underlying model identifier.
+        family_accuracy: In-grammar job family classification accuracy.
+        archetype_accuracy: In-grammar archetype classification accuracy.
+        block_precision: Mean block precision across all runs.
+        block_recall: Mean block recall across all runs.
+        abstain_rate: Fraction of runs that abstained or fell back.
+        fallback_rate: Fraction of runs that emitted fallback output.
+        round_trips_per_surface: Mean decision backend calls per surface turn.
+        decision_latency_p50: Median per-turn decision backend latency in milliseconds.
+        decision_latency_p95: 95th-percentile per-turn decision backend latency in ms.
+        host_overhead_p50: Median host synthesis overhead in milliseconds.
+        host_overhead_p95: 95th-percentile host synthesis overhead in milliseconds.
+        decision_calls_mean: Alias for `round_trips_per_surface`.
+        brier_family: Brier calibration score for family questions.
+        ece_family: Expected Calibration Error for family questions.
+        brier_archetype: Brier calibration score for in-grammar archetype questions.
+        ece_archetype: Expected Calibration Error for in-grammar archetype questions.
+        brier_gates: Brier calibration score for optional block gate questions.
+        ece_gates: Expected Calibration Error for optional block gate questions.
+        forced_fit_rate: Fraction of out-of-grammar runs that produced a forced plan.
+        false_no_fit_rate: Fraction of in-grammar runs that reported `no_fit`.
+        slot_binding_accuracy: Micro-averaged slot binding recall across runs.
+        sensitive_leak_rate: Fraction of sensitive-pointer runs that leaked data.
+        action_accuracy: Micro-averaged action binding accuracy across runs.
+        multi_turn_cache_hit_rate: Plan cache hit rate on multi-turn follow-up turns.
+        multi_turn_operation_accuracy: Surface operation accuracy on multi-turn steps.
+        in_grammar_count: Number of evaluated in-grammar cases.
+        out_of_grammar_count: Number of evaluated out-of-grammar (`none`) cases.
+        unverified_count: Number of evaluated cases with `verified: false`.
+        split_name: Name of the evaluated dataset split.
+        fitted_temperature: Optional temperature fitted over collected calibration pairs.
+        case_scores: Per-case aggregated `CaseScore` results.
+    """
 
     cases_count: int
     total_runs: int
@@ -710,50 +935,69 @@ class BenchmarkSummary:
 
     @property
     def mean_round_trips(self) -> float:
+        """Returns mean decision backend round trips per surface turn."""
         return self.round_trips_per_surface
 
     @property
     def p50_latency_ms(self) -> float:
+        """Returns median decision backend latency in milliseconds."""
         return self.decision_latency_p50
 
     @property
     def p95_latency_ms(self) -> float:
+        """Returns 95th-percentile decision backend latency in milliseconds."""
         return self.decision_latency_p95
 
 
 @dataclass(frozen=True)
 class ParaphraseComparison:
-    """Accuracy delta when question prompts are rewritten via `PARAPHRASE_PROMPT_TABLE`."""
+    """Stores accuracy deltas when question prompts are rewritten via `PARAPHRASE_PROMPT_TABLE`.
+
+    Attributes:
+        baseline: Benchmark summary with default decision question prompts.
+        paraphrased: Benchmark summary with paraphrased decision question prompts.
+    """
 
     baseline: BenchmarkSummary
     paraphrased: BenchmarkSummary
 
     @property
     def family_accuracy_delta(self) -> float:
+        """Returns `paraphrased.family_accuracy - baseline.family_accuracy`."""
         return self.paraphrased.family_accuracy - self.baseline.family_accuracy
 
     @property
     def archetype_accuracy_delta(self) -> float:
+        """Returns `paraphrased.archetype_accuracy - baseline.archetype_accuracy`."""
         return self.paraphrased.archetype_accuracy - self.baseline.archetype_accuracy
 
     @property
     def slot_binding_accuracy_delta(self) -> float:
+        """Returns `paraphrased.slot_binding_accuracy - baseline.slot_binding_accuracy`."""
         return (
             self.paraphrased.slot_binding_accuracy - self.baseline.slot_binding_accuracy
         )
 
     @property
     def forced_fit_rate_delta(self) -> float:
+        """Returns `paraphrased.forced_fit_rate - baseline.forced_fit_rate`."""
         return self.paraphrased.forced_fit_rate - self.baseline.forced_fit_rate
 
     @property
     def false_no_fit_rate_delta(self) -> float:
+        """Returns `paraphrased.false_no_fit_rate - baseline.false_no_fit_rate`."""
         return self.paraphrased.false_no_fit_rate - self.baseline.false_no_fit_rate
 
 
 @dataclass(frozen=True)
 class TemplateArmComparison:
-    """Comparison of unpromoted planner arm vs promoted `SurfaceTemplate` arm on tool cases."""
+    """Compares unpromoted planner arm against promoted `SurfaceTemplate` arm on tool cases.
+
+    Attributes:
+        tool_cases_count: Number of in-grammar `mode == 'tool'` cases evaluated.
+        planner_arm: Benchmark summary for unpromoted `DecisionRenderTool` planning.
+        template_arm: Benchmark summary after promoting a seed run to `SurfaceTemplate`.
+    """
 
     tool_cases_count: int
     planner_arm: BenchmarkSummary
@@ -1136,9 +1380,20 @@ def _build_calibration_points(
 def evaluate_single_run(
     case: PlanCase, output: SynthesisOutput, wall_time_ms: float
 ) -> tuple[CaseEvaluation, list[tuple[str, float, float]]]:
-    """Evaluates one synthesis output against `case` expectations."""
+    """Evaluates one synthesis output against `case` expectations.
+
+    Args:
+        case: Ground-truth `PlanCase` entry.
+        output: `SynthesisOutput` produced by `DecisionSynthesizer`.
+        wall_time_ms: End-to-end wall-clock execution duration in milliseconds.
+
+    Returns:
+        A `(case_evaluation, calibration_points)` tuple for the run.
+    """
     answers_by_id = {ans.question_id: ans for ans in output.decision_answers}
     no_fit = is_no_fit_output(output)
+    # Out-of-grammar cases only count as forced-fit when the planner built a
+    # direct layout plan instead of abstaining or using fallback messages.
     forced_fit = (
         case.is_out_of_grammar
         and output.layout_plan is not None
@@ -1208,9 +1463,16 @@ def evaluate_single_run(
 
 
 class _BackendCallRecorder(DecisionBackend):
-    """Wraps a `DecisionBackend` to retain answers and timings across abstentions."""
+    """Wraps a `DecisionBackend` to retain answers and timings across abstentions.
+
+    Attributes:
+        answers: Ordered `DecisionAnswer` entries collected across calls.
+        calls: Total `answer` round trips recorded.
+        latency_ms: Cumulative backend execution latency in milliseconds.
+    """
 
     def __init__(self, inner: DecisionBackend) -> None:
+        """Initializes the recorder around `inner`."""
         self._inner = inner
         self.answers: list[DecisionAnswer] = []
         self.calls: int = 0
@@ -1218,22 +1480,27 @@ class _BackendCallRecorder(DecisionBackend):
 
     @property
     def backend_kind(self) -> str:
+        """Returns the wrapped backend kind."""
         return self._inner.backend_kind
 
     @property
     def model_id(self) -> str:
+        """Returns the wrapped model identifier."""
         return self._inner.model_id
 
     @property
     def capabilities(self) -> BackendCapabilities:
+        """Returns the wrapped backend capabilities."""
         return self._inner.capabilities
 
     @property
     def last_call_latency_ms(self) -> float | None:
+        """Returns the latency of the most recent inner backend call in ms."""
         val = getattr(self._inner, "last_call_latency_ms", None)
         return float(val) if isinstance(val, (int, float)) else None
 
     async def answer(self, batch: DecisionBatch) -> tuple[DecisionAnswer, ...]:
+        """Delegates `batch` to the inner backend while recording answers and latency."""
         t0 = time.perf_counter()
         result = await self._inner.answer(batch)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -1246,15 +1513,19 @@ class _BackendCallRecorder(DecisionBackend):
         return result
 
     async def aclose(self) -> None:
+        """Closes the wrapped backend."""
         await self._inner.aclose()
 
     async def aclose_current_loop(self) -> None:
+        """Closes resources bound to the current event loop on the wrapped backend."""
         await self._inner.aclose_current_loop()
 
     async def __aenter__(self) -> _BackendCallRecorder:
+        """Enters the async context manager."""
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        """Closes the wrapped backend when exiting the async context manager."""
         await self.aclose()
 
 
@@ -1407,6 +1678,10 @@ async def _run_single_turn_step(
             actions=turn.action_specs(),
             exclude=turn.exclude,
             mutable_paths=turn.mutable_paths,
+            layout=turn.layout or None,
+            title=turn.title,
+            summary=turn.summary,
+            fallback_dsl=turn.fallback_dsl,
             operation=op,
             labels=turn.labels,
             region=turn.region,
@@ -1507,7 +1782,16 @@ async def run_case(
     *,
     repeat: int = 1,
 ) -> CaseScore:
-    """Executes a decision synthesis case `repeat` times and scores results."""
+    """Executes a decision synthesis case `repeat` times and scores results.
+
+    Args:
+        synth: Configured `DecisionSynthesizer` to benchmark.
+        case: Ground-truth `PlanCase` to execute.
+        repeat: Number of repeat executions to run.
+
+    Returns:
+        Aggregated `CaseScore` over `repeat` runs.
+    """
     score = CaseScore(case=case, repeats=repeat)
     for _ in range(repeat):
         evaluation, _ = await _execute_case_once(synth, case)
@@ -1575,6 +1859,7 @@ def _group_calibration_pairs(
 
 
 def _safe_ratio(numerator: float, denominator: float, *, empty: float = 0.0) -> float:
+    """Divides `numerator` by `denominator`, returning `empty` when `denominator <= 0`."""
     return numerator / denominator if denominator > 0 else empty
 
 
@@ -1647,7 +1932,9 @@ def _summarize_evaluations(
     """Computes `BenchmarkSummary` metrics over `all_evaluations`."""
     total_runs = len(all_evaluations)
     in_gram, out_gram, sens_evals = _partition_evals(all_evaluations)
-    acc_pool = in_gram or all_evaluations
+    # In-grammar family and archetype accuracy are defined strictly over
+    # in-grammar cases; out-of-grammar cases are scored via forced_fit_rate.
+    acc_pool = in_gram
     in_cnt, out_cnt, unver_cnt = _count_case_splits(cases)
 
     latencies = _eval_turn_latencies(all_evaluations)
@@ -1713,7 +2000,18 @@ async def run_benchmark(
     fit_temp: bool = False,
     split_name: str = "all",
 ) -> BenchmarkSummary:
-    """Runs the benchmark across `cases` and summarizes accuracy, latency, and calibration."""
+    """Runs the benchmark across `cases` and summarizes accuracy, latency, and calibration.
+
+    Args:
+        synth: Configured `DecisionSynthesizer` to benchmark.
+        cases: Sequence of ground-truth `PlanCase` entries to evaluate.
+        repeat: Number of repeat runs per case.
+        fit_temp: Whether to fit a calibration temperature over collected pairs.
+        split_name: Split label recorded in the returned `BenchmarkSummary`.
+
+    Returns:
+        Aggregated `BenchmarkSummary` across all cases and repeats.
+    """
     case_scores: list[CaseScore] = []
     all_evaluations: list[CaseEvaluation] = []
     calibration_records: list[tuple[str, float, float]] = []
@@ -1746,7 +2044,18 @@ async def run_paraphrase_benchmark(
     split_name: str = "all",
     baseline: BenchmarkSummary | None = None,
 ) -> ParaphraseComparison:
-    """Runs `cases` with rewritten question prompts and compares against `baseline`."""
+    """Runs `cases` with rewritten question prompts and compares against `baseline`.
+
+    Args:
+        synth: Configured `DecisionSynthesizer` to benchmark.
+        cases: Sequence of `PlanCase` entries to evaluate.
+        repeat: Number of repeat runs per case.
+        split_name: Split label recorded in both summaries.
+        baseline: Optional precomputed unparaphrased `BenchmarkSummary`.
+
+    Returns:
+        A `ParaphraseComparison` holding baseline and paraphrased summaries.
+    """
     base_summary = baseline or await run_benchmark(
         synth, cases, repeat=repeat, split_name=split_name
     )
@@ -1877,7 +2186,17 @@ async def run_template_arm_benchmark(
     repeat: int = 1,
     split_name: str = "all",
 ) -> TemplateArmComparison:
-    """Compares unpromoted `DecisionRenderTool` planning against promoted `SurfaceTemplate` rendering."""
+    """Compares unpromoted `DecisionRenderTool` planning against promoted `SurfaceTemplate` rendering.
+
+    Args:
+        synth: Configured `DecisionSynthesizer` to benchmark.
+        cases: Candidate `PlanCase` entries (filtered to in-grammar `mode == 'tool'`).
+        repeat: Number of repeat runs per tool case.
+        split_name: Split label recorded in both arm summaries.
+
+    Returns:
+        A `TemplateArmComparison` contrasting unpromoted planner and template arms.
+    """
     tool_cases = [c for c in cases if c.mode == "tool" and not c.is_out_of_grammar]
     if not tool_cases:
         empty = _empty_benchmark_summary(synth, split_name=split_name)
@@ -1929,7 +2248,15 @@ def _format_case_row(cs: CaseScore) -> str:
 
 
 def render_markdown(summary: BenchmarkSummary, backend_name: str | None = None) -> str:
-    """Renders a Markdown report with all Wave 6 metrics from `summary`."""
+    """Renders a Markdown report with all Wave 6 metrics from `summary`.
+
+    Args:
+        summary: Aggregated `BenchmarkSummary` to format.
+        backend_name: Optional custom label for the report heading.
+
+    Returns:
+        Formatted Markdown report text.
+    """
     header_label = backend_name or f"{summary.backend_kind}/{summary.model_id}"
     profile_key = f"{summary.backend_kind}/{summary.model_id}"
     lines: list[str] = [
@@ -1940,165 +2267,198 @@ def render_markdown(summary: BenchmarkSummary, backend_name: str | None = None) 
         "",
     ]
     if summary.unverified_count > 0:
-        lines.extend([
+        lines.extend(
+            [
+                (
+                    f"> **[UNFROZEN HELDOUT]** {summary.unverified_count} of"
+                    f" {summary.cases_count} evaluated cases have `verified: false`"
+                    " (pending human label review)."
+                ),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            f"- Backend: `{summary.backend_kind}` (model `{summary.model_id}`)",
             (
-                f"> **[UNFROZEN HELDOUT]** {summary.unverified_count} of"
-                f" {summary.cases_count} evaluated cases have `verified: false`"
-                " (pending human label review)."
+                f"- Cases evaluated: {summary.cases_count}"
+                f" ({summary.in_grammar_count} in-grammar,"
+                f" {summary.out_of_grammar_count} out-of-grammar,"
+                f" {summary.unverified_count} unverified; {summary.total_runs} runs)"
             ),
+            f"- Family accuracy: {summary.family_accuracy * 100.0:.1f}%",
+            f"- Archetype accuracy: {summary.archetype_accuracy * 100.0:.1f}%",
+            (
+                f"- Forced-fit rate: {summary.forced_fit_rate * 100.0:.1f}%"
+                f" (target <= {FORCED_FIT_TARGET * 100.0:.0f}%)"
+            ),
+            (
+                f"- False no-fit rate: {summary.false_no_fit_rate * 100.0:.1f}%"
+                f" (target <= {FALSE_NO_FIT_TARGET * 100.0:.0f}%)"
+            ),
+            f"- Slot binding accuracy: {summary.slot_binding_accuracy * 100.0:.1f}%",
+            f"- Action accuracy: {summary.action_accuracy * 100.0:.1f}%",
+            f"- Sensitive leak rate: {summary.sensitive_leak_rate * 100.0:.1f}%",
+            f"- Block precision: {summary.block_precision * 100.0:.1f}%",
+            f"- Block recall: {summary.block_recall * 100.0:.1f}%",
+            (
+                "- Multi-turn cache hit rate:"
+                f" {summary.multi_turn_cache_hit_rate * 100.0:.1f}%"
+            ),
+            (
+                "- Multi-turn operation accuracy:"
+                f" {summary.multi_turn_operation_accuracy * 100.0:.1f}%"
+            ),
+            f"- Fallback rate: {summary.fallback_rate * 100.0:.1f}%",
+            f"- Abstain rate: {summary.abstain_rate * 100.0:.1f}%",
             "",
-        ])
-    lines.extend([
-        f"- Backend: `{summary.backend_kind}` (model `{summary.model_id}`)",
-        (
-            f"- Cases evaluated: {summary.cases_count}"
-            f" ({summary.in_grammar_count} in-grammar,"
-            f" {summary.out_of_grammar_count} out-of-grammar,"
-            f" {summary.unverified_count} unverified; {summary.total_runs} runs)"
-        ),
-        f"- Family accuracy: {summary.family_accuracy * 100.0:.1f}%",
-        f"- Archetype accuracy: {summary.archetype_accuracy * 100.0:.1f}%",
-        (
-            f"- Forced-fit rate: {summary.forced_fit_rate * 100.0:.1f}%"
-            f" (target <= {FORCED_FIT_TARGET * 100.0:.0f}%)"
-        ),
-        (
-            f"- False no-fit rate: {summary.false_no_fit_rate * 100.0:.1f}%"
-            f" (target <= {FALSE_NO_FIT_TARGET * 100.0:.0f}%)"
-        ),
-        f"- Slot binding accuracy: {summary.slot_binding_accuracy * 100.0:.1f}%",
-        f"- Action accuracy: {summary.action_accuracy * 100.0:.1f}%",
-        f"- Sensitive leak rate: {summary.sensitive_leak_rate * 100.0:.1f}%",
-        f"- Block precision: {summary.block_precision * 100.0:.1f}%",
-        f"- Block recall: {summary.block_recall * 100.0:.1f}%",
-        (
-            "- Multi-turn cache hit rate:"
-            f" {summary.multi_turn_cache_hit_rate * 100.0:.1f}%"
-        ),
-        (
-            "- Multi-turn operation accuracy:"
-            f" {summary.multi_turn_operation_accuracy * 100.0:.1f}%"
-        ),
-        f"- Fallback rate: {summary.fallback_rate * 100.0:.1f}%",
-        f"- Abstain rate: {summary.abstain_rate * 100.0:.1f}%",
-        "",
-        "### Latency and round trips",
-        "",
-        (
-            f"- Decision latency (p50 / p95): {summary.decision_latency_p50:.1f} ms"
-            f" / {summary.decision_latency_p95:.1f} ms"
-        ),
-        (
-            f"- Host overhead (p50 / p95): {summary.host_overhead_p50:.1f} ms /"
-            f" {summary.host_overhead_p95:.1f} ms"
-        ),
-        f"- Round trips per surface: {summary.round_trips_per_surface:.2f}",
-        "",
-        "### Calibration",
-        "",
-        "| Question kind | Brier score | ECE (10-bin) |",
-        "| :--- | :--- | :--- |",
-        f"| Family | {summary.brier_family:.4f} | {summary.ece_family:.4f} |",
-        f"| Archetype | {summary.brier_archetype:.4f} | {summary.ece_archetype:.4f} |",
-        f"| Gates | {summary.brier_gates:.4f} | {summary.ece_gates:.4f} |",
-    ])
+            "### Latency and round trips",
+            "",
+            (
+                f"- Decision latency (p50 / p95): {summary.decision_latency_p50:.1f} ms"
+                f" / {summary.decision_latency_p95:.1f} ms"
+            ),
+            (
+                f"- Host overhead (p50 / p95): {summary.host_overhead_p50:.1f} ms /"
+                f" {summary.host_overhead_p95:.1f} ms"
+            ),
+            f"- Round trips per surface: {summary.round_trips_per_surface:.2f}",
+            "",
+            "### Calibration",
+            "",
+            "| Question kind | Brier score | ECE (10-bin) |",
+            "| :--- | :--- | :--- |",
+            f"| Family | {summary.brier_family:.4f} | {summary.ece_family:.4f} |",
+            f"| Archetype | {summary.brier_archetype:.4f} | {summary.ece_archetype:.4f} |",
+            f"| Gates | {summary.brier_gates:.4f} | {summary.ece_gates:.4f} |",
+        ]
+    )
     if summary.fitted_temperature is not None:
         profile_json = json.dumps(
             {profile_key: {"temperature": summary.fitted_temperature}}
         )
-        lines.extend([
-            "",
-            "### Fitted calibration profile",
-            "",
-            f"Profile entry: `{profile_json}`",
-        ])
+        lines.extend(
+            [
+                "",
+                "### Fitted calibration profile",
+                "",
+                f"Profile entry: `{profile_json}`",
+            ]
+        )
 
-    lines.extend([
-        "",
-        "### Case breakdown",
-        "",
-        (
-            "| Case | Family | Archetype | Bindings | Actions | Recall | Prec |"
-            " Round trips | Backend ms | Fallback |"
-        ),
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        *(_format_case_row(cs) for cs in summary.case_scores),
-    ])
+    lines.extend(
+        [
+            "",
+            "### Case breakdown",
+            "",
+            (
+                "| Case | Family | Archetype | Bindings | Actions | Recall | Prec |"
+                " Round trips | Backend ms | Fallback |"
+            ),
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            *(_format_case_row(cs) for cs in summary.case_scores),
+        ]
+    )
     return "\n".join(lines)
 
 
 def render_paraphrase_markdown(comp: ParaphraseComparison) -> str:
-    """Renders a Markdown table comparing baseline vs paraphrased prompts."""
+    """Renders a Markdown table comparing baseline vs paraphrased prompts.
+
+    Args:
+        comp: `ParaphraseComparison` holding baseline and paraphrased runs.
+
+    Returns:
+        Formatted Markdown comparison table.
+    """
     b = comp.baseline
     p = comp.paraphrased
-    return "\n".join([
-        "### Paraphrase sensitivity",
-        "",
-        "| Metric | Unparaphrased | Paraphrased | Delta |",
-        "| :--- | :--- | :--- | :--- |",
-        (
-            f"| Family accuracy | {b.family_accuracy * 100.0:.1f}% |"
-            f" {p.family_accuracy * 100.0:.1f}% |"
-            f" {comp.family_accuracy_delta * 100.0:+.1f} pp |"
-        ),
-        (
-            f"| Archetype accuracy | {b.archetype_accuracy * 100.0:.1f}% |"
-            f" {p.archetype_accuracy * 100.0:.1f}% |"
-            f" {comp.archetype_accuracy_delta * 100.0:+.1f} pp |"
-        ),
-        (
-            f"| Slot binding accuracy | {b.slot_binding_accuracy * 100.0:.1f}% |"
-            f" {p.slot_binding_accuracy * 100.0:.1f}% |"
-            f" {comp.slot_binding_accuracy_delta * 100.0:+.1f} pp |"
-        ),
-        (
-            f"| Forced-fit rate | {b.forced_fit_rate * 100.0:.1f}% |"
-            f" {p.forced_fit_rate * 100.0:.1f}% |"
-            f" {comp.forced_fit_rate_delta * 100.0:+.1f} pp |"
-        ),
-        (
-            f"| False no-fit rate | {b.false_no_fit_rate * 100.0:.1f}% |"
-            f" {p.false_no_fit_rate * 100.0:.1f}% |"
-            f" {comp.false_no_fit_rate_delta * 100.0:+.1f} pp |"
-        ),
-    ])
+    return "\n".join(
+        [
+            "### Paraphrase sensitivity",
+            "",
+            "| Metric | Unparaphrased | Paraphrased | Delta |",
+            "| :--- | :--- | :--- | :--- |",
+            (
+                f"| Family accuracy | {b.family_accuracy * 100.0:.1f}% |"
+                f" {p.family_accuracy * 100.0:.1f}% |"
+                f" {comp.family_accuracy_delta * 100.0:+.1f} pp |"
+            ),
+            (
+                f"| Archetype accuracy | {b.archetype_accuracy * 100.0:.1f}% |"
+                f" {p.archetype_accuracy * 100.0:.1f}% |"
+                f" {comp.archetype_accuracy_delta * 100.0:+.1f} pp |"
+            ),
+            (
+                f"| Slot binding accuracy | {b.slot_binding_accuracy * 100.0:.1f}% |"
+                f" {p.slot_binding_accuracy * 100.0:.1f}% |"
+                f" {comp.slot_binding_accuracy_delta * 100.0:+.1f} pp |"
+            ),
+            (
+                f"| Forced-fit rate | {b.forced_fit_rate * 100.0:.1f}% |"
+                f" {p.forced_fit_rate * 100.0:.1f}% |"
+                f" {comp.forced_fit_rate_delta * 100.0:+.1f} pp |"
+            ),
+            (
+                f"| False no-fit rate | {b.false_no_fit_rate * 100.0:.1f}% |"
+                f" {p.false_no_fit_rate * 100.0:.1f}% |"
+                f" {comp.false_no_fit_rate_delta * 100.0:+.1f} pp |"
+            ),
+        ]
+    )
 
 
 def render_template_arm_markdown(comp: TemplateArmComparison) -> str:
-    """Renders a Markdown table comparing unpromoted planner vs promoted template arm."""
+    """Renders a Markdown table comparing unpromoted planner vs promoted template arm.
+
+    Args:
+        comp: `TemplateArmComparison` holding planner and template arm summaries.
+
+    Returns:
+        Formatted Markdown comparison table.
+    """
     pl = comp.planner_arm
     tp = comp.template_arm
-    return "\n".join([
-        f"### Tool-mode template arm (`{comp.tool_cases_count}` tool cases)",
-        "",
-        (
-            "| Arm | Family Acc | Archetype Acc | Slot Bind | Action Acc | Sens Leak |"
-            " Round Trips | P50 (ms) | P95 (ms) |"
-        ),
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        (
-            f"| Planner (unpromoted) | {pl.family_accuracy * 100.0:.1f}% |"
-            f" {pl.archetype_accuracy * 100.0:.1f}% |"
-            f" {pl.slot_binding_accuracy * 100.0:.1f}% |"
-            f" {pl.action_accuracy * 100.0:.1f}% |"
-            f" {pl.sensitive_leak_rate * 100.0:.1f}% |"
-            f" {pl.round_trips_per_surface:.2f} |"
-            f" {pl.decision_latency_p50:.1f} | {pl.decision_latency_p95:.1f} |"
-        ),
-        (
-            f"| Promoted template | {tp.family_accuracy * 100.0:.1f}% |"
-            f" {tp.archetype_accuracy * 100.0:.1f}% |"
-            f" {tp.slot_binding_accuracy * 100.0:.1f}% |"
-            f" {tp.action_accuracy * 100.0:.1f}% |"
-            f" {tp.sensitive_leak_rate * 100.0:.1f}% |"
-            f" {tp.round_trips_per_surface:.2f} |"
-            f" {tp.decision_latency_p50:.1f} | {tp.decision_latency_p95:.1f} |"
-        ),
-    ])
+    return "\n".join(
+        [
+            f"### Tool-mode template arm (`{comp.tool_cases_count}` tool cases)",
+            "",
+            (
+                "| Arm | Family Acc | Archetype Acc | Slot Bind | Action Acc | Sens Leak |"
+                " Round Trips | P50 (ms) | P95 (ms) |"
+            ),
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            (
+                f"| Planner (unpromoted) | {pl.family_accuracy * 100.0:.1f}% |"
+                f" {pl.archetype_accuracy * 100.0:.1f}% |"
+                f" {pl.slot_binding_accuracy * 100.0:.1f}% |"
+                f" {pl.action_accuracy * 100.0:.1f}% |"
+                f" {pl.sensitive_leak_rate * 100.0:.1f}% |"
+                f" {pl.round_trips_per_surface:.2f} |"
+                f" {pl.decision_latency_p50:.1f} | {pl.decision_latency_p95:.1f} |"
+            ),
+            (
+                f"| Promoted template | {tp.family_accuracy * 100.0:.1f}% |"
+                f" {tp.archetype_accuracy * 100.0:.1f}% |"
+                f" {tp.slot_binding_accuracy * 100.0:.1f}% |"
+                f" {tp.action_accuracy * 100.0:.1f}% |"
+                f" {tp.sensitive_leak_rate * 100.0:.1f}% |"
+                f" {tp.round_trips_per_surface:.2f} |"
+                f" {tp.decision_latency_p50:.1f} | {tp.decision_latency_p95:.1f} |"
+            ),
+        ]
+    )
 
 
 def serialize_benchmark_summary(summary: BenchmarkSummary) -> dict[str, Any]:
-    """Serializes `summary` into a JSON-compatible dictionary."""
+    """Serializes `summary` into a JSON-compatible dictionary.
+
+    Args:
+        summary: `BenchmarkSummary` to serialize.
+
+    Returns:
+        JSON-serializable dictionary of aggregate and per-case metrics.
+    """
     return {
         "backend_kind": summary.backend_kind,
         "model_id": summary.model_id,

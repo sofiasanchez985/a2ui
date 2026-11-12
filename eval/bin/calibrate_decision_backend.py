@@ -70,7 +70,14 @@ _DEFAULT_PARETO_THRESHOLDS: tuple[float, ...] = (
 
 @dataclass(frozen=True)
 class CalibrationPoint:
-    """Coverage, precision, and fallback rate at one confidence threshold."""
+    """Coverage, precision, and fallback rate at one confidence threshold.
+
+    Attributes:
+        threshold: Minimum confidence score required to accept a layout plan.
+        coverage: Fraction of cases accepted at or above `threshold`.
+        precision: Fraction of accepted cases with matching family and archetype.
+        fallback_rate: Fraction of cases that abstain or fall back (`1 - coverage`).
+    """
 
     threshold: float
     coverage: float
@@ -80,7 +87,21 @@ class CalibrationPoint:
 
 @dataclass(frozen=True)
 class FittedCalibrationReport:
-    """Result of fitting a backend calibration profile on tuning cases."""
+    """Result of fitting a backend calibration profile on tuning cases.
+
+    Attributes:
+        backend_kind: Canonical decision backend kind name.
+        model_id: Concrete decision model identifier.
+        temperature: Fitted temperature scaling factor `T`.
+        cases_count: Number of verified tuning cases evaluated.
+        raw_ece: Expected Calibration Error before temperature scaling.
+        calibrated_ece: Expected Calibration Error after applying `temperature`.
+        raw_brier: Mean squared probability error before temperature scaling.
+        achieved_precision: Precision at the selected Pareto threshold.
+        achieved_coverage: Coverage at the selected Pareto threshold.
+        pareto_points: Evaluated `(threshold, coverage, precision, fallback_rate)`
+            grid points.
+    """
 
     backend_kind: str
     model_id: str
@@ -97,7 +118,19 @@ class FittedCalibrationReport:
 def compute_bayes_optimal_threshold(
     cost_fallback: float, cost_wrong_ui: float
 ) -> float:
-    """Computes the Bayes-optimal confidence threshold clamped to `[0.0, 1.0]`."""
+    """Computes the Bayes-optimal confidence threshold clamped to `[0.0, 1.0]`.
+
+    Args:
+        cost_fallback: Non-negative cost of abstaining or falling back.
+        cost_wrong_ui: Strictly positive cost of rendering an incorrect layout.
+
+    Returns:
+        Minimum confidence threshold `1 - (cost_fallback / cost_wrong_ui)`
+        clamped to `[0.0, 1.0]`.
+
+    Raises:
+        ValueError: If `cost_fallback < 0` or `cost_wrong_ui <= 0`.
+    """
     if cost_fallback < 0:
         raise ValueError("cost_fallback must be non-negative.")
     if cost_wrong_ui <= 0:
@@ -108,7 +141,15 @@ def compute_bayes_optimal_threshold(
 def _evaluate_pareto_threshold(
     evaluations: Sequence[CaseEvaluation], threshold: float
 ) -> CalibrationPoint:
-    """Computes coverage, precision, and fallback rate at `threshold`."""
+    """Computes coverage, precision, and fallback rate at `threshold`.
+
+    Args:
+        evaluations: Sequence of per-case benchmark evaluations.
+        threshold: Minimum confidence required to accept a synthesis output.
+
+    Returns:
+        `CalibrationPoint` summarizing coverage and precision at `threshold`.
+    """
     if not evaluations:
         return CalibrationPoint(
             threshold=threshold, coverage=0.0, precision=1.0, fallback_rate=1.0
@@ -137,7 +178,16 @@ def _evaluate_pareto_threshold(
 def _select_best_pareto_point(
     points: Sequence[CalibrationPoint], target_precision: float
 ) -> CalibrationPoint:
-    """Selects the Pareto-optimal calibration point for `target_precision`."""
+    """Selects the Pareto-optimal calibration point for `target_precision`.
+
+    Args:
+        points: Candidate `CalibrationPoint` entries across thresholds.
+        target_precision: Minimum acceptable precision on accepted plans.
+
+    Returns:
+        Feasible point with highest coverage (breaking ties toward lower
+        threshold), or highest-precision point if none reach `target_precision`.
+    """
     feasible = [p for p in points if p.precision >= target_precision]
     if feasible:
         return max(feasible, key=lambda p: (p.coverage, -p.threshold))
@@ -145,9 +195,17 @@ def _select_best_pareto_point(
 
 
 def validate_tuning_cases(cases: Sequence[PlanCase]) -> None:
-    """Raises `ValueError` if `cases` is empty or contains any held-out case."""
+    """Raises `ValueError` if `cases` is empty or contains any held-out case.
+
+    Args:
+        cases: Sequence of loaded `PlanCase` definitions to validate.
+
+    Raises:
+        ValueError: If `cases` is empty or includes any held-out case.
+    """
     if not cases:
         raise ValueError("Calibration tuning dataset must not be empty.")
+    # Guard against leaking held-out test cases into temperature calibration.
     heldout_names = [c.name for c in cases if c.is_heldout]
     if heldout_names:
         joined = ", ".join(heldout_names)
@@ -161,9 +219,27 @@ def load_tuning_cases(
     split: str | None = None,
     schema_path: str | Path | None = None,
 ) -> list[PlanCase]:
-    """Loads verified tuning cases, refusing any `heldout` split or tag."""
-    if split is not None and split.strip().lower() == "heldout":
-        raise ValueError("Refusing to fit calibration on 'heldout' split.")
+    """Loads verified tuning cases, refusing any non-tuning split or held-out tag.
+
+    Args:
+        cases_path: Path to a tuning YAML file or `decision_plans` directory.
+        tags: Optional tag sequence or comma-separated tag filter string.
+        split: Optional dataset split name (defaults to `'tuning'`).
+        schema_path: Optional override path to `decision_plans/schema.json`.
+
+    Returns:
+        List of verified tuning `PlanCase` instances.
+
+    Raises:
+        ValueError: If `split` is not `'tuning'`, if `tags` requests `'heldout'`,
+            or if the resulting case list is empty or contains held-out cases.
+    """
+    # Default to the tuning split so directory paths never load heldout_v1.yaml.
+    effective_split = "tuning" if split is None else split.strip().lower()
+    if effective_split != "tuning":
+        raise ValueError(
+            f"Refusing to fit calibration on '{split}' split; only 'tuning' is allowed."
+        )
     if isinstance(tags, str):
         tag_tokens = {t.strip().lower() for t in tags.split(",") if t.strip()}
     elif tags:
@@ -176,7 +252,7 @@ def load_tuning_cases(
     loaded = load_plan_cases(
         cases_path,
         tags=tags,
-        split=split,
+        split=effective_split if Path(cases_path).is_dir() else None,
         include_unverified=False,
         schema_path=schema_path,
     )
@@ -187,19 +263,28 @@ def load_tuning_cases(
 def _case_calibration_pairs(
     case: PlanCase, ev: CaseEvaluation
 ) -> list[tuple[float, float]]:
-    """Extracts `(probability, is_correct)` pairs from a single case evaluation."""
+    """Extracts `(probability, is_correct)` pairs from a single case evaluation.
+
+    Args:
+        case: Ground-truth `PlanCase` definition.
+        ev: Evaluated `CaseEvaluation` for `case`.
+
+    Returns:
+        List of `(probability, label)` pairs for family, in-grammar archetype,
+        and block gate questions.
+    """
     pairs: list[tuple[float, float]] = []
     answers_by_id = {a.question_id: a for a in ev.output.decision_answers}
     if "family" in answers_by_id:
         _, fam_p = answers_by_id["family"].top()
-        pairs.append((fam_p, 1.0 if ev.family_correct else 0.0))
+        pairs.append((fam_p, float(ev.family_correct)))
 
-    arch_p = ev.output.confidence
-    if ev.output.layout_plan is not None:
+    # Only include archetype calibration points for in-grammar cases that
+    # produced a layout plan; out-of-grammar abstentions never score an archetype.
+    if not case.is_out_of_grammar and ev.output.layout_plan is not None:
         arch_ans = answers_by_id.get(f"archetype:{ev.output.layout_plan.family}")
-        if arch_ans is not None:
-            _, arch_p = arch_ans.top()
-    pairs.append((arch_p, 1.0 if ev.archetype_correct else 0.0))
+        arch_p = arch_ans.top()[1] if arch_ans is not None else ev.output.confidence
+        pairs.append((arch_p, float(ev.archetype_correct)))
 
     req_blocks = set(case.required_blocks)
     forb_blocks = set(case.forbidden_blocks)
@@ -216,7 +301,14 @@ def _case_calibration_pairs(
 def _collect_calibration_pairs(
     case_scores: Sequence[CaseScore],
 ) -> list[tuple[float, float]]:
-    """Extracts `(probability, is_correct)` pairs across family, archetype, and gates."""
+    """Extracts `(probability, is_correct)` pairs across family, archetype, and gates.
+
+    Args:
+        case_scores: Sequence of per-case benchmark scores.
+
+    Returns:
+        Flattened list of `(probability, label)` calibration pairs.
+    """
     pairs: list[tuple[float, float]] = []
     for cs in case_scores:
         if cs.evaluations:
@@ -227,7 +319,15 @@ def _collect_calibration_pairs(
 def _rescale_pairs(
     pairs: Sequence[tuple[float, float]], temperature: float
 ) -> list[tuple[float, float]]:
-    """Applies `Calibration(temperature)` to `(probability, target)` pairs."""
+    """Applies `Calibration(temperature)` to `(probability, target)` pairs.
+
+    Args:
+        pairs: Uncalibrated `(probability, label)` pairs.
+        temperature: Positive temperature scaling factor `T`.
+
+    Returns:
+        List of temperature-scaled `(probability, label)` pairs.
+    """
     cal = Calibration(temperature=temperature)
     rescaled: list[tuple[float, float]] = []
     for p, y in pairs:
@@ -245,7 +345,22 @@ async def fit_backend_calibration(
     temperature_candidates: Sequence[float] | None = None,
     thresholds: Sequence[float] | None = None,
 ) -> FittedCalibrationReport:
-    """Evaluates `synth` on `cases` and fits temperature `T` minimizing ECE."""
+    """Evaluates `synth` on `cases` and fits temperature `T` minimizing ECE.
+
+    Args:
+        synth: Configured `DecisionSynthesizer` to evaluate.
+        cases: Verified tuning `PlanCase` definitions.
+        target_precision: Target precision for Pareto threshold selection.
+        temperature_candidates: Optional grid of candidate temperatures `T`.
+        thresholds: Optional grid of confidence thresholds for Pareto analysis.
+
+    Returns:
+        `FittedCalibrationReport` containing the fitted temperature and metrics.
+
+    Raises:
+        ValueError: If `cases` contains held-out cases or `target_precision` is
+            outside `(0.0, 1.0]`.
+    """
     validate_tuning_cases(cases)
     if not 0.0 < target_precision <= 1.0:
         raise ValueError("target_precision must be in (0.0, 1.0].")
@@ -290,7 +405,21 @@ def write_calibration_profile(
     model_id: str,
     temperature: float,
 ) -> Calibration:
-    """Writes or updates `backend_kind/model_id` in `out_path` and verifies via `Calibration.load`."""
+    """Writes or updates `backend_kind/model_id` in `out_path` and verifies loading.
+
+    Args:
+        out_path: Destination JSON file path for the calibration profile.
+        backend_kind: Canonical decision backend kind name.
+        model_id: Concrete decision model identifier.
+        temperature: Fitted temperature scaling factor `T`.
+
+    Returns:
+        Reloaded `Calibration` instance verified via `Calibration.load`.
+
+    Raises:
+        ValueError: If an existing file at `out_path` does not contain a JSON
+            object.
+    """
     target = Path(out_path)
     existing: dict[str, Any] = {}
     if target.is_file():
@@ -308,6 +437,14 @@ def write_calibration_profile(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parses command-line arguments for `calibrate_decision_backend`.
+
+    Args:
+        argv: Optional list of CLI argument tokens.
+
+    Returns:
+        Parsed `argparse.Namespace` configuration.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Fit a temperature calibration profile on tuning cases of"
@@ -346,7 +483,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Optional dataset split filter (for example 'tuning'; 'heldout' is"
+            "Optional dataset split filter (defaults to 'tuning'; 'heldout' is"
             " refused)."
         ),
     )
@@ -372,6 +509,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def _async_main(args: argparse.Namespace) -> int:
+    """Runs async calibration fitting and writes the resulting JSON profile.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit code (`0` on success).
+    """
     cases_path = Path(args.cases)
     if not cases_path.is_absolute():
         cases_path = GIT_ROOT / cases_path
@@ -417,6 +562,14 @@ async def _async_main(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for `calibrate_decision_backend`.
+
+    Args:
+        argv: Optional list of CLI argument tokens.
+
+    Returns:
+        Process exit code (`0` on success, `1` on error).
+    """
     args = parse_args(argv)
     try:
         return asyncio.run(_async_main(args))

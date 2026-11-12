@@ -115,6 +115,7 @@ def format_system_prompt(format_name: str, version: str) -> Solver:
     validate_format(format_name)
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:  # pylint: disable=unused-argument
+        """Prepends the assembled format system prompt to `state.messages`."""
         catalog_path = state.metadata["catalog"]
         resolved_catalog_path = str(GIT_ROOT / catalog_path)
         options = runner_options_from_metadata(state.metadata, resolved_catalog_path)
@@ -166,11 +167,12 @@ class _CompileResult:
 
     @property
     def ok(self) -> bool:
+        """Returns True when compilation succeeded with no error."""
         return self.error is None
 
 
 def _find_surface_id(completion: str, allowed_surface_ids: list[str]) -> str:
-    """The surface ID named in the completion, or the first allowed one."""
+    """Returns the surface ID named in `completion`, or the first allowed one."""
     default_surface_id = allowed_surface_ids[0] if allowed_surface_ids else "main"
     match = _SURFACE_ID_PATTERN.search(completion)
     if match and match.group(2) in allowed_surface_ids:
@@ -219,6 +221,7 @@ async def _attempt_compile(ctx: _CompileContext, completion: str) -> _CompileRes
 
 
 def _retry_prompt(error: str) -> str:
+    """Formats a validation retry prompt instructing the model to fix `error`."""
     return (
         f"Validation failed: {error}. Fix the A2UI payload and reply with the"
         " complete corrected payload only."
@@ -290,6 +293,7 @@ def compile_format_payload(
     measured = measured_generate()
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
+        """Compiles and validates the model completion with optional retries."""
         if not state.output or not state.output.completion:
             return state
 

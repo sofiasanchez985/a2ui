@@ -64,7 +64,16 @@ DEFAULT_DATASET_DIR = GIT_ROOT / "eval" / "datasets" / "decision_plans"
 
 @dataclass(frozen=True)
 class ScorecardTargetSpec:
-    """Configuration for one backend entry in a scorecard run."""
+    """Stores configuration for one backend entry in a scorecard run.
+
+    Attributes:
+        backend: Backend kind (`mock`, `openrouter`, `gemini`, `http`, or `litert`).
+        model: Model identifier or `.litertlm` file path.
+        label: Optional display label override for scorecard rows.
+        endpoint_url: Optional endpoint URL for `http` or `openrouter` backends.
+        calibration: Optional path to a calibration profile JSON file.
+        p95_target_ms: Optional P95 decision latency target override in milliseconds.
+    """
 
     backend: str
     model: str
@@ -75,16 +84,26 @@ class ScorecardTargetSpec:
 
     @property
     def display_name(self) -> str:
+        """Returns the human-readable backend display label."""
         return self.label or f"{self.backend}/{self.model}"
 
     @property
     def target_ms(self) -> float:
+        """Returns the effective P95 latency target in milliseconds."""
         if self.p95_target_ms is not None:
             return float(self.p95_target_ms)
         return p95_target_for_backend(self.backend)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ScorecardTargetSpec:
+        """Constructs a `ScorecardTargetSpec` from a raw YAML backend mapping.
+
+        Args:
+            data: Raw dictionary parsed from a scorecard configuration YAML file.
+
+        Returns:
+            A validated `ScorecardTargetSpec` instance.
+        """
         backend = str(data["backend"]).strip().lower()
         model = str(data.get("model") or backend).strip()
         raw_target = data.get("p95_target_ms")
@@ -108,7 +127,14 @@ class ScorecardTargetSpec:
 
 @dataclass
 class ScorecardRow:
-    """Evaluated summary and target pass/fail status for one backend on one split."""
+    """Stores the evaluated summary and target pass/fail status for one backend on one split.
+
+    Attributes:
+        spec: Backend target specification.
+        summary: Primary benchmark summary for the split.
+        paraphrase: Optional paraphrase sensitivity comparison.
+        template_arm: Optional promoted template arm comparison.
+    """
 
     spec: ScorecardTargetSpec
     summary: BenchmarkSummary
@@ -117,10 +143,12 @@ class ScorecardRow:
 
     @property
     def latency_target_pass(self) -> bool:
+        """Returns whether P95 decision latency meets `self.spec.target_ms`."""
         return self.summary.p95_latency_ms <= self.spec.target_ms
 
     @property
     def rates_target_pass(self) -> bool:
+        """Returns whether forced-fit, false no-fit, and sensitive leak rates meet targets."""
         return (
             self.summary.forced_fit_rate <= FORCED_FIT_TARGET
             and self.summary.false_no_fit_rate <= FALSE_NO_FIT_TARGET
@@ -129,19 +157,35 @@ class ScorecardRow:
 
     @property
     def overall_target_pass(self) -> bool:
+        """Returns whether both latency and error-rate targets pass."""
         return self.latency_target_pass and self.rates_target_pass
 
 
 @dataclass
 class ScorecardReport:
-    """Multi-backend scorecard report grouped by split."""
+    """Stores the multi-backend scorecard report grouped by split.
+
+    Attributes:
+        rows_by_split: Mapping from split name (`tuning`, `heldout`) to evaluated rows.
+        skipped_backends: List of `(display_name, reason)` pairs for skipped backends.
+    """
 
     rows_by_split: dict[str, list[ScorecardRow]] = field(default_factory=dict)
     skipped_backends: list[tuple[str, str]] = field(default_factory=list)
 
 
 def load_scorecard_config(config_path: str | Path) -> list[ScorecardTargetSpec]:
-    """Loads `ScorecardTargetSpec` entries from a YAML scorecard config file."""
+    """Loads `ScorecardTargetSpec` entries from a YAML scorecard config file.
+
+    Args:
+        config_path: Path to the YAML configuration file.
+
+    Returns:
+        List of parsed `ScorecardTargetSpec` entries.
+
+    Raises:
+        ValueError: If the YAML file is malformed or defines no backends.
+    """
     path = Path(config_path)
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
@@ -163,7 +207,14 @@ def load_scorecard_config(config_path: str | Path) -> list[ScorecardTargetSpec]:
 def ensure_mock_baseline(
     specs: Sequence[ScorecardTargetSpec],
 ) -> list[ScorecardTargetSpec]:
-    """Appends the `mock/mock` baseline when no `mock` entry is present."""
+    """Appends the `mock/mock` baseline when no `mock` entry is present.
+
+    Args:
+        specs: Initial sequence of `ScorecardTargetSpec` entries.
+
+    Returns:
+        A list of `ScorecardTargetSpec` entries guaranteed to include a `mock` baseline.
+    """
     ordered = list(specs)
     if not any(s.backend == "mock" for s in ordered):
         ordered.append(
@@ -215,54 +266,69 @@ def _render_split_section(split_name: str, rows: Sequence[ScorecardRow]) -> str:
     unverified = max((r.summary.unverified_count for r in rows), default=0)
     total_cases = max((r.summary.cases_count for r in rows), default=0)
     if unverified > 0:
-        lines.extend([
+        lines.extend(
+            [
+                (
+                    f"> **[UNFROZEN HELDOUT]** {unverified} of {total_cases}"
+                    " evaluated cases have `verified: false` (pending human label"
+                    " review)."
+                ),
+                "",
+            ]
+        )
+    lines.extend(
+        [
             (
-                f"> **[UNFROZEN HELDOUT]** {unverified} of {total_cases}"
-                " evaluated cases have `verified: false` (pending human label"
-                " review)."
+                "Targets: forced-fit rate"
+                f" <= {FORCED_FIT_TARGET * 100.0:.0f}%, false no-fit rate"
+                f" <= {FALSE_NO_FIT_TARGET * 100.0:.0f}%, sensitive leak rate = 0%,"
+                " hosted reference P95 < 250 ms."
             ),
             "",
-        ])
-    lines.extend([
-        (
-            "Targets: forced-fit rate"
-            f" <= {FORCED_FIT_TARGET * 100.0:.0f}%, false no-fit rate"
-            f" <= {FALSE_NO_FIT_TARGET * 100.0:.0f}%, sensitive leak rate = 0%,"
-            " hosted reference P95 < 250 ms."
-        ),
-        "",
-        (
-            "| Backend | Model | Cases | Family Acc | Archetype Acc |"
-            " Forced-Fit (<=5%) | False No-Fit (<=10%) | Slot Bind | Action Acc |"
-            " Sens Leak | Round Trips | Cache Hit | Fallback | P50 (ms) |"
-            " P95 (ms) | P95 Target | Target Pass |"
-        ),
-        (
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
-            " :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
-        ),
-        *(_format_scorecard_row(r) for r in rows),
-    ])
+            (
+                "| Backend | Model | Cases | Family Acc | Archetype Acc |"
+                " Forced-Fit (<=5%) | False No-Fit (<=10%) | Slot Bind | Action Acc |"
+                " Sens Leak | Round Trips | Cache Hit | Fallback | P50 (ms) |"
+                " P95 (ms) | P95 Target | Target Pass |"
+            ),
+            (
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+                " :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+            ),
+            *(_format_scorecard_row(r) for r in rows),
+        ]
+    )
     for row in rows:
         if row.paraphrase is not None:
-            lines.extend([
-                "",
-                f"#### `{row.spec.display_name}` paraphrase check",
-                "",
-                render_paraphrase_markdown(row.paraphrase),
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"#### `{row.spec.display_name}` paraphrase check",
+                    "",
+                    render_paraphrase_markdown(row.paraphrase),
+                ]
+            )
         if row.template_arm is not None and row.template_arm.tool_cases_count > 0:
-            lines.extend([
-                "",
-                f"#### `{row.spec.display_name}` template arm",
-                "",
-                render_template_arm_markdown(row.template_arm),
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"#### `{row.spec.display_name}` template arm",
+                    "",
+                    render_template_arm_markdown(row.template_arm),
+                ]
+            )
     return "\n".join(lines)
 
 
 def render_scorecard_markdown(report: ScorecardReport) -> str:
-    """Renders the complete multi-backend Wave 6 Markdown scorecard."""
+    """Renders the complete multi-backend Wave 6 Markdown scorecard.
+
+    Args:
+        report: `ScorecardReport` holding evaluated rows and skipped backends.
+
+    Returns:
+        Formatted Markdown scorecard document ending with a newline.
+    """
     lines: list[str] = ["# A2UI Decision Model Scorecard", ""]
     for split_name, rows in report.rows_by_split.items():
         lines.append(_render_split_section(split_name, rows))
@@ -284,7 +350,19 @@ async def evaluate_backend_on_splits(
     paraphrase: bool = False,
     template_arm: bool = False,
 ) -> dict[str, ScorecardRow]:
-    """Runs `backend` across every `(split_name, cases)` group."""
+    """Runs `backend` across every `(split_name, cases)` group.
+
+    Args:
+        spec: Target specification for `backend`.
+        backend: Initialized `DecisionBackend` instance.
+        split_groups: Sequence of `(split_name, cases)` pairs to evaluate.
+        repeat: Number of repeat runs per case.
+        paraphrase: Whether to include a paraphrase sensitivity check.
+        template_arm: Whether to include a promoted template arm comparison.
+
+    Returns:
+        Mapping from `split_name` to the evaluated `ScorecardRow`.
+    """
     synth = DecisionSynthesizer(
         [BasicCatalog("v1.0")],
         backend,
@@ -372,7 +450,19 @@ async def run_scorecard(
     template_arm: bool = False,
     strict: bool = False,
 ) -> ScorecardReport:
-    """Builds and benchmarks every configured backend."""
+    """Builds and benchmarks every configured backend.
+
+    Args:
+        specs: Backend specifications to evaluate.
+        split_groups: Sequence of `(split_name, cases)` pairs to evaluate.
+        repeat: Number of repeat runs per case.
+        paraphrase: Whether to include paraphrase sensitivity checks.
+        template_arm: Whether to include promoted template arm comparisons.
+        strict: Whether to re-raise backend credential or execution errors.
+
+    Returns:
+        Completed `ScorecardReport` across all splits and backends.
+    """
     all_specs = list(specs) or ensure_mock_baseline(())
     rows_by_split: dict[str, list[ScorecardRow]] = {
         name: [] for name, _ in split_groups
@@ -402,25 +492,29 @@ def _load_split_groups(
 ) -> list[tuple[str, list[PlanCase]]]:
     """Loads `(split_name, cases)` groups for scorecard evaluation."""
     if split == "tuning":
-        return [(
-            "tuning",
-            load_plan_cases(
-                cases_path,
-                tags=tags,
-                split="tuning",
-                include_unverified=include_unverified,
-            ),
-        )]
+        return [
+            (
+                "tuning",
+                load_plan_cases(
+                    cases_path,
+                    tags=tags,
+                    split="tuning",
+                    include_unverified=include_unverified,
+                ),
+            )
+        ]
     if split == "heldout":
-        return [(
-            "heldout",
-            load_plan_cases(
-                cases_path,
-                tags=tags,
-                split="heldout",
-                include_unverified=True,
-            ),
-        )]
+        return [
+            (
+                "heldout",
+                load_plan_cases(
+                    cases_path,
+                    tags=tags,
+                    split="heldout",
+                    include_unverified=True,
+                ),
+            )
+        ]
     groups: list[tuple[str, list[PlanCase]]] = []
     tuning = load_plan_cases(
         cases_path,
@@ -461,7 +555,14 @@ def _resolve_target_specs(args: argparse.Namespace) -> list[ScorecardTargetSpec]
 
 
 def serialize_scorecard_report(report: ScorecardReport) -> dict[str, Any]:
-    """Serializes `report` into a JSON-compatible dictionary."""
+    """Serializes `report` into a JSON-compatible dictionary.
+
+    Args:
+        report: `ScorecardReport` to serialize.
+
+    Returns:
+        JSON-serializable dictionary of splits and skipped backends.
+    """
     return {
         "splits": {
             split_name: [
@@ -485,6 +586,14 @@ def serialize_scorecard_report(report: ScorecardReport) -> dict[str, Any]:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parses command-line arguments for `decision_scorecard.py`.
+
+    Args:
+        argv: Optional argument list; defaults to `sys.argv[1:]`.
+
+    Returns:
+        Parsed `argparse.Namespace`.
+    """
     parser = argparse.ArgumentParser(
         description="Run multi-backend decision scorecard and emit Markdown table.",
     )
@@ -593,6 +702,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 async def _async_main(args: argparse.Namespace) -> int:
+    """Executes the scorecard workflow asynchronously and writes outputs."""
     cases_path = Path(args.cases)
     if not cases_path.is_absolute():
         cases_path = GIT_ROOT / cases_path
@@ -636,6 +746,7 @@ async def _async_main(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Runs the CLI entrypoint for `decision_scorecard.py`."""
     args = parse_args(argv)
     return asyncio.run(_async_main(args))
 

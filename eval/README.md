@@ -329,9 +329,9 @@ uv run ./bin/compare_strategies.py logs/decision_vs_express --json logs/decision
 
 It reports:
 
-- Pass@1 accuracy and Pass@K validation rates.
-- Token usage: prompt and output tokens per turn, and token reduction percentage.
-- Latency: median and 95th percentile wall-clock response time, plus decision-stage latency and call counts.
+- Algorithmic (Stage 1/2), LLM judge (Stage 3), and combined pass rates.
+- Token usage: median prompt and output tokens per sample.
+- Latency and caching: median wall-clock duration, median decision-stage latency, and prompt-cache status (plus round trips per surface and fallback rate in `--json` output).
 
 ## Decision Model Benchmarking, Scorecards, and Calibration
 
