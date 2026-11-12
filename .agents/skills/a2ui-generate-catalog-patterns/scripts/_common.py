@@ -36,12 +36,20 @@ from a2ui.inference_formats.decision import (
 
 
 class ToolError(Exception):
-    """User-facing CLI failure; printed to stderr with exit code 2."""
+    """Signals a user-facing CLI failure printed to stderr with exit code 2."""
 
 
 @dataclass(frozen=True)
 class LoadedCatalog:
-    """Loaded A2UI catalog paired with its decision graph, grammar, and target directory."""
+    """Pairs a loaded A2UI catalog with its decision graph, grammar, and target directory.
+
+    Attributes:
+        path: Resolved filesystem path to the source `catalog.json` file.
+        target_dir: Resolved directory where generated sidecars live or will be written.
+        catalog: Parsed A2UI catalog instance.
+        graph: Decision graph derived from the catalog component schemas.
+        grammar: Default archetype layout grammar used for pattern resolution.
+    """
 
     path: Path
     target_dir: Path
@@ -51,7 +59,18 @@ class LoadedCatalog:
 
 
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:
-    """Reads and validates that `path` contains a JSON object."""
+    """Reads and validates that `path` contains a top-level JSON object.
+
+    Args:
+        path: Filesystem path to the JSON file to read.
+        label: Human-readable artifact label included in error messages.
+
+    Returns:
+        The parsed top-level JSON dictionary.
+
+    Raises:
+        ToolError: If the file cannot be read, contains invalid JSON, or is not an object.
+    """
     try:
         raw_text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -68,8 +87,20 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
 def load_catalog(
     path: str | Path, *, out_dir: str | Path | None = None
 ) -> LoadedCatalog:
-    """Loads a `catalog.json` file and constructs its `CatalogDecisionGraph`."""
+    """Loads a `catalog.json` file and constructs its `CatalogDecisionGraph`.
+
+    Args:
+        path: Path to the target `catalog.json` file.
+        out_dir: Optional directory override for sidecar discovery and output.
+
+    Returns:
+        A `LoadedCatalog` bundling the catalog, decision graph, and archetype grammar.
+
+    Raises:
+        ToolError: If `catalog.json` is unreadable, malformed, or fails schema parsing.
+    """
     resolved = Path(path).resolve()
+    # Default sidecar output and auto-discovery to the catalog's own directory.
     target_dir = Path(out_dir).resolve() if out_dir is not None else resolved.parent
     doc = _read_json_object(resolved, "catalog")
     try:
@@ -90,7 +121,18 @@ def load_catalog(
 def load_pattern_library(
     path: str | Path, *, grammar: ArchetypeGrammar | None = None
 ) -> PatternLibrary:
-    """Loads and validates a `patterns.json` file or directory."""
+    """Loads and validates a `patterns.json` file or directory.
+
+    Args:
+        path: Path to `patterns.json` or its containing directory.
+        grammar: Optional archetype grammar used to validate pattern slot bindings.
+
+    Returns:
+        The parsed and schema-validated `PatternLibrary`.
+
+    Raises:
+        ToolError: If `patterns.json` cannot be read or fails pattern schema validation.
+    """
     resolved = Path(path).resolve()
     try:
         return PatternLibrary.from_file(resolved, grammar=grammar)
@@ -107,7 +149,17 @@ def load_pattern_library(
 
 
 def load_template_registry(path: str | Path) -> TemplateRegistry:
-    """Loads and validates a `templates.json` file or directory."""
+    """Loads and validates a `templates.json` file or directory.
+
+    Args:
+        path: Path to `templates.json` or its containing directory.
+
+    Returns:
+        The parsed and schema-validated `TemplateRegistry`.
+
+    Raises:
+        ToolError: If `templates.json` cannot be read or fails template schema validation.
+    """
     resolved = Path(path).resolve()
     try:
         return TemplateRegistry.from_file(resolved)
@@ -121,7 +173,18 @@ def load_template_registry(path: str | Path) -> TemplateRegistry:
 
 
 def _parse_samples_map(path: Path, raw_samples: Any) -> dict[str, dict[str, Any]]:
-    """Validates a `{"samples": {...}}` map of named payload dicts."""
+    """Validates a `{"samples": {...}}` map of named payload dictionaries.
+
+    Args:
+        path: Source file path used in error diagnostics.
+        raw_samples: Raw value of the `"samples"` property from the payload file.
+
+    Returns:
+        A dictionary mapping each non-empty sample name to its payload object.
+
+    Raises:
+        ToolError: If `raw_samples` is empty or any entry is not a non-empty object.
+    """
     if not isinstance(raw_samples, Mapping) or not raw_samples:
         raise ToolError(
             f"Sample payloads 'samples' at {path} must be a non-empty object."
@@ -141,11 +204,20 @@ def _parse_samples_map(path: Path, raw_samples: Any) -> dict[str, dict[str, Any]
 
 
 def load_sample_payloads(path: str | Path) -> dict[str, dict[str, Any]]:
-    """Loads sample payloads from `path`.
+    """Loads one or more sample payloads from `path`.
 
-    Accepts either:
-    - `{"samples": {"<sample_name>": {<payload_dict>}, ...}}` for multiple named samples, or
-    - `{<payload_dict>}` for a single payload (returned under the key `"default"`).
+    Accepts either `{"samples": {"<sample_name>": {<payload_dict>}, ...}}` for
+    multiple named samples or `{<payload_dict>}` for a single payload returned
+    under the `"default"` key.
+
+    Args:
+        path: Filesystem path to the sample payloads JSON file.
+
+    Returns:
+        A mapping from sample name to payload dictionary.
+
+    Raises:
+        ToolError: If the file is missing, empty, or contains invalid sample objects.
     """
     resolved = Path(path).resolve()
     doc = _read_json_object(resolved, "sample payloads")
@@ -157,7 +229,15 @@ def load_sample_payloads(path: str | Path) -> dict[str, dict[str, Any]]:
 
 
 def render_markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
-    """Renders a GitHub-flavored Markdown pipe table."""
+    """Renders a GitHub-flavored Markdown pipe table.
+
+    Args:
+        headers: Column header labels in display order.
+        rows: Sequence of row cell sequences matching `headers`.
+
+    Returns:
+        The formatted Markdown table string without a trailing newline.
+    """
     header_line = "| " + " | ".join(headers) + " |"
     sep_line = "| " + " | ".join("---" for _ in headers) + " |"
     body_lines = ["| " + " | ".join(str(cell) for cell in row) + " |" for row in rows]
@@ -171,7 +251,14 @@ def write_report(
     out: TextIO,
     markdown: str | None = None,
 ) -> None:
-    """Writes `report` as formatted JSON or Markdown to `out`."""
+    """Writes `report` as formatted JSON or Markdown to `out`.
+
+    Args:
+        report: JSON-serializable report dictionary.
+        fmt: Output format selector (`"json"` or `"markdown"`).
+        out: Writable text stream receiving the formatted report.
+        markdown: Pre-rendered Markdown text used when `fmt` is `"markdown"`.
+    """
     if fmt == "markdown" and markdown is not None:
         text = markdown if markdown.endswith("\n") else f"{markdown}\n"
         out.write(text)

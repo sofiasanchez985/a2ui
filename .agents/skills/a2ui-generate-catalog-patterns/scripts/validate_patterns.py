@@ -23,7 +23,7 @@ from pathlib import Path
 import re
 from typing import Any, Literal
 
-from a2ui.core import A2uiError, CatalogApi
+from a2ui.core import A2uiError
 from a2ui.inference_formats.decision import (
     ArchetypeGrammar,
     BlockSpec,
@@ -62,26 +62,37 @@ from synthetic_bindings import (
 _CRITERIA_PATTERN_RE = re.compile(r"\bpattern:([a-z_]+)(?::([A-Za-z0-9_]+))?\b")
 _REQUIRED_PROP_RE = re.compile(r"'([^']+)' is a required property")
 _ADDITIONAL_PROP_RE = re.compile(r"Additional properties are not allowed \('([^']+)'")
-_NON_ACTION_EVENT_SLOTS: frozenset[str] = frozenset({
-    "label",
-    "sendLabel",
-    "title",
-    "headline",
-    "subtitle",
-    "text",
-    "body",
-    "caption",
-    "supporting",
-    "detail",
-    "value",
-    "picture",
-    "icon",
-})
+_NON_ACTION_EVENT_SLOTS: frozenset[str] = frozenset(
+    {
+        "label",
+        "sendLabel",
+        "title",
+        "headline",
+        "subtitle",
+        "text",
+        "body",
+        "caption",
+        "supporting",
+        "detail",
+        "value",
+        "picture",
+        "icon",
+    }
+)
 
 
 @dataclass(frozen=True)
 class ExpansionFailure:
-    """One failure recorded while expanding, linting, or schema-checking a pattern."""
+    """Records one failure while expanding, linting, or schema-checking a pattern.
+
+    Attributes:
+        pattern: Pattern name in `patterns.json` (or `"<payload>"` for payload checks).
+        block_id: Grammar block identifier being dry-run, or `None` for `"page"`.
+        knobs: Anatomy knob assignment active when the failure occurred.
+        stage: Validation stage where the failure occurred (`"expand"`, `"lint"`,
+            `"schema"`, or `"payload"`).
+        message: Actionable diagnostic citing file, pattern, component, property, and guide anchor.
+    """
 
     pattern: str
     block_id: str | None
@@ -92,7 +103,14 @@ class ExpansionFailure:
 
 @dataclass(frozen=True)
 class TemplateValidationFailure:
-    """One failure recorded while linting, matching, or rendering a `SurfaceTemplate`."""
+    """Records one failure while linting, matching, or rendering a `SurfaceTemplate`.
+
+    Attributes:
+        template_id: Identifier of the failing template in `templates.json`.
+        sample: Sample payload name that triggered the failure, or `None` for static checks.
+        stage: Validation stage where the failure occurred (`"lint"`, `"schema"`, or `"payload"`).
+        message: Diagnostic describing the lint, payload, or schema failure.
+    """
 
     template_id: str
     sample: str | None
@@ -102,7 +120,14 @@ class TemplateValidationFailure:
 
 @dataclass(frozen=True)
 class BlockCoverage:
-    """How one layout grammar block resolves against a `PatternLibrary`."""
+    """Describes how one layout grammar block resolves against a `PatternLibrary`.
+
+    Attributes:
+        block_id: Grammar block identifier.
+        resolution: Resolution mode (`"direct"`, `"fallback"`, or `"unavailable"`).
+        pattern: Resolved pattern name in `patterns.json`, or `None` if unavailable.
+        via: Fallback pattern reference (including optional `:variant`), or `None` if direct.
+    """
 
     block_id: str
     resolution: Literal["direct", "fallback", "unavailable"]
@@ -112,7 +137,18 @@ class BlockCoverage:
 
 @dataclass(frozen=True)
 class ArchetypeCoverage:
-    """Pattern-level coverage for one layout archetype."""
+    """Summarizes pattern-level coverage for one layout archetype.
+
+    Attributes:
+        archetype_id: Archetype identifier from `archetypes.json`.
+        family: High-level task family owning the archetype.
+        eligible: Whether the archetype can be synthesized from the pattern library.
+        missing_required: Required block IDs (`!`) that cannot be resolved at all.
+        degraded_required: Required block IDs (`!`) that resolved only via a fallback pattern.
+        missing_criteria_patterns: `pattern:<name>:<variant>` criteria missing from the library.
+        viable_blocks: Count of optional or required blocks in the archetype that resolve.
+        at_least: Minimum viable block count required by the archetype grammar.
+    """
 
     archetype_id: str
     family: str
@@ -126,7 +162,14 @@ class ArchetypeCoverage:
 
 @dataclass(frozen=True)
 class PayloadSampleReport:
-    """Per-sample eligibility and template matching results."""
+    """Records per-sample archetype eligibility and template matching results.
+
+    Attributes:
+        sample_name: Key identifying the sample payload in `--payload`.
+        pointer_count: Number of JSON Pointers discovered by `inspect_payload_pointers`.
+        eligible_archetypes: Archetype IDs eligible for the sample payload and pattern library.
+        matching_templates: Surface template IDs whose `requiredPointers` match the sample.
+    """
 
     sample_name: str
     pointer_count: int
@@ -136,7 +179,26 @@ class PayloadSampleReport:
 
 @dataclass(frozen=True)
 class ValidationReport:
-    """Complete validation report across `patterns.json`, `templates.json`, and `--payload`."""
+    """Holds the complete validation report across `patterns.json`, `templates.json`, and `--payload`.
+
+    Attributes:
+        catalog_id: Canonical catalog URI from `catalog.json`.
+        patterns_path: Resolved path to `patterns.json`, or `None` for fixed-surface catalogs.
+        templates_path: Resolved path to `templates.json`, or `None` for composable catalogs.
+        payload_path: Resolved path to the sample payloads JSON file.
+        schema_ok: Whether top-level sidecar schema validation succeeded.
+        schema_error: Top-level schema validation error string, if any.
+        unknown_patterns: Pattern names in `patterns.json` not referenced by `page` or any block.
+        warnings: Non-fatal warnings for unreachable pattern variants or truncated knob products.
+        expansions_run: Total number of pattern variant and knob dry-run expansions executed.
+        failures: Pattern expansion, lint, schema, or payload eligibility failures.
+        templates_validated: Number of surface templates validated from `templates.json`.
+        template_failures: Surface template lint, payload matching, or schema failures.
+        blocks: Resolution status for all 19 layout grammar blocks.
+        archetypes: Pattern-level eligibility breakdown for all 14 layout archetypes.
+        payload_samples: Per-sample pointer, archetype eligibility, and template match reports.
+        payload_eligible: Union of archetype IDs eligible across all sample payloads.
+    """
 
     catalog_id: str
     patterns_path: Path | None
@@ -157,12 +219,23 @@ class ValidationReport:
 
     @property
     def ok(self) -> bool:
-        """Whether all schema, pattern, template, and payload checks passed."""
+        """Returns whether all schema, pattern, template, and payload checks passed.
+
+        Returns:
+            Whether `schema_ok` is true and both `failures` and `template_failures` are empty.
+        """
         return self.schema_ok and not self.failures and not self.template_failures
 
 
 def _wire_version(protocol_version: str) -> str:
-    """Returns `'1.0'` for 1.x protocol versions and `'v0.9'` otherwise."""
+    """Normalizes `protocol_version` to its wire envelope version string.
+
+    Args:
+        protocol_version: Protocol version string from `CatalogDecisionGraph`.
+
+    Returns:
+        `'1.0'` for 1.x protocol versions, or `'v0.9'` otherwise.
+    """
     clean = protocol_version.strip().lstrip("v")
     return "1.0" if clean == "1" or clean.startswith("1.") else "v0.9"
 
@@ -174,12 +247,24 @@ def surface_messages(
     *,
     ensure_root: bool = False,
 ) -> list[dict[str, Any]]:
-    """Builds the wire-format `createSurface` + `updateComponents` + `updateDataModel` batch."""
+    """Builds a wire-format `createSurface`, `updateComponents`, and `updateDataModel` batch.
+
+    Args:
+        graph: Catalog decision graph providing protocol version and catalog URI.
+        components: Expanded component dictionaries to place in `updateComponents`.
+        payload: Synthetic or sample data model dictionary for `updateDataModel`.
+        ensure_root: Whether to rewrite the first component ID to `"root"` when testing
+            a standalone block outside a `"page"` wrapper.
+
+    Returns:
+        A list of A2UI wire message dictionaries ready for `to_message_models`.
+    """
     version = _wire_version(graph.protocol_version)
     create_body: dict[str, Any] = {"surfaceId": "validation_surface"}
     if graph.surface_catalog_id is not None:
         create_body["catalogId"] = graph.surface_catalog_id
     copied = [copy.deepcopy(dict(c)) for c in components]
+    # Standalone block dry runs lack a page wrapper, so promote the first root to "root".
     if ensure_root and copied and not any(c.get("id") == "root" for c in copied):
         copied[0]["id"] = "root"
     messages: list[dict[str, Any]] = [
@@ -193,19 +278,28 @@ def surface_messages(
         },
     ]
     if payload:
-        messages.append({
-            "version": version,
-            "updateDataModel": {
-                "surfaceId": "validation_surface",
-                "path": "/",
-                "value": dict(payload),
-            },
-        })
+        messages.append(
+            {
+                "version": version,
+                "updateDataModel": {
+                    "surfaceId": "validation_surface",
+                    "path": "/",
+                    "value": dict(payload),
+                },
+            }
+        )
     return messages
 
 
 def _first_line(exc: Exception) -> str:
-    """Returns the first non-empty line of an exception message."""
+    """Returns the first non-empty line of an exception message.
+
+    Args:
+        exc: Exception instance to summarize.
+
+    Returns:
+        The first non-empty line of `str(exc)`, or the exception class name.
+    """
     for line in str(exc).splitlines():
         if line.strip():
             return line.strip()
@@ -222,7 +316,20 @@ def _format_failure_message(
     rule: str,
     anchor: str,
 ) -> str:
-    """Formats an actionable failure message naming file, pattern, component, property, rule, and guide link."""
+    """Formats a failure diagnostic naming file, pattern, component, property, rule, and guide link.
+
+    Args:
+        file_path: Path to the offending artifact file, or `None` for default `"patterns.json"`.
+        pattern: Pattern name in `patterns.json`.
+        component_id: Template component ID within the pattern.
+        component_type: Optional catalog component type name.
+        prop: Component property path where validation failed.
+        rule: Concise description of the violated rule.
+        anchor: Section anchor in `patterns_authoring_guide.md`.
+
+    Returns:
+        The formatted diagnostic message string.
+    """
     file_label = file_path.name if file_path is not None else "patterns.json"
     comp_desc = (
         f"component '{component_id}' ({component_type})"
@@ -236,7 +343,14 @@ def _format_failure_message(
 
 
 def _infer_prop_from_message(msg: str) -> str:
-    """Infers a component property name from a schema validation message."""
+    """Infers a component property name from a JSON Schema validation error line.
+
+    Args:
+        msg: First line of a schema validation error message.
+
+    Returns:
+        The missing required or unexpected property name, or `"component"` as fallback.
+    """
     req_match = _REQUIRED_PROP_RE.search(msg)
     if req_match is not None:
         return req_match.group(1)
@@ -253,7 +367,18 @@ def _resolve_template_component(
     block_id: str | None,
     knobs: Mapping[str, str],
 ) -> tuple[str, str | None]:
-    """Maps an expanded component ID back to its template ID and type in `patterns.json`."""
+    """Maps an expanded component ID back to its template ID and type in `patterns.json`.
+
+    Args:
+        expanded_id: Component ID emitted by `PatternExpander` (or `"root"`).
+        comp_type: Component type name from the expanded component, if known.
+        cat_pattern: Source `CatalogPattern` definition, if available.
+        block_id: Grammar block prefix applied during expansion, or `None` for `"page"`.
+        knobs: Active knob mapping used to select the pattern variant.
+
+    Returns:
+        A `(template_component_id, component_type)` pair pointing to the authored template.
+    """
     if cat_pattern is None:
         return (expanded_id, comp_type)
     variant = cat_pattern.select_variant(knobs)
@@ -282,7 +407,18 @@ def _extract_schema_failure_target(
     block_id: str | None,
     knobs: Mapping[str, str],
 ) -> tuple[str, str | None, str]:
-    """Extracts `(template_component_id, component_type, property_name)` from a schema error."""
+    """Extracts `(template_component_id, component_type, property_name)` from a schema error.
+
+    Args:
+        exc: Validation exception raised by `to_message_models` or `validate_payload`.
+        components: Expanded component list that was validated.
+        cat_pattern: Source `CatalogPattern` definition.
+        block_id: Grammar block ID, or `None` for `"page"`.
+        knobs: Active knob values for variant resolution.
+
+    Returns:
+        A `(template_component_id, component_type, property_name)` tuple.
+    """
     msg = _first_line(exc)
     exc_path = getattr(exc, "path", None)
     expanded_id = (
@@ -309,7 +445,14 @@ def _extract_schema_failure_target(
 
 
 def _is_valid_event_target(target: Any) -> bool:
-    """Returns whether `target` is a valid `$event` action slot binding."""
+    """Returns whether `target` is a valid `$event` action slot binding.
+
+    Args:
+        target: Value assigned to the `"$event"` key in a component template.
+
+    Returns:
+        Whether `target` names an action slot rather than a presentational label slot.
+    """
     if isinstance(target, str):
         return bool(target.strip()) and target not in _NON_ACTION_EVENT_SLOTS
     if isinstance(target, Mapping):
@@ -324,7 +467,15 @@ def _is_valid_event_target(target: Any) -> bool:
 
 
 def _check_event_context(ctx_val: Any, *, ctx_prop: str) -> tuple[str, str] | None:
-    """Validates the `context` sub-object of an `$event` directive."""
+    """Validates the `context` sub-object of an `$event` directive.
+
+    Args:
+        ctx_val: Value of the `"context"` property inside an `"$event"` directive.
+        ctx_prop: Dotted property path to `"context"` for diagnostic messages.
+
+    Returns:
+        A `(property_path, rule_message)` tuple if invalid, or `None` if valid.
+    """
     if ctx_val is None:
         return None
     if not isinstance(ctx_val, Mapping):
@@ -354,7 +505,15 @@ def _check_event_context(ctx_val: Any, *, ctx_prop: str) -> tuple[str, str] | No
 def _check_event_mapping(
     node: Mapping[str, Any], *, prop_path: str
 ) -> tuple[str, str] | None:
-    """Validates an `$event` or `$actionContext` directive mapping."""
+    """Validates an `$event` or `$actionContext` directive mapping.
+
+    Args:
+        node: Mapping inside a component property value.
+        prop_path: Dotted property path to `node`.
+
+    Returns:
+        A `(property_path, rule_message)` tuple if invalid, or `None` if valid.
+    """
     if "$event" in node:
         target = node["$event"]
         if not _is_valid_event_target(target):
@@ -382,7 +541,15 @@ def _check_event_mapping(
 
 
 def _walk_property_directives(value: Any, *, prop_path: str) -> list[tuple[str, str]]:
-    """Recursively checks a component property value for invalid `$event` or `$actionContext` directives."""
+    """Recursively checks a component property value for invalid `$event` or `$actionContext` directives.
+
+    Args:
+        value: Arbitrary JSON value inside a component template property.
+        prop_path: Dotted property path to `value`.
+
+    Returns:
+        List of `(property_path, rule_message)` findings discovered under `value`.
+    """
     if isinstance(value, Mapping):
         finding = _check_event_mapping(value, prop_path=prop_path)
         if finding is not None:
@@ -410,7 +577,19 @@ def _validate_component_template_directives(
     patterns_path: Path | None,
     default_id: str,
 ) -> list[ExpansionFailure]:
-    """Validates `$event` and `$actionContext` directives on one component template dict."""
+    """Validates `$event` and `$actionContext` directives on one component template dict.
+
+    Args:
+        comp_tpl: Raw component template mapping from `patterns.json`.
+        pattern_name: Owning pattern name.
+        block_id: Grammar block ID, or `None` for `"page"`.
+        knobs: Knob assignment for the containing pattern variant.
+        patterns_path: Path to `patterns.json` for diagnostic formatting.
+        default_id: Fallback component ID when `comp_tpl` omits `"id"`.
+
+    Returns:
+        List of `ExpansionFailure` entries found on `comp_tpl`.
+    """
     comp_id = str(comp_tpl.get("id", default_id))
     comp_type = str(comp_tpl.get("component", "")) or None
     failures: list[ExpansionFailure] = []
@@ -446,7 +625,16 @@ def _validate_pattern_directives(
     block_id: str | None,
     patterns_path: Path | None,
 ) -> list[ExpansionFailure]:
-    """Validates `$event` and `$actionContext` directives across all variants and fieldVariants of `cat_pattern`."""
+    """Validates `$event` and `$actionContext` directives across all variants and fieldVariants.
+
+    Args:
+        cat_pattern: Catalog pattern definition to inspect.
+        block_id: Grammar block ID, or `None` for `"page"`.
+        patterns_path: Path to `patterns.json` for diagnostic formatting.
+
+    Returns:
+        List of `ExpansionFailure` entries across all variants and `fieldVariants`.
+    """
     failures: list[ExpansionFailure] = []
     for variant in cat_pattern.variants:
         variant_knobs = {k: v[0] for k, v in variant.when.items() if v}
@@ -486,7 +674,21 @@ def _check_expanded_surface(
     cat_pattern: CatalogPattern | None = None,
     patterns_path: Path | None = None,
 ) -> list[ExpansionFailure]:
-    """Runs `lint_components` and `validate_payload` on an expanded component list."""
+    """Runs `lint_components` and `validate_payload` on an expanded component list.
+
+    Args:
+        pattern_name: Name of the expanded pattern.
+        block_id: Grammar block ID, or `None` for `"page"`.
+        knobs: Active knob mapping used for expansion.
+        components: Expanded component dictionaries.
+        payload: Synthetic data model dictionary for `updateDataModel`.
+        graph: Catalog decision graph used for wire message validation.
+        cat_pattern: Source `CatalogPattern` for mapping expanded IDs back to templates.
+        patterns_path: Path to `patterns.json` for diagnostic formatting.
+
+    Returns:
+        List of lint and catalog schema `ExpansionFailure` records.
+    """
     failures: list[ExpansionFailure] = []
     default_root = (
         cat_pattern.select_variant(knobs).root if cat_pattern is not None else "<root>"
@@ -550,7 +752,15 @@ def _check_expanded_surface(
 def _check_unreachable_variants(
     pattern: CatalogPattern, combos: Sequence[Mapping[str, str]]
 ) -> list[str]:
-    """Warns when a declared variant with `when` is never selected by any knob combo."""
+    """Warns when a declared variant with `when` is never selected by any knob combination.
+
+    Args:
+        pattern: Catalog pattern definition whose variants are checked.
+        combos: Enumerated knob combinations for `pattern`.
+
+    Returns:
+        List of warning strings for any unreachable pattern variants.
+    """
     if len(pattern.variants) <= 1:
         return []
     selected_ids = {id(pattern.select_variant(knobs)) for knobs in combos}
@@ -572,7 +782,18 @@ def dry_run_block(
     *,
     patterns_path: Path | None = None,
 ) -> tuple[int, list[ExpansionFailure], list[str]]:
-    """Dry-runs `block` across all knob combinations of its resolved pattern."""
+    """Dry-runs `block` across all knob combinations of its resolved pattern.
+
+    Args:
+        expander: Pattern expander bound to `library` and `graph`.
+        library: Pattern library under validation.
+        block: Layout grammar block specification to expand.
+        graph: Catalog decision graph for component schema verification.
+        patterns_path: Optional path to `patterns.json` for diagnostic messages.
+
+    Returns:
+        A `(runs, failures, warnings)` tuple for `block`.
+    """
     resolved = resolve_fallback_pattern(block, library)
     if resolved is None:
         return (0, [], [])
@@ -648,7 +869,16 @@ def _expand_seed_block_for_page(
     grammar: ArchetypeGrammar,
     library: PatternLibrary,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
-    """Expands one real block so `expand_page` has a valid child component root ID."""
+    """Expands one real block so `expand_page` has a valid child component root ID.
+
+    Args:
+        expander: Pattern expander bound to `library`.
+        grammar: Layout archetype grammar providing candidate seed blocks.
+        library: Pattern library under validation.
+
+    Returns:
+        A `(seed_components, block_root_ids, synthetic_payload)` tuple.
+    """
     preferred_order = ("prose", *grammar.blocks.keys())
     for block_id in preferred_order:
         block = grammar.blocks.get(block_id)
@@ -680,7 +910,18 @@ def dry_run_page(
     *,
     patterns_path: Path | None = None,
 ) -> tuple[int, list[ExpansionFailure], list[str]]:
-    """Dry-runs the `page` pattern paired with one expanded seed block."""
+    """Dry-runs the `page` pattern paired with one expanded seed block.
+
+    Args:
+        expander: Pattern expander bound to `library` and `graph`.
+        grammar: Layout archetype grammar.
+        library: Pattern library under validation.
+        graph: Catalog decision graph for schema validation.
+        patterns_path: Optional path to `patterns.json` for diagnostic messages.
+
+    Returns:
+        A `(runs, failures, warnings)` tuple for the `"page"` pattern.
+    """
     page_pattern = library.get("page")
     if page_pattern is None:
         return (
@@ -762,7 +1003,15 @@ def dry_run_page(
 def block_coverage(
     grammar: ArchetypeGrammar, library: PatternLibrary
 ) -> tuple[BlockCoverage, ...]:
-    """Computes direct, fallback, or unavailable resolution for every grammar block."""
+    """Computes direct, fallback, or unavailable resolution for every grammar block.
+
+    Args:
+        grammar: Layout archetype grammar defining all 19 blocks.
+        library: Pattern library under evaluation.
+
+    Returns:
+        A tuple of `BlockCoverage` entries in grammar block order.
+    """
     out: list[BlockCoverage] = []
     for block in grammar.blocks.values():
         primary_name = PatternRef.parse(block.pattern).name
@@ -804,7 +1053,15 @@ def block_coverage(
 def _missing_criteria_patterns(
     criteria: str, library: PatternLibrary
 ) -> tuple[str, ...]:
-    """Returns `pattern:<name>:<variant>` tokens in `criteria` missing from `library`."""
+    """Returns `pattern:<name>:<variant>` tokens in `criteria` missing from `library`.
+
+    Args:
+        criteria: Archetype criteria expression string.
+        library: Pattern library under evaluation.
+
+    Returns:
+        Tuple of missing pattern or `pattern:variant` specifiers.
+    """
     missing: list[str] = []
     for match in _CRITERIA_PATTERN_RE.finditer(criteria):
         pat_name, pat_var = match.group(1), match.group(2)
@@ -820,7 +1077,17 @@ def _single_archetype_coverage(
     *,
     has_page: bool,
 ) -> ArchetypeCoverage:
-    """Computes pattern-level coverage for one `LayoutArchetype`."""
+    """Computes pattern-level coverage for one `LayoutArchetype`.
+
+    Args:
+        arch: Layout archetype specification from `grammar.archetypes`.
+        library: Pattern library under evaluation.
+        by_block: Block coverage lookup keyed by `block_id`.
+        has_page: Whether `library` defines the required `"page"` pattern.
+
+    Returns:
+        An `ArchetypeCoverage` record for `arch`.
+    """
     missing_req: list[str] = []
     degraded_req: list[str] = []
     for req_id in arch.required_block_ids():
@@ -857,7 +1124,16 @@ def archetype_coverage(
     library: PatternLibrary,
     blocks: Sequence[BlockCoverage],
 ) -> tuple[ArchetypeCoverage, ...]:
-    """Computes pattern-level eligibility for all 14 archetypes."""
+    """Computes pattern-level eligibility for all 14 archetypes.
+
+    Args:
+        grammar: Layout archetype grammar.
+        library: Pattern library under evaluation.
+        blocks: Per-block coverage results from `block_coverage`.
+
+    Returns:
+        A tuple of `ArchetypeCoverage` entries for all archetypes in `grammar`.
+    """
     by_block = {b.block_id: b for b in blocks}
     has_page = library.has_pattern("page")
     return tuple(
@@ -869,7 +1145,15 @@ def archetype_coverage(
 def _unknown_pattern_names(
     grammar: ArchetypeGrammar, library: PatternLibrary
 ) -> tuple[str, ...]:
-    """Returns pattern names in `library` not referenced by `page` or any grammar block."""
+    """Returns pattern names in `library` not referenced by `page` or any grammar block.
+
+    Args:
+        grammar: Layout archetype grammar.
+        library: Pattern library under evaluation.
+
+    Returns:
+        Sorted tuple of unreferenced pattern names.
+    """
     known: set[str] = {"page"}
     for block in grammar.blocks.values():
         known.add(PatternRef.parse(block.pattern).name)
@@ -884,7 +1168,17 @@ def _validate_single_template(
     samples: Mapping[str, Mapping[str, Any]],
     sample_pointer_paths: Mapping[str, set[str]],
 ) -> list[TemplateValidationFailure]:
-    """Lints and validates one `SurfaceTemplate` against matching sample payloads."""
+    """Lints and validates one `SurfaceTemplate` against matching sample payloads.
+
+    Args:
+        loaded: Loaded catalog bundle.
+        template: Surface template under validation.
+        samples: Mapping from sample name to sample payload dictionary.
+        sample_pointer_paths: Mapping from sample name to its discovered JSON Pointers.
+
+    Returns:
+        List of `TemplateValidationFailure` records for `template`.
+    """
     failures: list[TemplateValidationFailure] = []
     for finding in lint_components(list(template.components), plan=None):
         if finding.severity == "error":
@@ -938,7 +1232,20 @@ def validate_templates(
     samples: Mapping[str, Mapping[str, Any]],
     sample_pointer_paths: Mapping[str, set[str]],
 ) -> tuple[int, list[TemplateValidationFailure]]:
-    """Validates all templates in `registry` against `loaded.catalog` and `samples`."""
+    """Validates all templates in `registry` against `loaded.catalog` and `samples`.
+
+    Args:
+        loaded: Loaded catalog bundle.
+        registry: Loaded surface template registry.
+        samples: Mapping from sample name to payload dictionary.
+        sample_pointer_paths: Mapping from sample name to discovered pointer paths.
+
+    Returns:
+        A `(templates_validated, failures)` pair.
+
+    Raises:
+        ToolError: If any template's `catalogId` does not match `loaded.catalog.catalog_id`.
+    """
     target_cat_id = loaded.catalog.catalog_id
     for tpl in registry.list_templates():
         if tpl.catalog_id is not None and tpl.catalog_id != target_cat_id:
@@ -961,7 +1268,19 @@ def _resolve_sidecar_paths(
     patterns_path: str | Path | None,
     templates_path: str | Path | None,
 ) -> tuple[Path | None, Path | None]:
-    """Resolves explicit or auto-discovered `patterns.json` and `templates.json` paths."""
+    """Resolves explicit or auto-discovered `patterns.json` and `templates.json` paths.
+
+    Args:
+        loaded: Loaded catalog bundle providing `target_dir` for auto-discovery.
+        patterns_path: Optional explicit path to `patterns.json`.
+        templates_path: Optional explicit path to `templates.json`.
+
+    Returns:
+        A `(patterns_path, templates_path)` pair where at least one path is non-`None`.
+
+    Raises:
+        ToolError: If neither sidecar is provided or auto-discovered in `loaded.target_dir`.
+    """
     p_path = Path(patterns_path).resolve() if patterns_path is not None else None
     t_path = Path(templates_path).resolve() if templates_path is not None else None
     if p_path is None and t_path is None:
@@ -992,7 +1311,17 @@ def _evaluate_pattern_library(
     tuple[BlockCoverage, ...],
     tuple[ArchetypeCoverage, ...],
 ]:
-    """Runs dry-run expansion and coverage analysis on `library`."""
+    """Runs dry-run expansion and coverage analysis on `library`.
+
+    Args:
+        loaded: Loaded catalog bundle.
+        library: Parsed pattern library under validation.
+        patterns_path: Optional path to `patterns.json` for diagnostic messages.
+
+    Returns:
+        A `(expansions_run, failures, warnings, unknown_patterns, blocks_coverage,
+        archetypes_coverage)` tuple.
+    """
     unknown = _unknown_pattern_names(loaded.grammar, library)
     expander = PatternExpander(library, loaded.graph, grammar=loaded.grammar)
     expansions_run, failures, warnings = dry_run_page(
@@ -1026,7 +1355,18 @@ def _evaluate_single_sample(
     library: PatternLibrary | None,
     registry: TemplateRegistry | None,
 ) -> tuple[PayloadSampleReport, set[str]]:
-    """Evaluates one sample payload against `library` and `registry`."""
+    """Evaluates one sample payload against `library` and `registry`.
+
+    Args:
+        loaded: Loaded catalog bundle.
+        sample_name: Identifier of the sample payload.
+        sample_payload: Sample data model dictionary.
+        library: Optional pattern library for archetype eligibility evaluation.
+        registry: Optional surface template registry for `requiredPointers` matching.
+
+    Returns:
+        A `(sample_report, pointer_paths_set)` pair.
+    """
     ptrs = inspect_payload_pointers(sample_payload)
     ptr_set = {p.path for p in ptrs}
     el_ids = (
@@ -1056,7 +1396,17 @@ def _evaluate_sample_payloads(
     library: PatternLibrary | None,
     registry: TemplateRegistry | None,
 ) -> tuple[list[PayloadSampleReport], dict[str, set[str]], list[str]]:
-    """Evaluates `samples` against `library` and `registry`."""
+    """Evaluates `samples` against `library` and `registry`.
+
+    Args:
+        loaded: Loaded catalog bundle.
+        samples: Mapping from sample name to sample payload dictionary.
+        library: Optional pattern library.
+        registry: Optional surface template registry.
+
+    Returns:
+        A `(sample_reports, sample_pointer_paths, union_eligible_archetypes)` tuple.
+    """
     sample_reports: list[PayloadSampleReport] = []
     sample_ptr_paths: dict[str, set[str]] = {}
     union_eligible: list[str] = []
@@ -1080,7 +1430,28 @@ def validate_catalog_artifacts(
     patterns_path: str | Path | None = None,
     templates_path: str | Path | None = None,
 ) -> ValidationReport:
-    """Validates `patterns.json` and/or `templates.json` with required `--payload` samples."""
+    """Validates `patterns.json` and/or `templates.json` with required `--payload` samples.
+
+    Executes the five validation stages in order:
+    1. Sidecar JSON Schema and `catalogId` / `grammarVersion` parity checks.
+    2. Combinatorial dry-run expansion of `page` and all 19 grammar blocks across knobs.
+    3. Structural component topology and directive linting (`lint_components`).
+    4. Catalog wire message validation (`to_message_models` and `validate_payload`).
+    5. Runtime sample payload eligibility (`eligible_archetypes`) and template matching.
+
+    Args:
+        loaded: Loaded catalog bundle.
+        payload_path: Path to the sample payloads JSON file (`--payload`).
+        patterns_path: Optional explicit path to `patterns.json`.
+        templates_path: Optional explicit path to `templates.json`.
+
+    Returns:
+        The populated `ValidationReport`.
+
+    Raises:
+        ToolError: If sidecar files cannot be resolved, fail schema parsing, or mismatch
+            `catalogId` or `grammarVersion`.
+    """
     resolved_payload_path = Path(payload_path).resolve()
     samples = load_sample_payloads(resolved_payload_path)
     p_path, t_path = _resolve_sidecar_paths(loaded, patterns_path, templates_path)
@@ -1172,7 +1543,14 @@ def validate_catalog_artifacts(
 
 
 def report_to_dict(report: ValidationReport) -> dict[str, Any]:
-    """Serializes `report` to a JSON-compatible dictionary."""
+    """Serializes `report` to a JSON-compatible dictionary.
+
+    Args:
+        report: Validation report to serialize.
+
+    Returns:
+        A camelCase dictionary suitable for JSON serialization.
+    """
     return {
         "ok": report.ok,
         "catalogId": report.catalog_id,
@@ -1239,8 +1617,30 @@ def report_to_dict(report: ValidationReport) -> dict[str, Any]:
     }
 
 
+def _append_warnings_and_unknown_patterns(
+    lines: list[str], report: ValidationReport
+) -> None:
+    """Appends unknown pattern and warning sections to `lines` when present.
+
+    Args:
+        lines: Mutable Markdown output line buffer.
+        report: Validation report containing unknown pattern names and warnings.
+    """
+    if report.unknown_patterns:
+        unknown = ", ".join(f"`{name}`" for name in report.unknown_patterns)
+        lines.extend(["", f"## Unknown Patterns: {unknown}"])
+    if report.warnings:
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in report.warnings)
+
+
 def _append_failure_tables(lines: list[str], report: ValidationReport) -> None:
-    """Appends pattern and template failure tables to `lines` when present."""
+    """Appends pattern failure, template failure, unknown pattern, and warning sections to `lines`.
+
+    Args:
+        lines: Mutable Markdown output line buffer.
+        report: Validation report containing failures, unknown patterns, and warnings.
+    """
     if report.failures:
         lines.extend(["", "## Pattern & Payload Failures", ""])
         rows = [
@@ -1272,10 +1672,18 @@ def _append_failure_tables(lines: list[str], report: ValidationReport) -> None:
         lines.append(
             render_markdown_table(["Template ID", "Sample", "Stage", "Message"], rows)
         )
+    _append_warnings_and_unknown_patterns(lines, report)
 
 
 def _archetype_row(arch: ArchetypeCoverage) -> list[str]:
-    """Formats one `ArchetypeCoverage` row for the Markdown table."""
+    """Formats one `ArchetypeCoverage` row for the Markdown table.
+
+    Args:
+        arch: Archetype coverage entry to format.
+
+    Returns:
+        List of six Markdown table cells.
+    """
     return [
         f"`{arch.archetype_id}`",
         arch.family,
@@ -1287,7 +1695,14 @@ def _archetype_row(arch: ArchetypeCoverage) -> list[str]:
 
 
 def _sample_row(sample: PayloadSampleReport) -> list[str]:
-    """Formats one `PayloadSampleReport` row for the Markdown table."""
+    """Formats one `PayloadSampleReport` row for the Markdown table.
+
+    Args:
+        sample: Payload sample report entry to format.
+
+    Returns:
+        List of four Markdown table cells.
+    """
     return [
         f"`{sample.sample_name}`",
         str(sample.pointer_count),
@@ -1297,7 +1712,14 @@ def _sample_row(sample: PayloadSampleReport) -> list[str]:
 
 
 def report_to_markdown(report: ValidationReport) -> str:
-    """Renders `report` as a Markdown summary."""
+    """Renders `report` as a Markdown summary.
+
+    Args:
+        report: Validation report to format.
+
+    Returns:
+        The formatted Markdown report ending with a newline.
+    """
     status = "PASSED" if report.ok else "FAILED"
     lines: list[str] = [
         f"# Catalog Validation ({status}): `{report.catalog_id}`",
@@ -1318,38 +1740,42 @@ def report_to_markdown(report: ValidationReport) -> str:
 
     if report.archetypes:
         el_count = sum(1 for a in report.archetypes if a.eligible)
-        lines.extend([
+        lines.extend(
+            [
+                "",
+                (
+                    f"## Archetype Coverage ({el_count}/{len(report.archetypes)}"
+                    " pattern-eligible)"
+                ),
+                "",
+                render_markdown_table(
+                    [
+                        "Archetype",
+                        "Family",
+                        "Pattern-Eligible",
+                        "Missing Required",
+                        "Degraded Required",
+                        "Viable Blocks",
+                    ],
+                    [_archetype_row(a) for a in report.archetypes],
+                ),
+            ]
+        )
+
+    lines.extend(
+        [
             "",
-            (
-                f"## Archetype Coverage ({el_count}/{len(report.archetypes)}"
-                " pattern-eligible)"
-            ),
+            "## Sample Payload Verification (`--payload`)",
             "",
             render_markdown_table(
                 [
-                    "Archetype",
-                    "Family",
-                    "Pattern-Eligible",
-                    "Missing Required",
-                    "Degraded Required",
-                    "Viable Blocks",
+                    "Sample",
+                    "Pointers",
+                    "Eligible Archetypes",
+                    "Matching Templates",
                 ],
-                [_archetype_row(a) for a in report.archetypes],
+                [_sample_row(s) for s in report.payload_samples],
             ),
-        ])
-
-    lines.extend([
-        "",
-        "## Sample Payload Verification (`--payload`)",
-        "",
-        render_markdown_table(
-            [
-                "Sample",
-                "Pointers",
-                "Eligible Archetypes",
-                "Matching Templates",
-            ],
-            [_sample_row(s) for s in report.payload_samples],
-        ),
-    ])
+        ]
+    )
     return "\n".join(lines) + "\n"

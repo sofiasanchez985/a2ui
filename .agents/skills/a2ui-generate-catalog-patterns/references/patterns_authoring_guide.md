@@ -91,7 +91,7 @@ Every expanded component template in `"components"` or `"fieldVariants"` must va
 | `{"$byType": "<slot>", "video_url": "<id1>", "audio_url": "<id2>"}` | Container `children` list | Selects the child component ID matching the semantic type of `<slot>`. |
 | `{"$repeat": "<slot>", "component": "<comp_id>", "order": "primaryLast"}` | Container `children` property | Expands `<comp_id>` across a repeated slot. Emits a `TemplateChildList` (`{"path": ..., "componentId": ...}`) for array pointers with relative fields, or unrolls indexed component copies when items are unrolled. |
 | `{"$map": "<key>", "<opt1>": <v1>, "$default": <v0>}` | Component property | Maps knob or instance answer `<key>` to a catalog-specific enum or literal value. |
-| `{"$ knobValue": "<knob.prop>", "$default": <v0>}` | Component property | Looks up `<knob.prop>` in the plan's knobs or instance answers, falling back to `"$default"`. |
+| `{"$knobValue": "<knob.prop>", "$default": <v0>}` | Component property | Looks up `<knob.prop>` in the plan's knobs or instance answers, falling back to `"$default"`. |
 | `{"$event": "action", "$default": "<name>", "context": {"$actionContext": true}}` | Action property | Emits `{"event": {"name": "<action_id>", "context": ...}}` from the bound `ActionSpec`. |
 | `{"$actionContext": true}` | Inside `$event.context` | Resolves action context bindings from explicit `ActionSpec.context`, item key inside `$repeat`, or mutable form pointers. |
 | `{"$blocks": true}` | `page` container `children` list | Splices the root component IDs of all expanded content blocks into the `page` container. |
@@ -143,21 +143,21 @@ Every expanded pattern surface must satisfy `lint_components`:
 | `banner` | `banner` | `banner -> prose` | `title*`, `text` | - | `tone` |
 | `picture` | `picture` | `picture` | `picture*`, `caption`, `width`, `height`, `aspectRatio`, `orientation` | `framing`, `prominence` | - |
 | `filters` | `filters` | `filters` | `query`, `categories` | - | - |
-| `headline` | `headline` | `headline -> facts` | `items*[]` (`label*`, `value*`, `delta`, `min`, `max`) | `deltas`, `gauge` | `state_tone` |
-| `media` | `media` | `media -> facts` | `source*`, `poster`, `title`, `duration`, `skipForward` | - | - |
-| `chart` | `chart` | `chart -> headline -> collection` | `series*[]` (`x*`, `y*`, `group`), `title` | `form`, `stacking` | - |
-| `facts` | `facts` | `facts -> prose` | `rows*[]` (`label*`, `value*`) | `density` | - |
-| `prose` | `prose` | `prose` | `heading`, `body*` | `length` (measure) | - |
-| `collection` | `collection` | `collection` | `items*[]` (`headline*`, `supporting`, `picture`, `meta`, `badge`, `rating`), `count` (m) | `layout`, `leading`, `trailing` | `badge_tone` |
-| `comparison` | `comparison` | `comparison -> collection:cards -> collection:rows` | `options*[]` (`headline*`, `picture`, `attributes*`, `highlight`) | - | - |
+| `headline` | `headline` | `headline -> facts` | `items[]` (`label`, `value*`, `delta`, `min`, `max`) | `deltas`, `gauge` | `news`, `state_tone` |
+| `media` | `media` | `media -> facts` | `source*`, `poster`, `title`, `duration` | - | - |
+| `chart` | `chart` | `chart -> headline -> collection` | `series*`, `title` | - | - |
+| `facts` | `facts` | `facts -> prose` | `rows[]` (`label*`, `value*`) | - | - |
+| `prose` | `prose` | `prose` | `heading`, `body*`, `length` (measure) | - | - |
+| `collection` | `collection` | `collection` | `items*[]` (`headline*`, `supporting`, `picture`, `icon`, `meta`, `badge`, `rating`) | `layout`, `leading`, `trailing` | `badge_tone` |
+| `comparison` | `comparison` | `comparison -> collection:cards -> collection:rows` | `options*[]` (`headline*`, `picture`, `attributes`, `highlight`) | - | `headline_attribute` |
 | `steps` | `steps` | `steps -> collection:rows` | `items*[]` (`title*`, `detail`, `done`) | - | - |
-| `form` | `form` | `form -> facts` | `fields*[]` (`label*`, `value*`, `options`, `min`, `max`) | - | `control`, `input_format`, `required` |
-| `groups` | `groups` | `groups -> form` | `groups*[]` (`heading*`, `rows*` (`label*`, `value*`, `options`, `min`, `max`)) | - | `row_kind` |
-| `actions` | `actions` | `actions` | `buttons*[]` (`action*`, `label*`) | `sticky` | `primary`, `destructive` |
-| `timeline` | `timeline` | `timeline -> steps -> collection:rows` | `events*[]` (`time*`, `title*`, `detail`, `state`) | `state` | `event_state` |
-| `map` | `map` | `map -> facts` | `location*`, `label`, `pins[]` (`location*`, `label`) | - | - |
+| `form` | `form` | `form -> facts` | `fields*[]` (`label*`, `value*`, `options`, `min`, `max`) | - | `control`, `required` |
+| `groups` | `groups` | `groups -> form` | `groups*[]` (`heading*`, `rows` (`label*`, `value*`)) | - | `row_kind` |
+| `actions` | `actions` | `actions` | `buttons[]` (`label*`, `action*`) | - | `primary`, `destructive` |
+| `timeline` | `timeline` | `timeline -> steps -> collection:rows` | `events*[]` (`time*`, `title*`, `detail`, `state`) | `order` | `state_tone` |
+| `map` | `map` | `map -> facts` | `location*`, `label`, `pins` | - | - |
 | `conversation` | `conversation` | `conversation -> collection:rows` | `messages*[]` (`author*`, `text*`, `time`, `avatar`, `attachment`) | `self` | - |
-| `compose` | `compose` | `compose` | `draft*`, `sendLabel` | - | - |
+| `compose` | `compose` | `compose` | `draft`, `sendLabel` | - | - |
 | `outcome` | `outcome` | `outcome -> banner -> prose` | `headline*`, `detail` | - | `tone` |
 
 ### Pattern Design Recipes

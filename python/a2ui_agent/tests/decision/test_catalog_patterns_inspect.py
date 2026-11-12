@@ -35,6 +35,7 @@ import inspect_catalog  # noqa: E402
 
 
 def test_inspect_composable_design_system_catalog(tmp_path: Path) -> None:
+    """Verifies that `inspect_catalog` classifies a composable catalog and identifies block candidates."""
     ext_dir = tmp_path / "my_design_repo" / "catalog"
     cat_path = write_json(ext_dir, "catalog.json", design_system_catalog_dict("1.0"))
     loaded = _common.load_catalog(cat_path)
@@ -60,6 +61,7 @@ def test_inspect_composable_design_system_catalog(tmp_path: Path) -> None:
 
 
 def test_inspect_fixed_forms_catalog(tmp_path: Path) -> None:
+    """Verifies that `inspect_catalog` classifies a monolithic catalog as `fixed_surface`."""
     forms_dir = tmp_path / "forms_repo"
     cat_path = write_json(forms_dir, "catalog.json", fixed_forms_catalog_dict("1.0"))
     loaded = _common.load_catalog(cat_path)
@@ -86,6 +88,7 @@ def test_inspect_fixed_forms_catalog(tmp_path: Path) -> None:
 
 
 def test_inspect_hybrid_catalog(tmp_path: Path) -> None:
+    """Verifies that `inspect_catalog` classifies a mixed composable/monolithic catalog as `hybrid`."""
     hybrid_dir = tmp_path / "hybrid_repo"
     cat_path = write_json(hybrid_dir, "catalog.json", hybrid_catalog_dict("1.0"))
     loaded = _common.load_catalog(cat_path)
@@ -104,6 +107,7 @@ def test_inspect_hybrid_catalog(tmp_path: Path) -> None:
 
 
 def test_inspect_basic_catalog_and_markdown_roundtrip() -> None:
+    """Verifies that `inspect_catalog` inspects the basic v1 catalog and serializes to Markdown and JSON."""
     basic_path = REPO_ROOT / "catalogs" / "basic" / "v1" / "catalog.json"
     loaded = _common.load_catalog(basic_path)
     report = inspect_catalog.inspect_catalog(loaded)

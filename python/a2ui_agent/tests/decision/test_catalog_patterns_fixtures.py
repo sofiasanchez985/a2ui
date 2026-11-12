@@ -48,6 +48,7 @@ import _common  # noqa: E402
 
 
 def test_fixture_catalogs_and_decision_graphs() -> None:
+    """Verifies that composable, fixed-surface, and hybrid fixtures build expected decision graphs."""
     design = build_design_system_catalog("1.0")
     design_graph = CatalogDecisionGraph([design])
     container_names = {c.name for c in design_graph.container_candidates()}
@@ -70,6 +71,7 @@ def test_fixture_catalogs_and_decision_graphs() -> None:
 
 
 def test_pattern_library_from_file_and_directory(tmp_path: Path) -> None:
+    """Verifies that `PatternLibrary.from_file` loads from both a file path and a parent directory."""
     patterns_file = write_json(tmp_path, "patterns.json", DESIGN_SYSTEM_PATTERNS)
     lib_from_file = PatternLibrary.from_file(patterns_file)
     lib_from_dir = PatternLibrary.from_file(tmp_path)
@@ -83,6 +85,7 @@ def test_pattern_library_from_file_and_directory(tmp_path: Path) -> None:
 def test_template_registry_from_json_file_and_round_trip(
     tmp_path: Path,
 ) -> None:
+    """Verifies that `TemplateRegistry` loads from file or directory and round-trips through `to_dict`."""
     templates_file = write_json(tmp_path, "templates.json", FIXED_FORMS_TEMPLATES)
     reg_from_file = TemplateRegistry.from_file(templates_file)
     reg_from_dir = TemplateRegistry.from_file(tmp_path)
@@ -107,6 +110,7 @@ def test_template_registry_from_json_file_and_round_trip(
 
 
 def test_surface_template_from_json_validation_errors() -> None:
+    """Verifies that `SurfaceTemplate.from_json` rejects empty descriptions and relative pointers."""
     with pytest.raises(A2uiValidationError, match="non-empty 'description'"):
         SurfaceTemplate.from_json("bad", {"description": "", "components": []})
 
@@ -122,6 +126,7 @@ def test_surface_template_from_json_validation_errors() -> None:
 
 
 def test_common_loaders_and_target_dir_resolution(tmp_path: Path) -> None:
+    """Verifies that `_common.load_catalog` resolves `target_dir` and rejects malformed JSON."""
     ext_repo_dir = tmp_path / "external_repo" / "catalogs" / "custom"
     cat_path = write_json(
         ext_repo_dir, "catalog.json", design_system_catalog_dict("1.0")
@@ -142,6 +147,7 @@ def test_common_loaders_and_target_dir_resolution(tmp_path: Path) -> None:
 
 
 def test_load_sample_payloads_named_and_single(tmp_path: Path) -> None:
+    """Verifies that `_common.load_sample_payloads` accepts multi-sample maps and single payloads."""
     named_path = write_json(
         tmp_path, "sample_payloads.json", DESIGN_SYSTEM_SAMPLE_PAYLOADS
     )

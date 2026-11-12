@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 import itertools
 from typing import Any
 
@@ -33,26 +33,37 @@ from a2ui.inference_formats.decision import (
     SlotSpec,
 )
 
-_NUMERIC_TYPES: frozenset[str] = frozenset({
-    "number",
-    "integer",
-    "count",
-    "currency",
-    "percent",
-    "percentage",
-    "ratio",
-    "quantity",
-    "rating",
-    "bounded",
-    "duration",
-    "distance",
-})
+_NUMERIC_TYPES: frozenset[str] = frozenset(
+    {
+        "number",
+        "integer",
+        "count",
+        "currency",
+        "percent",
+        "percentage",
+        "ratio",
+        "quantity",
+        "rating",
+        "bounded",
+        "duration",
+        "distance",
+    }
+)
 
 
 def _first_semantic_type(from_types: Sequence[str]) -> SemanticType | None:
-    """Returns the first entry in `from_types` that is a valid `SemanticType`, or None."""
+    """Returns the first entry in `from_types` that is a valid `SemanticType`.
+
+    Args:
+        from_types: Sequence of grammar slot source type names.
+
+    Returns:
+        The first matching `SemanticType` enum value, or `None` if `from_types`
+        contains only grammar-level tokens (`"key"`, `"any"`, `"mutable"`, `"action"`).
+    """
     for name in from_types:
         try:
+            # Skip non-enum grammar tokens such as "key", "any", "mutable", and "action".
             return SemanticType(name)
         except ValueError:
             continue
@@ -60,7 +71,16 @@ def _first_semantic_type(from_types: Sequence[str]) -> SemanticType | None:
 
 
 def _scalar_sample_value(slot: SlotSpec, key: str, idx: int = 0) -> Any:
-    """Returns a type-appropriate literal value for `slot`."""
+    """Returns a type-appropriate literal sample value for `slot`.
+
+    Args:
+        slot: Grammar slot specification describing allowed `from_types`.
+        key: Slot or nested field name.
+        idx: Zero-based item index when populating repeated items.
+
+    Returns:
+        A deterministic boolean, list, number, URL, or string sample value.
+    """
     from_set = set(slot.from_types)
     if from_set == {"boolean"}:
         return idx == 0
@@ -85,7 +105,14 @@ def _scalar_sample_value(slot: SlotSpec, key: str, idx: int = 0) -> Any:
 
 
 def _repeat_item_count(block: BlockSpec) -> int:
-    """Returns enough synthetic items to exercise every instance option on `block`."""
+    """Returns enough synthetic items to exercise every instance option on `block`.
+
+    Args:
+        block: Grammar block specification.
+
+    Returns:
+        The synthetic item count (at least 2, or the largest non-boolean instance option count).
+    """
     max_opts = 2
     for q_spec in block.instance.values():
         if q_spec.kind is not QuestionKind.BOOLEAN:
@@ -94,7 +121,14 @@ def _repeat_item_count(block: BlockSpec) -> int:
 
 
 def synthetic_actions(block: BlockSpec) -> tuple[ActionSpec, ...]:
-    """Builds synthetic `ActionSpec` declarations for surface and item actions on `block`."""
+    """Builds synthetic `ActionSpec` declarations for surface and item actions on `block`.
+
+    Args:
+        block: Grammar block specification.
+
+    Returns:
+        A tuple of synthetic `ActionSpec` instances matching the block's action slots.
+    """
     if block.id == "actions":
         return (
             ActionSpec(
@@ -149,7 +183,14 @@ def synthetic_actions(block: BlockSpec) -> tuple[ActionSpec, ...]:
 
 
 def _build_groups_binding(block: BlockSpec) -> SlotBinding:
-    """Builds synthetic nested group and row bindings for the `groups` block."""
+    """Builds synthetic nested group and row bindings for the `groups` block.
+
+    Args:
+        block: The `"groups"` grammar block specification.
+
+    Returns:
+        A `SlotBinding` containing one group with heterogeneous row bindings.
+    """
     count = _repeat_item_count(block)
     row_actions = synthetic_actions(block)
     rows = tuple(
@@ -183,7 +224,15 @@ def _build_groups_binding(block: BlockSpec) -> SlotBinding:
 
 
 def _build_comparison_binding(slot: SlotSpec) -> SlotBinding:
-    """Builds synthetic `options` bindings (with nested `attributes` and `fields`) for `comparison`."""
+    """Builds synthetic `options` bindings with nested `attributes` and `fields` for `comparison`.
+
+    Args:
+        slot: The `"options"` slot specification from the `"comparison"` grammar block.
+
+    Returns:
+        A `SlotBinding` providing both template `fields` and unrolled `items` so direct
+        `comparison` patterns and `collection` fallback patterns can expand without error.
+    """
     fields = {
         f_name: SlotBinding(
             pointer=f_name,
@@ -210,7 +259,15 @@ def _build_comparison_binding(slot: SlotSpec) -> SlotBinding:
 
 
 def _build_scalar_repeated_binding(block: BlockSpec, slot: SlotSpec) -> SlotBinding:
-    """Builds unrolled item mappings for scalar-repeated slots (`headline`, `facts`, `form`, `actions`)."""
+    """Builds unrolled item mappings for scalar-repeated slots (`headline`, `facts`, `form`, `actions`).
+
+    Args:
+        block: Grammar block owning `slot`.
+        slot: Repeated slot specification whose items unroll over object keys or actions.
+
+    Returns:
+        A `SlotBinding` populated with unrolled `items` dictionaries.
+    """
     if "action" in slot.from_types:
         actions = synthetic_actions(block)
         return SlotBinding(
@@ -247,7 +304,16 @@ def _build_scalar_repeated_binding(block: BlockSpec, slot: SlotSpec) -> SlotBind
 def _build_array_repeat_binding(
     block: BlockSpec, name: str, slot: SlotSpec
 ) -> SlotBinding:
-    """Builds a template-mode array `SlotBinding` with synthetic item `ActionSpec`s."""
+    """Builds a template-mode array `SlotBinding` with synthetic item `ActionSpec`s.
+
+    Args:
+        block: Grammar block owning `slot`.
+        name: Slot name on the block.
+        slot: Repeated array slot specification.
+
+    Returns:
+        A `SlotBinding` with root pointer `/{name}` and relative `fields` bindings.
+    """
     item_actions = synthetic_actions(block)
     item_action = item_actions[0] if item_actions else None
     fields: dict[str, SlotBinding] = {"id": SlotBinding(pointer="id")}
@@ -265,7 +331,12 @@ def _build_array_repeat_binding(
 
 
 def _attach_compose_action(block: BlockSpec, slots: dict[str, SlotBinding]) -> None:
-    """Binds a synthetic `ActionSpec` for the `compose` block."""
+    """Binds a synthetic `ActionSpec` for the `compose` block.
+
+    Args:
+        block: Grammar block being bound.
+        slots: Mutable slot binding mapping to update in place when `block.id == "compose"`.
+    """
     if block.id != "compose":
         return
     compose_actions = synthetic_actions(block)
@@ -274,7 +345,14 @@ def _attach_compose_action(block: BlockSpec, slots: dict[str, SlotBinding]) -> N
 
 
 def synthetic_block_bindings(block: BlockSpec) -> BlockBindings:
-    """Constructs synthetic `BlockBindings` covering all slots of `block`."""
+    """Constructs synthetic `BlockBindings` covering all slots of `block`.
+
+    Args:
+        block: Grammar block specification to bind.
+
+    Returns:
+        A `BlockBindings` instance ready for `PatternExpander.expand_block`.
+    """
     if block.id == "groups":
         return BlockBindings(slots={"groups": _build_groups_binding(block)})
     if block.id == "comparison":
@@ -301,7 +379,11 @@ def synthetic_block_bindings(block: BlockSpec) -> BlockBindings:
 
 
 def synthetic_page_bindings() -> PageBindings:
-    """Constructs synthetic `PageBindings` with title, subtitle, and mark bound."""
+    """Constructs synthetic `PageBindings` with title, subtitle, and mark bound.
+
+    Returns:
+        A `PageBindings` instance referencing `/page_title`, `/page_subtitle`, and `/page_mark`.
+    """
     return PageBindings(
         title=SlotBinding(pointer="/page_title", semantic_type=SemanticType.TITLE),
         subtitle=SlotBinding(
@@ -314,7 +396,16 @@ def synthetic_page_bindings() -> PageBindings:
 def synthetic_instances(
     block: BlockSpec, bindings: BlockBindings
 ) -> dict[str, dict[str, str]]:
-    """Constructs per-item and block-level instance answers for `block`."""
+    """Constructs per-item and block-level instance answers for `block`.
+
+    Args:
+        block: Grammar block specification defining `block.instance` questions.
+        bindings: Synthetic block bindings (unused, retained for call-site symmetry).
+
+    Returns:
+        A mapping from item index (or block ID) to question-ID/option-ID answers that
+        cycles through every declared option across repeated items.
+    """
     del bindings
     if block.id == "actions":
         return {
@@ -344,11 +435,22 @@ def synthetic_instances(
 def knob_combinations(
     pattern: CatalogPattern, *, limit: int = 64
 ) -> tuple[tuple[dict[str, str], ...], bool]:
-    """Returns `(combinations, truncated)` for `pattern.knobs`, with `{}` first."""
+    """Enumerates the Cartesian product of `pattern.knobs` with `{}` first.
+
+    Args:
+        pattern: Catalog pattern definition whose declared `knobs` are enumerated.
+        limit: Maximum number of knob combinations to return before truncating.
+
+    Returns:
+        A `(combinations, truncated)` pair where `combinations` always starts with `{}`
+        to test default `$knobValue` fallbacks and `truncated` indicates whether the
+        product exceeded `limit`.
+    """
     if not pattern.knobs:
         return (({},), False)
     keys = list(pattern.knobs.keys())
     value_lists = [list(pattern.knobs[k]) for k in keys]
+    # Include the empty knob dict first to exercise default $knobValue fallbacks.
     combos: list[dict[str, str]] = [{}]
     truncated = False
     for prod in itertools.product(*value_lists):
@@ -362,7 +464,14 @@ def knob_combinations(
 def _populate_slot_payload(
     payload: dict[str, Any], block: BlockSpec, name: str, slot: SlotSpec
 ) -> None:
-    """Populates synthetic payload values for one `SlotSpec`."""
+    """Populates synthetic payload values for one `SlotSpec`.
+
+    Args:
+        payload: Mutable payload dictionary to populate.
+        block: Grammar block owning `slot`.
+        name: Slot name on the block.
+        slot: Grammar slot specification.
+    """
     if slot.repeat and "array" in slot.from_types:
         base_elem = {
             f_name: _scalar_sample_value(f_spec, f_name, 0)
@@ -385,7 +494,14 @@ def _populate_slot_payload(
 
 
 def synthetic_payload(block: BlockSpec) -> dict[str, Any]:
-    """Builds a synthetic data model matching `synthetic_block_bindings(block)`."""
+    """Builds a synthetic data model matching `synthetic_block_bindings(block)`.
+
+    Args:
+        block: Grammar block specification whose bound pointers need sample values.
+
+    Returns:
+        A dictionary suitable for `updateDataModel` payload validation.
+    """
     count = _repeat_item_count(block)
     payload: dict[str, Any] = {
         "page_title": "Sample Page Title",

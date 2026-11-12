@@ -54,6 +54,7 @@ import validate_patterns  # noqa: E402
 
 
 def test_basic_catalog_oracle_and_payload_eligibility(tmp_path: Path) -> None:
+    """Verifies that the basic v1 catalog `patterns.json` validates cleanly and resolves all 14 archetypes."""
     basic_cat = REPO_ROOT / "catalogs" / "basic" / "v1" / "catalog.json"
     basic_pat = REPO_ROOT / "catalogs" / "basic" / "v1" / "patterns.json"
     payload_file = write_json(
@@ -94,6 +95,7 @@ def test_basic_catalog_oracle_and_payload_eligibility(tmp_path: Path) -> None:
 
 
 def test_basic_patterns_asset_parity() -> None:
+    """Verifies that `catalogs/basic/v1/patterns.json` matches the bundled `basic_v1_0.json` asset."""
     from a2ui.inference_formats.decision.archetypes import asset_path
 
     src_pat = REPO_ROOT / "catalogs" / "basic" / "v1" / "patterns.json"
@@ -106,6 +108,7 @@ def test_basic_patterns_asset_parity() -> None:
 def test_composable_design_system_validation_and_broken_patterns(
     tmp_path: Path,
 ) -> None:
+    """Verifies composable pattern validation and failure diagnostics on broken pattern fixtures."""
     cat_path = write_json(tmp_path, "catalog.json", design_system_catalog_dict("1.0"))
     pat_path = write_json(tmp_path, "patterns.json", DESIGN_SYSTEM_PATTERNS)
     pay_path = write_json(
@@ -139,6 +142,7 @@ def test_composable_design_system_validation_and_broken_patterns(
 def test_fixed_forms_templates_validation_and_broken_templates(
     tmp_path: Path,
 ) -> None:
+    """Verifies fixed-surface template validation and failure diagnostics on broken templates."""
     forms_dir = tmp_path / "forms"
     cat_path = write_json(forms_dir, "catalog.json", fixed_forms_catalog_dict("1.0"))
     tpl_path = write_json(forms_dir, "templates.json", FIXED_FORMS_TEMPLATES)
@@ -166,6 +170,7 @@ def test_fixed_forms_templates_validation_and_broken_templates(
 
 
 def test_hybrid_catalog_auto_discovers_both_sidecars(tmp_path: Path) -> None:
+    """Verifies that a hybrid catalog auto-discovers and validates both `patterns.json` and `templates.json`."""
     hybrid_dir = tmp_path / "hybrid"
     cat_path = write_json(hybrid_dir, "catalog.json", hybrid_catalog_dict("1.0"))
     hybrid_patterns = copy.deepcopy(DESIGN_SYSTEM_PATTERNS)
@@ -202,6 +207,7 @@ def test_hybrid_catalog_auto_discovers_both_sidecars(tmp_path: Path) -> None:
 
 
 def test_catalog_id_mismatch_and_synthetic_helpers(tmp_path: Path) -> None:
+    """Verifies `catalogId` and `grammarVersion` mismatch errors and synthetic binding helpers."""
     cat_path = write_json(tmp_path, "catalog.json", fixed_forms_catalog_dict("1.0"))
     pat_path = write_json(tmp_path, "patterns.json", DESIGN_SYSTEM_PATTERNS)
     pay_path = write_json(
@@ -295,6 +301,7 @@ def test_catalog_id_mismatch_and_synthetic_helpers(tmp_path: Path) -> None:
 def test_textfield_missing_value_produces_actionable_failure(
     tmp_path: Path,
 ) -> None:
+    """Verifies that missing a required component property produces an actionable guide-linked failure."""
     basic_cat = REPO_ROOT / "catalogs" / "basic" / "v1" / "catalog.json"
     basic_pat_path = REPO_ROOT / "catalogs" / "basic" / "v1" / "patterns.json"
     basic_patterns = json.loads(basic_pat_path.read_text(encoding="utf-8"))
@@ -329,6 +336,7 @@ def test_textfield_missing_value_produces_actionable_failure(
 
 
 def test_event_and_action_context_directive_validation(tmp_path: Path) -> None:
+    """Verifies that invalid `$event` targets and legacy `$item` action context syntax fail lint."""
     cat_path = write_json(tmp_path, "catalog.json", design_system_catalog_dict("1.0"))
     pay_path = write_json(
         tmp_path, "sample_payloads.json", DESIGN_SYSTEM_SAMPLE_PAYLOADS
@@ -381,3 +389,34 @@ def test_event_and_action_context_directive_validation(tmp_path: Path) -> None:
     assert "property 'onPress.context'" in ctx_msg
     assert "$actionContext" in ctx_msg
     assert "patterns_authoring_guide.md#action-events-and-action-context" in ctx_msg
+
+
+def test_markdown_report_renders_unknown_patterns_and_warnings(tmp_path: Path) -> None:
+    """Verifies that `report_to_markdown` renders both `unknown_patterns` and `warnings`."""
+    cat_path = write_json(tmp_path, "catalog.json", design_system_catalog_dict("1.0"))
+    pay_path = write_json(
+        tmp_path, "sample_payloads.json", DESIGN_SYSTEM_SAMPLE_PAYLOADS
+    )
+    with_warnings = copy.deepcopy(DESIGN_SYSTEM_PATTERNS)
+    with_warnings["patterns"]["extra_unused_pattern"] = copy.deepcopy(
+        DESIGN_SYSTEM_PATTERNS["patterns"]["prose"]
+    )
+    # Add a second variant with an unreachable `when` condition to trigger a warning.
+    unreachable_variant = copy.deepcopy(
+        with_warnings["patterns"]["collection"]["variants"][0]
+    )
+    unreachable_variant["when"] = {"layout": "grid"}
+    with_warnings["patterns"]["collection"]["variants"].append(unreachable_variant)
+    pat_path = write_json(tmp_path, "patterns.json", with_warnings)
+
+    loaded = _common.load_catalog(cat_path)
+    report = validate_patterns.validate_catalog_artifacts(
+        loaded, payload_path=pay_path, patterns_path=pat_path
+    )
+    assert report.unknown_patterns == ("extra_unused_pattern",)
+    assert any("never selected" in w for w in report.warnings)
+
+    md_text = validate_patterns.report_to_markdown(report)
+    assert "## Unknown Patterns: `extra_unused_pattern`" in md_text
+    assert "## Warnings" in md_text
+    assert "never selected" in md_text
