@@ -145,8 +145,23 @@ export class PlaygroundInspector extends LitElement {
 
     .action-btn:hover,
     .copy-btn:hover,
-    .pruned-toggle-btn:hover {
+    .pruned-toggle-btn:hover,
+    .close-btn:hover {
       background: light-dark(rgba(81, 84, 179, 0.1), rgba(160, 163, 255, 0.18));
+    }
+
+    .close-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border-radius: 50%;
+      border: 1px solid light-dark(rgba(81, 84, 179, 0.35), rgba(160, 163, 255, 0.3));
+      background: light-dark(var(--n-100, #fff), var(--n-20, #303030));
+      color: inherit;
+      transition: background 0.15s ease;
     }
 
     .summary-header {
@@ -506,13 +521,13 @@ export class PlaygroundInspector extends LitElement {
           </button>
           <button
             type="button"
-            class="action-btn collapse-btn"
+            class="close-btn"
             data-testid="toggle-inspector"
-            aria-label="Collapse inspector"
+            aria-label="Close inspector"
             @click=${this.#dispatchToggleInspector}
-            title="Collapse inspector drawer"
+            title="Close inspector"
           >
-            <span class="material-symbols">visibility_off</span>
+            <span class="material-symbols">close</span>
           </button>
         </div>
       </div>

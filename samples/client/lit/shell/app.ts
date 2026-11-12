@@ -803,15 +803,18 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   }
 
   #renderInspectorToggle() {
+    if (this._inspectorOpen) {
+      return nothing;
+    }
     return html`<button
       type="button"
       class="inspector-drawer-toggle"
       @click=${this.#toggleInspector}
-      aria-expanded=${this._inspectorOpen ? 'true' : 'false'}
-      title=${this._inspectorOpen ? 'Hide pipeline inspector' : 'Show pipeline inspector'}
+      aria-expanded="false"
+      title="Show pipeline inspector"
     >
-      <span class="material-symbols">${this._inspectorOpen ? 'visibility_off' : 'visibility'}</span>
-      <span>${this._inspectorOpen ? 'Hide Inspector' : 'Inspector'}</span>
+      <span class="material-symbols">visibility</span>
+      <span>Show Inspector</span>
     </button>`;
   }
 

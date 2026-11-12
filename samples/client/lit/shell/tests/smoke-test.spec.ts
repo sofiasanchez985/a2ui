@@ -60,19 +60,28 @@ describe('a2ui-shell layout and inspector integration', () => {
       | (HTMLElement & {trace: unknown})
       | null;
     expect(inspector).not.toBeNull();
+    // Floating drawer toggle is hidden while the inspector panel is open
+    expect(el.shadowRoot?.querySelector('.inspector-drawer-toggle')).toBeNull();
 
-    // Dispatch toggle-inspector event from the inspector
-    inspector!.dispatchEvent(new CustomEvent('toggle-inspector', {bubbles: true, composed: true}));
+    // Click the "x" close button inside the inspector panel header
+    const closeBtn = inspector!.shadowRoot?.querySelector<HTMLButtonElement>(
+      '[data-testid="toggle-inspector"]',
+    );
+    expect(closeBtn).not.toBeNull();
+    expect(closeBtn!.textContent).toContain('close');
+    closeBtn!.click();
     await el.updateComplete;
     expect(el.hasAttribute('inspector-collapsed')).toBe(true);
     expect(el.shadowRoot?.querySelector('playground-inspector')).toBeNull();
 
-    // Re-open via top drawer toggle button
+    // Re-open via the floating Show Inspector button that appears when collapsed
     const toggleBtn = el.shadowRoot?.querySelector('.inspector-drawer-toggle') as HTMLButtonElement;
     expect(toggleBtn).not.toBeNull();
+    expect(toggleBtn.textContent).toContain('Show Inspector');
     toggleBtn.click();
     await el.updateComplete;
     expect(el.hasAttribute('inspector-collapsed')).toBe(false);
+    expect(el.shadowRoot?.querySelector('.inspector-drawer-toggle')).toBeNull();
     const reopened = el.shadowRoot?.querySelector('playground-inspector') as
       | (HTMLElement & {trace: unknown})
       | null;
