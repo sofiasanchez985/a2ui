@@ -56,4 +56,6 @@ export interface AppConfig {
   clearSurfacesOnResponse?: boolean;
   /** Optional row of example buttons rendered below the text input. */
   quickActions?: QuickAction[];
+  /** Whether to render the split-screen <playground-inspector> side panel. */
+  inspector?: boolean;
 }

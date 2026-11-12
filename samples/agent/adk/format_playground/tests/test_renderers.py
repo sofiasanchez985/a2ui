@@ -148,6 +148,11 @@ async def test_render_decision_produces_a_surface_without_llm_calls(
     assert result.metrics.mode is RenderMode.DECISION
     assert any("`family`" in line for line in result.trace_lines)
     assert "**decision** · mock · 0 LLM calls" in result.metrics.footer()
+    assert len(result.messages) >= 2
+    assert 'surface("turn-1")' in result.decompiled_express
+    assert renderers.backend.backend_kind == "mock"
+    assert renderers.synthesizer_or_none("1.0") is not None
+    assert renderers.synthesizer_or_none("0.9") is None
 
 
 @pytest.mark.asyncio
@@ -166,6 +171,9 @@ async def test_render_with_llm_express_succeeds_retries_and_fails(
     assert surface_ids(ok.parts) == ["turn-1"]
     assert ok.metrics is not None and ok.metrics.llm_calls == 1
     assert ok.metrics.backend == "llm" and ok.metrics.fallback is None
+    assert len(ok.messages) == 1
+    assert ok.raw_stage2_text == EXPRESS_OK
+    assert 'surface("turn-1")' in ok.decompiled_express
     call = scripted_llm.calls_for("express:1.0")[0]
     assert call["session_id"] is None
     assert "Casa Verde" in str(call["user_text"]) and "turn-1" in str(call["user_text"])
@@ -360,6 +368,34 @@ async def test_render_tool_result_synthesizes_with_zero_llm_calls() -> None:
     assert res.metrics.llm_calls == 0
     assert res.metrics.decision_latency_ms is not None
     assert "0 LLM calls" in res.metrics.footer()
+    assert len(res.messages) >= 2
+    assert 'surface("turn-tool-test")' in res.decompiled_express
+
+    # Second call with the same conversation_id hits PlanCache (updateDataModel-only)
+    cache_renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
+    cached_first = await cache_renderers.render_tool_result(
+        "Show host health status",
+        {"hostname": "server-1", "cpu": "98%", "status": "critical"},
+        surface_id="main",
+        version="1.0",
+        mutable_paths=["/status"],
+        conversation_id="conv-cache-test",
+    )
+    assert cached_first.ok
+    cached_second = await cache_renderers.render_tool_result(
+        "Show host health status",
+        {"hostname": "server-2", "cpu": "40%", "status": "healthy"},
+        surface_id="main",
+        version="1.0",
+        mutable_paths=["/status"],
+        conversation_id="conv-cache-test",
+    )
+    assert cached_second.ok
+    assert cached_second.metrics is not None and cached_second.metrics.cache_hit
+    assert len(cached_second.messages) == 1
+    assert "updateDataModel" in cached_second.messages[0]
+    assert 'surface("main")' in cached_second.decompiled_express
+    assert 'hostname: "server-2"' in cached_second.decompiled_express
 
     # Verify render_decision forwards fallback_dsl/title/summary via to_synthesis_kwargs (M22)
     abstain_renderers = Renderers(

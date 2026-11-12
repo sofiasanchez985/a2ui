@@ -53,7 +53,10 @@ from a2ui.inference_formats.decision import (
     surface_operation_for,
 )
 from a2ui.inference_formats.direct_json import DirectJsonFormatFactory
-from a2ui.inference_formats.express import ExpressFormatFactory
+from a2ui.inference_formats.express import (
+    ExpressDecompiler,
+    ExpressFormatFactory,
+)
 from a2ui.parser import A2uiPart
 from a2ui.parser.messages import to_message_dicts
 from a2ui.processor import A2uiGenerator, A2uiRequestProcessor, CatalogConfig
@@ -210,6 +213,8 @@ class _Stage2Attempt:
     turn: LlmTurn
     parts: list[Part]
     error: str | None
+    messages: tuple[dict[str, Any], ...] = ()
+    decompiled_express: str = ""
 
 
 class Renderers:
@@ -272,6 +277,11 @@ class Renderers:
         )
 
     @property
+    def backend(self) -> DecisionBackend:
+        """The active decision backend instance."""
+        return self._raw_backend
+
+    @property
     def backend_name(self) -> str:
         """The decision backend's short name, from the backend passed in."""
         return backend_display_name(self._raw_backend)
@@ -297,6 +307,17 @@ class Renderers:
     def prompt_for(self, mode: RenderMode, version: str) -> str:
         """The stage-2 system instruction for `mode` (the format's own prompt)."""
         return self.processor(mode, version).prompt_snippet
+
+    def synthesizer_or_none(
+        self, version: str = DECISION_VERSION
+    ) -> DecisionSynthesizer | None:
+        """The decision synthesizer for `version`, or `None` when not v1.0."""
+        if to_version_number(version) != DECISION_VERSION:
+            return None
+        processor = self._processors.get((RenderMode.DECISION, DECISION_VERSION))
+        if processor is None or not isinstance(processor.format, DecisionFormat):
+            return None
+        return processor.format.synthesizer
 
     def _synthesizer(self, version: str) -> DecisionSynthesizer:
         """The decision synthesizer for `version`.
@@ -375,16 +396,21 @@ class Renderers:
                 metrics=self._decision_metrics(None, started, mode=mode),
                 error=error,
             )
-        parts = [
-            create_a2ui_part(message, version=version)
-            for message in to_message_dicts(output.messages)
-        ]
+        msg_dicts = tuple(to_message_dicts(output.messages))
+        parts = [create_a2ui_part(message, version=version) for message in msg_dicts]
+        active_catalogs = self.processor(RenderMode.DECISION, version).active_catalogs
+        try:
+            decompiled = output.to_express(active_catalogs)
+        except A2uiError:
+            decompiled = ""
         return RenderResult(
             parts=parts,
             metrics=self._decision_metrics(output, started, mode=mode),
             trace_lines=trace_lines(output),
             decision_answers=output.decision_answers,
             output=output,
+            messages=msg_dicts,
+            decompiled_express=decompiled,
             error=None if parts else "The decision model produced no surface.",
         )
 
@@ -497,14 +523,30 @@ class Renderers:
             response_parts = processor.parse_response(turn.text)
         except (A2uiError, ValueError, json.JSONDecodeError) as exc:
             return _Stage2Attempt(turn=turn, parts=[], error=str(exc))
-        parts = [
-            create_a2ui_part(message, version=version)
+        parsed_models = [
+            msg
             for part in response_parts
             if isinstance(part, A2uiPart)
-            for message in to_message_dicts(part.a2ui)
+            for msg in part.a2ui
         ]
+        msg_dicts = tuple(to_message_dicts(parsed_models))
+        parts = [create_a2ui_part(message, version=version) for message in msg_dicts]
+        decompiled = ""
+        if parsed_models:
+            try:
+                decompiled = ExpressDecompiler(processor.active_catalogs).decompile(
+                    parsed_models
+                )
+            except A2uiError:
+                decompiled = ""
         error = None if parts else "The reply contained no A2UI block."
-        return _Stage2Attempt(turn=turn, parts=parts, error=error)
+        return _Stage2Attempt(
+            turn=turn,
+            parts=parts,
+            error=error,
+            messages=msg_dicts,
+            decompiled_express=decompiled,
+        )
 
     async def render_with_llm(
         self,
@@ -540,7 +582,14 @@ class Renderers:
             output_tokens=sum(a.turn.output_tokens for a in attempts),
             fallback="validation_retry" if len(attempts) > 1 else None,
         )
-        return RenderResult(parts=last.parts, metrics=metrics, error=last.error)
+        return RenderResult(
+            parts=last.parts,
+            metrics=metrics,
+            error=last.error,
+            messages=last.messages,
+            raw_stage2_text=last.turn.text,
+            decompiled_express=last.decompiled_express,
+        )
 
     def status_surface(
         self, lines: Sequence[str], *, surface_id: str, version: str

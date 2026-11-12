@@ -254,6 +254,12 @@ class RenderResult:
     """Why rendering failed, if it did."""
     decision_answers: tuple[Any, ...] = ()
     output: Any = None
+    messages: tuple[dict[str, Any], ...] = ()
+    """Raw A2UI message dictionaries produced for this candidate."""
+    raw_stage2_text: str | None = None
+    """Raw LLM Stage 2 reply text for `express` or `direct` renders."""
+    decompiled_express: str = ""
+    """A2UI Express representation decompiled from the candidate's messages."""
 
     @property
     def ok(self) -> bool:
