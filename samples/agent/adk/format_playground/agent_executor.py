@@ -109,6 +109,13 @@ def build_query(parts: list[Any]) -> str:
     return text
 
 
+def _is_inspector_enabled(context: RequestContext) -> bool:
+    """Returns whether the incoming A2A message requested the playground inspector."""
+    if context.message is None:
+        return False
+    return bool((context.message.metadata or {}).get("a2uiPlaygroundInspector"))
+
+
 class PlaygroundAgentExecutor(AgentExecutor):
     """Routes A2A requests to `PlaygroundAgent.stream`."""
 
@@ -119,6 +126,7 @@ class PlaygroundAgentExecutor(AgentExecutor):
         active_ui_version = try_activate_a2ui_extension(context, self._agent.agent_card)
         parts = list(context.message.parts) if context.message else []
         query = build_query(parts) or context.get_user_input()
+        inspector_enabled = _is_inspector_enabled(context)
         logger.info("Playground query (a2ui %s): %r", active_ui_version, query[:200])
 
         task = context.current_task
@@ -127,7 +135,12 @@ class PlaygroundAgentExecutor(AgentExecutor):
             await event_queue.enqueue_event(task)
         updater = TaskUpdater(event_queue, task.id, task.context_id)
 
-        async for item in self._agent.stream(query, task.context_id, active_ui_version):
+        async for item in self._agent.stream(
+            query,
+            task.context_id,
+            active_ui_version,
+            inspector_enabled=inspector_enabled,
+        ):
             if not item["is_task_complete"]:
                 if "parts" in item:
                     message = new_agent_parts_message(

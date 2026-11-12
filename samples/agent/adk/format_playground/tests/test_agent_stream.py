@@ -25,6 +25,7 @@ import pytest
 from a2ui.inference_formats.decision import DeterministicMockBackend
 from agent import PlaygroundAgent
 from fakes import FakeLlmCaller
+from inspector_trace import PLAYGROUND_TRACE_MIME_TYPE
 from modes import LlmToolTurn, RenderMode
 from renderers import Renderers
 from stage1 import UI_ACTION_PREFIX
@@ -82,11 +83,30 @@ def status_text(parts: list[Part]) -> str:
 
 
 async def collect(
-    agent: PlaygroundAgent, query: str, session: str, version: str | None = "0.9"
+    agent: PlaygroundAgent,
+    query: str,
+    session: str,
+    version: str | None = "0.9",
+    *,
+    inspector_enabled: bool = False,
 ) -> list[Part]:
-    items = [item async for item in agent.stream(query, session, version)]
+    items = [
+        item
+        async for item in agent.stream(
+            query, session, version, inspector_enabled=inspector_enabled
+        )
+    ]
     assert len(items) == 1 and items[0]["is_task_complete"] is True
     return items[0]["parts"]
+
+
+def trace_parts_of(parts: list[Part]) -> list[dict[str, Any]]:
+    return [
+        p.root.data
+        for p in parts
+        if isinstance(p.root, DataPart)
+        and (p.root.metadata or {}).get("mimeType") == PLAYGROUND_TRACE_MIME_TYPE
+    ]
 
 
 @pytest.fixture
@@ -473,3 +493,224 @@ async def test_direct_tool_command_renders_without_llm_calls(
 
     unknown = await collect(agent, "/tool bogus", "s-direct-tool", version="1.0")
     assert "Unknown tool `bogus`" in status_text(unknown)
+
+
+async def test_inspector_enabled_omits_footers_and_attaches_trace_part(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    scripted_llm.script("stage1", STAGE1_BLOCK)
+    parts = await collect(
+        agent,
+        "I want to see the resort",
+        "s-insp-1",
+        "1.0",
+        inspector_enabled=True,
+    )
+    assert surface_ids(parts) == ["main"]
+    traces = trace_parts_of(parts)
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace["schemaVersion"] == 1
+    assert trace["turn"] == 1
+    assert trace["activeMode"] == "decision"
+    assert trace["stage1"]["source"] == "llm"
+    assert trace["stage1"]["block"]["intent"] == "Show the resort overview"
+    cand = trace["candidates"][0]
+    assert cand["mode"] == "decision"
+    assert cand["decisionInput"] is not None
+    assert cand["decisionOutput"] is not None
+    assert cand["wireOutput"]["surfaceId"] == "main"
+
+
+async def test_inspector_enabled_classifies_pasted_json_vs_ui_action(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    scripted_llm.script("stage1", STAGE1_BLOCK, STAGE1_BLOCK)
+    pasted_query = 'Use this JSON:\n```json\n{"host": "prod-1", "cpu": 0.5}\n```'
+    pasted_parts = await collect(
+        agent, pasted_query, "s-insp-src", "1.0", inspector_enabled=True
+    )
+    assert trace_parts_of(pasted_parts)[0]["stage1"]["source"] == "pasted_json"
+
+    action_query = (
+        f'{UI_ACTION_PREFIX} action `save` on surface `main` with context {{"id": 1}}.'
+    )
+    action_parts = await collect(
+        agent, action_query, "s-insp-src", "1.0", inspector_enabled=True
+    )
+    assert trace_parts_of(action_parts)[0]["stage1"]["source"] == "llm"
+
+
+async def test_inspector_enabled_direct_tool_and_plan_cache_hit(
+    agent: PlaygroundAgent,
+) -> None:
+    first = await collect(
+        agent, "/tool host", "s-insp-tool", "1.0", inspector_enabled=True
+    )
+    assert surface_ids(first) == ["main"]
+    trace1 = trace_parts_of(first)[0]
+    assert trace1["stage1"]["source"] == "direct_tool"
+    assert trace1["stage1"]["toolName"] == "get_host_health"
+    assert trace1["stage1"]["llmCalls"] == 0
+    assert trace1["candidates"][0]["decisionInput"]["cacheHit"] is False
+
+    second = await collect(
+        agent, "/tool host", "s-insp-tool", "1.0", inspector_enabled=True
+    )
+    # Turn 2 is a PlanCache hit: only updateDataModel + trace part (no footer surface).
+    assert surface_ids(second) == []
+    trace2 = trace_parts_of(second)[0]
+    assert trace2["candidates"][0]["decisionInput"]["cacheHit"] is True
+    assert trace2["candidates"][0]["decisionInput"]["decisionCalls"] == 0
+
+
+async def test_inspector_enabled_tool_mode_with_and_without_tool_call(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    await collect(agent, "/mode tool", "s-insp-tm", "1.0", inspector_enabled=True)
+
+    # No-tool prose reply omits turn-N-tool-footer and emits a trace part with candidates=[].
+    scripted_llm.script_tool(
+        "tool_mode",
+        LlmToolTurn(
+            tool_name=None,
+            arguments={},
+            result=None,
+            text="I only have host and resort tools.",
+            prompt_tokens=90,
+            output_tokens=15,
+            latency_ms=55.0,
+        ),
+    )
+    no_tool_parts = await collect(
+        agent, "tell me a joke", "s-insp-tm", "1.0", inspector_enabled=True
+    )
+    assert surface_ids(no_tool_parts) == ["turn-1-status"]
+    no_tool_trace = trace_parts_of(no_tool_parts)[0]
+    assert no_tool_trace["stage1"]["source"] == "tool_call"
+    assert no_tool_trace["stage1"]["rawText"] == "I only have host and resort tools."
+    assert no_tool_trace["candidates"] == []
+
+    # Tool-calling turn omits turn-N-tool-footer and attaches full candidate trace.
+    scripted_llm.script_tool(
+        "tool_mode",
+        LlmToolTurn(
+            tool_name="get_host_health",
+            arguments={"hostname": "prod-02"},
+            result={"hostname": "prod-02", "cpu": "40%", "status": "healthy"},
+            prompt_tokens=120,
+            output_tokens=25,
+            latency_ms=95.0,
+        ),
+    )
+    tool_parts = await collect(
+        agent, "check prod-02", "s-insp-tm", "1.0", inspector_enabled=True
+    )
+    assert surface_ids(tool_parts) == ["main"]
+    tool_trace = trace_parts_of(tool_parts)[0]
+    assert tool_trace["stage1"]["source"] == "tool_call"
+    assert tool_trace["stage1"]["toolName"] == "get_host_health"
+    assert len(tool_trace["candidates"]) == 1
+    assert tool_trace["candidates"][0]["decisionInput"] is not None
+
+
+async def test_inspector_enabled_compare_and_slash_commands_and_error_fallbacks(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    # Slash commands emit turn-N-status with zero trace parts even when inspector_enabled=True.
+    for cmd in ("/help", "/trace", "/ratings", "/compare"):
+        cmd_parts = await collect(
+            agent, cmd, "s-insp-cmp", "1.0", inspector_enabled=True
+        )
+        assert trace_parts_of(cmd_parts) == []
+
+    # Compare render turn omits all footers and the compare summary card, attaching 3 candidates in trace.
+    scripted_llm.script("stage1", STAGE1_BLOCK)
+    scripted_llm.script("express:1.0", EXPRESS_OK.replace("turn-1", "turn-1-express"))
+    scripted_llm.script(
+        "direct:1.0",
+        direct_json_reply(agent.renderers, "1.0").replace("turn-1", "turn-1-direct"),
+    )
+    cmp_parts = await collect(
+        agent, "compare the resort", "s-insp-cmp", "1.0", inspector_enabled=True
+    )
+    assert surface_ids(cmp_parts) == [
+        "turn-1-decision",
+        "turn-1-express",
+        "turn-1-direct",
+    ]
+    cmp_trace = trace_parts_of(cmp_parts)[0]
+    assert cmp_trace["compare"] is True
+    assert [c["mode"] for c in cmp_trace["candidates"]] == [
+        "decision",
+        "express",
+        "direct",
+    ]
+
+    # v0.9 decision render failure emits fallback turn-N-status card + trace part (M2, F1).
+    scripted_llm.script("stage1", STAGE1_BLOCK)
+    v09_parts = await collect(
+        agent, "show resort on v0.9", "s-insp-v09", "0.9", inspector_enabled=True
+    )
+    assert surface_ids(v09_parts) == ["turn-1-status"]
+    assert "v1.0 only" in status_text(v09_parts)
+    v09_trace = trace_parts_of(v09_parts)[0]
+    assert v09_trace["candidates"][0]["ok"] is False
+    assert v09_trace["candidates"][0]["decisionInput"] is None
+
+    # Stage 1 block-extraction failure emits status card + trace part with stage1.error.
+    scripted_llm.script("stage1", "Plain text without an a2ui block.")
+    bad_s1 = await collect(
+        agent, "plain reply", "s-insp-err", "1.0", inspector_enabled=True
+    )
+    assert surface_ids(bad_s1) == ["turn-1-status"]
+    bad_s1_trace = trace_parts_of(bad_s1)[0]
+    assert bad_s1_trace["stage1"]["error"] is not None
+    assert bad_s1_trace["candidates"] == []
+
+
+async def test_executor_forwards_inspector_metadata_to_agent_stream(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    from types import SimpleNamespace
+    from a2a.server.events import EventQueue
+    from a2a.types import Message, Role
+    from agent_executor import PlaygroundAgentExecutor, _is_inspector_enabled
+
+    executor = PlaygroundAgentExecutor(agent)
+    msg_with_meta = Message(
+        message_id="m-1",
+        role=Role.user,
+        parts=[Part(root=TextPart(text="show resort"))],
+        metadata={"a2uiPlaygroundInspector": True},
+    )
+    ctx_enabled = SimpleNamespace(
+        message=msg_with_meta,
+        current_task=None,
+        call_context=None,
+        get_user_input=lambda: "show resort",
+    )
+    assert _is_inspector_enabled(ctx_enabled) is True  # type: ignore[arg-type]
+
+    ctx_disabled = SimpleNamespace(message=None)
+    assert _is_inspector_enabled(ctx_disabled) is False  # type: ignore[arg-type]
+
+    captured_flag: list[bool] = []
+    original_stream = agent.stream
+
+    async def _spy_stream(
+        query: str,
+        session_id: str,
+        ui_version: str | None,
+        *,
+        inspector_enabled: bool = False,
+    ):
+        captured_flag.append(inspector_enabled)
+        async for item in original_stream(
+            query, session_id, ui_version, inspector_enabled=inspector_enabled
+        ):
+            yield item
+
+    agent.stream = _spy_stream  # type: ignore[method-assign]
+    await executor.execute(ctx_enabled, EventQueue())  # type: ignore[arg-type]
+    assert captured_flag == [True]

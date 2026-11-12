@@ -14,14 +14,28 @@
  * limitations under the License.
  */
 
-import {Part, SendMessageSuccessResponse, Task} from '@a2a-js/sdk';
+import {DataPart, Part, SendMessageSuccessResponse, Task} from '@a2a-js/sdk';
 import {A2AClient} from '@a2a-js/sdk/client';
 
+import {
+  A2UIClientTurnResult,
+  PLAYGROUND_TRACE_MIME_TYPE,
+  PlaygroundTurnTrace,
+} from './types/inspector.js';
+
+export {type A2UIClientTurnResult, PLAYGROUND_TRACE_MIME_TYPE, type PlaygroundTurnTrace};
+
 const A2UI_MIME_TYPE = 'application/a2ui+json';
+const LEGACY_A2UI_MIME_TYPE = 'application/json+a2ui';
+
+export interface SendTurnOptions {
+  inspector?: boolean;
+}
 
 export class A2UIClient {
   #serverUrl: string;
   #client: A2AClient | null = null;
+  #contextId: string | null = null;
 
   constructor(serverUrl: string = '') {
     this.#serverUrl = serverUrl;
@@ -30,6 +44,14 @@ export class A2UIClient {
   #ready: Promise<void> = Promise.resolve();
   get ready() {
     return this.#ready;
+  }
+
+  get contextId(): string | null {
+    return this.#contextId;
+  }
+
+  resetSession(): void {
+    this.#contextId = null;
   }
 
   async #getClient() {
@@ -51,41 +73,17 @@ export class A2UIClient {
     return this.#client;
   }
 
-  /**
-   * Sends a message to the agent.
-   *
-   * @param message The user's text, or a client event.
-   * @param rendererCapabilities The renderer's capabilities, keyed by protocol
-   *   version, which the agent negotiates the request's catalogs from.
-   */
-  async send(message: any | string, rendererCapabilities: Record<string, unknown>): Promise<any[]> {
-    const client = await this.#getClient();
-    let parts: Part[] = [];
-
+  #buildOutgoingParts(message: unknown): Part[] {
+    let parts: Part[];
     if (typeof message === 'string') {
-      // Try to parse as JSON first, just in case
-      try {
-        const parsed = JSON.parse(message);
-        if (typeof parsed === 'object' && parsed !== null) {
-          parts = [
-            {
-              kind: 'data',
-              data: parsed as unknown as Record<string, unknown>,
-              mimeType: A2UI_MIME_TYPE,
-            } as Part,
-          ];
-        } else {
-          parts = [{kind: 'text', text: message}];
-        }
-      } catch {
-        parts = [{kind: 'text', text: message}];
-      }
+      parts = this.#parseStringMessageParts(message);
     } else {
       parts = [
         {
           kind: 'data',
-          data: message as unknown as Record<string, unknown>,
+          data: message as Record<string, unknown>,
           mimeType: A2UI_MIME_TYPE,
+          metadata: {mimeType: A2UI_MIME_TYPE},
         } as Part,
       ];
     }
@@ -95,14 +93,77 @@ export class A2UIClient {
       data: {useStreaming: false},
       mimeType: 'application/json',
     } as Part);
+    return parts;
+  }
+
+  #parseStringMessageParts(message: string): Part[] {
+    try {
+      const parsed = JSON.parse(message);
+      if (typeof parsed === 'object' && parsed !== null) {
+        return [
+          {
+            kind: 'data',
+            data: parsed as Record<string, unknown>,
+            mimeType: A2UI_MIME_TYPE,
+            metadata: {mimeType: A2UI_MIME_TYPE},
+          } as Part,
+        ];
+      }
+    } catch {
+      // Fall through to plain text part.
+    }
+    return [{kind: 'text', text: message}];
+  }
+
+  #routeDataParts(parts: Part[] | undefined): {
+    messages: unknown[];
+    trace: PlaygroundTurnTrace | null;
+  } {
+    const messages: unknown[] = [];
+    let trace: PlaygroundTurnTrace | null = null;
+    if (!parts) {
+      return {messages, trace};
+    }
+
+    for (const part of parts) {
+      if (part.kind !== 'data') {
+        continue;
+      }
+      const dataPart = part as DataPart & {mimeType?: unknown};
+      const rawMime = dataPart.metadata?.mimeType ?? dataPart.mimeType;
+      const mimeType = typeof rawMime === 'string' ? rawMime : undefined;
+      if (mimeType === PLAYGROUND_TRACE_MIME_TYPE) {
+        trace = dataPart.data as unknown as PlaygroundTurnTrace;
+      } else if (!mimeType || mimeType === A2UI_MIME_TYPE || mimeType === LEGACY_A2UI_MIME_TYPE) {
+        messages.push(dataPart.data);
+      }
+    }
+    return {messages, trace};
+  }
+
+  /**
+   * Sends a turn to the agent, persisting `contextId` across calls and splitting
+   * any in-band playground trace `DataPart` from A2UI surface messages.
+   */
+  async sendTurn(
+    message: unknown,
+    rendererCapabilities: Record<string, unknown>,
+    options?: SendTurnOptions,
+  ): Promise<A2UIClientTurnResult> {
+    const client = await this.#getClient();
+    const parts = this.#buildOutgoingParts(message);
 
     const response = await client.sendMessage({
       message: {
         messageId: crypto.randomUUID(),
         role: 'user',
-        parts: parts,
+        parts,
         kind: 'message',
-        metadata: {a2uiClientCapabilities: rendererCapabilities},
+        contextId: this.#contextId ?? undefined,
+        metadata: {
+          a2uiClientCapabilities: rendererCapabilities,
+          ...(options?.inspector ? {a2uiPlaygroundInspector: true} : {}),
+        },
       },
     });
 
@@ -111,16 +172,31 @@ export class A2UIClient {
     }
 
     const result = (response as SendMessageSuccessResponse).result as Task;
-    if (result.kind === 'task' && result.status.message?.parts) {
-      const messages: any[] = [];
-      for (const part of result.status.message.parts) {
-        if (part.kind === 'data') {
-          messages.push(part.data);
-        }
-      }
-      return messages;
+    if (result?.kind === 'task') {
+      this.#contextId = result.contextId ?? this.#contextId;
+      const routed = this.#routeDataParts(result.status?.message?.parts);
+      return {
+        messages: routed.messages,
+        trace: routed.trace,
+        contextId: this.#contextId,
+      };
     }
 
-    return [];
+    return {
+      messages: [],
+      trace: null,
+      contextId: this.#contextId,
+    };
+  }
+
+  /**
+   * Sends a message to the agent.
+   *
+   * @param message The user's text, or a client event.
+   * @param rendererCapabilities The renderer's capabilities, keyed by protocol
+   *   version, which the agent negotiates the request's catalogs from.
+   */
+  async send(message: unknown, rendererCapabilities: Record<string, unknown>): Promise<unknown[]> {
+    return (await this.sendTurn(message, rendererCapabilities)).messages;
   }
 }

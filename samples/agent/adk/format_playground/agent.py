@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import AsyncIterable, Sequence
+from collections.abc import AsyncIterable, Mapping, Sequence
 import logging
 import os
 import time
@@ -43,6 +43,7 @@ from a2ui.inference_formats.decision import (
     create_decision_backend,
 )
 from commands import DECISION_BACKENDS, apply_command, help_text, parse_command
+from inspector_trace import Stage1Source, build_turn_trace, create_trace_part
 from modes import (
     CHAT_MODES,
     LlmCaller,
@@ -65,7 +66,9 @@ from ratings import (
 from renderers import Renderers, build_named_backend
 from stage1 import (
     TOOL_MODE_INSTRUCTION,
+    UI_ACTION_PREFIX,
     extract_block,
+    extract_pasted_json,
     stage1_instruction,
     stage1_user_text,
 )
@@ -302,6 +305,16 @@ def _execute_fallback_tool(
     return None
 
 
+def _classify_stage1_source(query: str) -> Stage1Source:
+    """Classifies whether `query` came from pasted JSON or a normal/action LLM turn."""
+    if (
+        not query.startswith(UI_ACTION_PREFIX)
+        and extract_pasted_json(query) is not None
+    ):
+        return "pasted_json"
+    return "llm"
+
+
 class PlaygroundAgent:
     """Chat agent that renders one request through the chosen inference mode."""
 
@@ -402,8 +415,98 @@ class PlaygroundAgent:
             version=version,
         )
 
+    def _trace_part(
+        self,
+        *,
+        turn: int,
+        query: str,
+        compare: bool,
+        active_mode: RenderMode,
+        stage1_source: Stage1Source,
+        stage1_turn: LlmTurn | None,
+        tool_name: str | None,
+        tool_args: Mapping[str, Any] | None,
+        block: DecisionBlock | None,
+        stage1_error: str | None,
+        candidates: Sequence[tuple[RenderMode, str, RenderResult, TurnMetrics]],
+        version: str,
+    ) -> Part:
+        return create_trace_part(
+            build_turn_trace(
+                turn=turn,
+                query=query,
+                compare=compare,
+                active_mode=active_mode,
+                stage1_source=stage1_source,
+                model_name=self.model_name,
+                stage1_turn=stage1_turn,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                block=block,
+                stage1_error=stage1_error,
+                candidates=candidates,
+                synthesizer=self.renderers.synthesizer_or_none(version),
+            )
+        )
+
+    def _finalize_tool_parts(
+        self,
+        *,
+        query: str,
+        settings: PlaygroundSettings,
+        version: str,
+        surface_id: str,
+        result: RenderResult,
+        metrics: TurnMetrics,
+        stage1_source: Stage1Source,
+        stage1_turn: LlmTurn | None,
+        tool_name: str,
+        tool_args: Mapping[str, Any],
+        block: DecisionBlock,
+        inspector_enabled: bool,
+    ) -> list[Part]:
+        parts = list(result.parts)
+        if not inspector_enabled:
+            footer_lines = [metrics.footer()]
+            if result.error:
+                footer_lines.append(f"Render failed: {result.error}")
+            parts.extend(
+                self._status(footer_lines, settings, version, suffix="tool-footer")
+            )
+            return parts
+        if not result.parts:
+            parts.extend(
+                self._status(
+                    [f"Render failed: {result.error or 'no surface produced'}"],
+                    settings,
+                    version,
+                )
+            )
+        parts.append(
+            self._trace_part(
+                turn=settings.turn,
+                query=query,
+                compare=False,
+                active_mode=RenderMode.TOOL,
+                stage1_source=stage1_source,
+                stage1_turn=stage1_turn,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                block=block,
+                stage1_error=None,
+                candidates=[(RenderMode.TOOL, surface_id, result, metrics)],
+                version=version,
+            )
+        )
+        return parts
+
     async def stream(
-        self, query: str, session_id: str, ui_version: str | None
+        self,
+        query: str,
+        session_id: str,
+        ui_version: str | None,
+        *,
+        inspector_enabled: bool = False,
     ) -> AsyncIterable[dict[str, Any]]:
         """Handles one chat message and yields a single final item of parts."""
         if ui_version is None:
@@ -424,13 +527,29 @@ class PlaygroundAgent:
         settings = self._settings_for(session_id)
         command = parse_command(query)
         if command is not None:
-            parts = await self._run_command(command, session_id, settings, ui_version)
+            parts = await self._run_command(
+                command,
+                session_id,
+                settings,
+                ui_version,
+                inspector_enabled=inspector_enabled,
+            )
         elif settings.mode is RenderMode.TOOL and not settings.compare:
             parts = await self._render_tool_turn(
-                query, session_id, settings, ui_version
+                query,
+                session_id,
+                settings,
+                ui_version,
+                inspector_enabled=inspector_enabled,
             )
         else:
-            parts = await self._render_turn(query, session_id, settings, ui_version)
+            parts = await self._render_turn(
+                query,
+                session_id,
+                settings,
+                ui_version,
+                inspector_enabled=inspector_enabled,
+            )
         yield {"is_task_complete": True, "parts": parts}
 
     async def _run_command(
@@ -439,10 +558,16 @@ class PlaygroundAgent:
         session_id: str,
         settings: PlaygroundSettings,
         version: str,
+        *,
+        inspector_enabled: bool = False,
     ) -> list[Part]:
         if command.name == "tool":
             return await self._render_direct_tool(
-                command.argument, session_id, settings, version
+                command.argument,
+                session_id,
+                settings,
+                version,
+                inspector_enabled=inspector_enabled,
             )
         new_settings, reply = apply_command(command, settings)
         self._remember(self._settings, session_id, new_settings)
@@ -474,6 +599,8 @@ class PlaygroundAgent:
         session_id: str,
         settings: PlaygroundSettings,
         version: str,
+        *,
+        inspector_enabled: bool = False,
     ) -> list[Part]:
         """Executes a specific example tool and renders its result with zero LLM calls."""
         choices = ", ".join(EXAMPLE_TOOL_NAMES)
@@ -489,13 +616,22 @@ class PlaygroundAgent:
             )
         tool_name, payload = invoked
         surface_id = surface_id_for(next_settings, RenderMode.TOOL)
+        intent = TOOL_INTENTS[tool_name]
+        mutable_paths = tuple(TOOL_MUTABLE_PATHS.get(tool_name, ()))
+        actions = tuple(TOOL_ACTIONS.get(tool_name, ()))
+        block = DecisionBlock(
+            intent=intent,
+            payload=payload,
+            mutable_paths=mutable_paths,
+            actions=actions,
+        )
         result = await self.renderers.render_tool_result(
-            TOOL_INTENTS[tool_name],
+            intent,
             payload,
             surface_id=surface_id,
             version=version,
-            mutable_paths=TOOL_MUTABLE_PATHS.get(tool_name, ()),
-            actions=TOOL_ACTIONS.get(tool_name, ()),
+            mutable_paths=mutable_paths,
+            actions=actions,
             conversation_id=session_id,
         )
         metrics = result.metrics or TurnMetrics(
@@ -503,13 +639,6 @@ class PlaygroundAgent:
             backend=self.renderers.backend_kind,
             llm_calls=0,
             latency_ms=0.0,
-        )
-        parts = list(result.parts)
-        footer_lines = [metrics.footer()]
-        if result.error:
-            footer_lines.append(f"Render failed: {result.error}")
-        parts.extend(
-            self._status(footer_lines, next_settings, version, suffix="tool-footer")
         )
         if result.trace_lines:
             self._remember(self._last_trace, session_id, result.trace_lines)
@@ -519,7 +648,20 @@ class PlaygroundAgent:
             (f"/tool {tool_name}", [(RenderMode.TOOL, result, metrics)]),
         )
         self._remember(self._settings, session_id, next_settings)
-        return parts
+        return self._finalize_tool_parts(
+            query=f"/tool {tool_name}",
+            settings=next_settings,
+            version=version,
+            surface_id=surface_id,
+            result=result,
+            metrics=metrics,
+            stage1_source="direct_tool",
+            stage1_turn=None,
+            tool_name=tool_name,
+            tool_args={},
+            block=block,
+            inspector_enabled=inspector_enabled,
+        )
 
     async def _switch_backend(self, argument: str | None) -> list[str]:
         if not argument:
@@ -535,14 +677,63 @@ class PlaygroundAgent:
         await self.renderers.set_backend(backend)
         return [f"Decision backend set to `{self.renderers.backend_name}`."]
 
+    async def _render_mode_candidates(
+        self,
+        modes: Sequence[RenderMode],
+        block: DecisionBlock,
+        stage1: LlmTurn,
+        settings: PlaygroundSettings,
+        version: str,
+        session_id: str,
+        *,
+        inspector_enabled: bool,
+    ) -> tuple[
+        list[Part],
+        list[tuple[RenderMode, RenderResult, TurnMetrics]],
+        list[tuple[RenderMode, str, RenderResult, TurnMetrics]],
+    ]:
+        parts: list[Part] = []
+        results: list[tuple[RenderMode, RenderResult]] = []
+        turn_candidates: list[tuple[RenderMode, RenderResult, TurnMetrics]] = []
+        trace_candidates: list[tuple[RenderMode, str, RenderResult, TurnMetrics]] = []
+        for mode in modes:
+            surface_id = surface_id_for(settings, mode)
+            result = await self._render_mode(mode, block, settings, version, session_id)
+            results.append((mode, result))
+            parts.extend(result.parts)
+            if not inspector_enabled:
+                parts.extend(
+                    self._footer_parts(mode, result, stage1, settings, version)
+                )
+            if mode is RenderMode.DECISION and result.trace_lines:
+                self._remember(self._last_trace, session_id, result.trace_lines)
+            cand_metrics = (
+                result.metrics
+                or TurnMetrics(mode=mode, backend="llm", llm_calls=0, latency_ms=0.0)
+            ).plus_stage1(stage1)
+            turn_candidates.append((mode, result, cand_metrics))
+            trace_candidates.append((mode, surface_id, result, cand_metrics))
+        if not inspector_enabled and settings.compare:
+            parts.extend(self._compare_summary(results, stage1, settings, version))
+        elif inspector_enabled and all(not res.parts for _, res in results):
+            error_lines = [
+                f"Render failed ({m.value}): {r.error or 'no surface produced'}"
+                for m, r in results
+            ]
+            parts.extend(self._status(error_lines, settings, version))
+        return parts, turn_candidates, trace_candidates
+
     async def _render_turn(
         self,
         query: str,
         session_id: str,
         settings: PlaygroundSettings,
         version: str,
+        *,
+        inspector_enabled: bool = False,
     ) -> list[Part]:
         settings = settings.next_turn()
+        stage1_source = _classify_stage1_source(query)
         try:
             stage1 = await self.llm(
                 instruction_key=_STAGE1_KEY,
@@ -553,12 +744,30 @@ class PlaygroundAgent:
         except Exception as exc:  # the model call itself failed; keep the chat alive
             logger.exception("Stage 1 failed")
             self._remember(self._settings, session_id, settings)
-            return self._status([f"Stage 1 failed: {exc}"], settings, version)
+            parts = self._status([f"Stage 1 failed: {exc}"], settings, version)
+            if inspector_enabled:
+                parts.append(
+                    self._trace_part(
+                        turn=settings.turn,
+                        query=query,
+                        compare=settings.compare,
+                        active_mode=settings.mode,
+                        stage1_source=stage1_source,
+                        stage1_turn=None,
+                        tool_name=None,
+                        tool_args=None,
+                        block=None,
+                        stage1_error=f"Stage 1 failed: {exc}",
+                        candidates=(),
+                        version=version,
+                    )
+                )
+            return parts
         block = extract_block(stage1.text)
         if block is None:
             self._remember(self._settings, session_id, settings)
             prose = stage1.text.strip() or "(empty reply)"
-            return self._status(
+            parts = self._status(
                 [
                     (
                         "I could not turn that into a decision block; try describing"
@@ -569,25 +778,51 @@ class PlaygroundAgent:
                 settings,
                 version,
             )
+            if inspector_enabled:
+                parts.append(
+                    self._trace_part(
+                        turn=settings.turn,
+                        query=query,
+                        compare=settings.compare,
+                        active_mode=settings.mode,
+                        stage1_source=stage1_source,
+                        stage1_turn=stage1,
+                        tool_name=None,
+                        tool_args=None,
+                        block=None,
+                        stage1_error=f"Could not extract decision block: {prose[:500]}",
+                        candidates=(),
+                        version=version,
+                    )
+                )
+            return parts
         modes = list(CHAT_MODES) if settings.compare else [settings.mode]
-        parts: list[Part] = []
-        results: list[tuple[RenderMode, RenderResult]] = []
-        turn_candidates: list[tuple[RenderMode, RenderResult, TurnMetrics]] = []
-        for mode in modes:
-            result = await self._render_mode(mode, block, settings, version, session_id)
-            results.append((mode, result))
-            parts.extend(result.parts)
-            parts.extend(self._footer_parts(mode, result, stage1, settings, version))
-            if mode is RenderMode.DECISION:
-                if result.trace_lines:
-                    self._remember(self._last_trace, session_id, result.trace_lines)
-            cand_metrics = (
-                result.metrics
-                or TurnMetrics(mode=mode, backend="llm", llm_calls=0, latency_ms=0.0)
-            ).plus_stage1(stage1)
-            turn_candidates.append((mode, result, cand_metrics))
-        if settings.compare:
-            parts.extend(self._compare_summary(results, stage1, settings, version))
+        parts, turn_candidates, trace_candidates = await self._render_mode_candidates(
+            modes,
+            block,
+            stage1,
+            settings,
+            version,
+            session_id,
+            inspector_enabled=inspector_enabled,
+        )
+        if inspector_enabled:
+            parts.append(
+                self._trace_part(
+                    turn=settings.turn,
+                    query=query,
+                    compare=settings.compare,
+                    active_mode=settings.mode,
+                    stage1_source=stage1_source,
+                    stage1_turn=stage1,
+                    tool_name=None,
+                    tool_args=None,
+                    block=block,
+                    stage1_error=None,
+                    candidates=trace_candidates,
+                    version=version,
+                )
+            )
         self._remember(self._last_turn, session_id, (query, turn_candidates))
         self._remember(
             self._settings,
@@ -596,12 +831,80 @@ class PlaygroundAgent:
         )
         return parts
 
+    def _no_tool_parts(
+        self,
+        query: str,
+        session_id: str,
+        settings: PlaygroundSettings,
+        version: str,
+        tool_turn: LlmToolTurn,
+        *,
+        inspector_enabled: bool,
+    ) -> list[Part]:
+        self._remember(self._settings, session_id, settings)
+        prose = tool_turn.text.strip() or "No relevant tool was found for that request."
+        metrics = TurnMetrics(
+            mode=RenderMode.TOOL,
+            backend="llm",
+            llm_calls=1,
+            latency_ms=tool_turn.latency_ms,
+            prompt_tokens=tool_turn.prompt_tokens,
+            output_tokens=tool_turn.output_tokens,
+        )
+        parts = self._status([prose], settings, version)
+        if not inspector_enabled:
+            parts.extend(
+                self._status(
+                    [metrics.footer()], settings, version, suffix="tool-footer"
+                )
+            )
+        self._remember(
+            self._last_turn,
+            session_id,
+            (
+                query,
+                [
+                    (
+                        RenderMode.TOOL,
+                        RenderResult(parts=list(parts), metrics=metrics),
+                        metrics,
+                    )
+                ],
+            ),
+        )
+        if inspector_enabled:
+            stage1_equivalent = LlmTurn(
+                text=tool_turn.text,
+                prompt_tokens=tool_turn.prompt_tokens,
+                output_tokens=tool_turn.output_tokens,
+                latency_ms=tool_turn.latency_ms,
+            )
+            parts.append(
+                self._trace_part(
+                    turn=settings.turn,
+                    query=query,
+                    compare=False,
+                    active_mode=RenderMode.TOOL,
+                    stage1_source="tool_call",
+                    stage1_turn=stage1_equivalent,
+                    tool_name=None,
+                    tool_args=None,
+                    block=None,
+                    stage1_error=None,
+                    candidates=(),
+                    version=version,
+                )
+            )
+        return parts
+
     async def _render_tool_turn(
         self,
         query: str,
         session_id: str,
         settings: PlaygroundSettings,
         version: str,
+        *,
+        inspector_enabled: bool = False,
     ) -> list[Part]:
         settings = settings.next_turn()
         try:
@@ -615,46 +918,47 @@ class PlaygroundAgent:
         except Exception as exc:  # the model call itself failed; keep the chat alive
             logger.exception("Tool mode call failed")
             self._remember(self._settings, session_id, settings)
-            return self._status([f"Tool call failed: {exc}"], settings, version)
-
-        surface_id = surface_id_for(settings, RenderMode.TOOL)
-        if not tool_turn.tool_name or tool_turn.result is None:
-            self._remember(self._settings, session_id, settings)
-            prose = (
-                tool_turn.text.strip() or "No relevant tool was found for that request."
-            )
-            metrics = TurnMetrics(
-                mode=RenderMode.TOOL,
-                backend="llm",
-                llm_calls=1,
-                latency_ms=tool_turn.latency_ms,
-                prompt_tokens=tool_turn.prompt_tokens,
-                output_tokens=tool_turn.output_tokens,
-            )
-            parts = self._status([prose], settings, version)
-            footer_lines = [metrics.footer()]
-            parts.extend(
-                self._status(footer_lines, settings, version, suffix="tool-footer")
-            )
-            self._remember(
-                self._last_turn,
-                session_id,
-                (
-                    query,
-                    [
-                        (
-                            RenderMode.TOOL,
-                            RenderResult(parts=parts, metrics=metrics),
-                            metrics,
-                        )
-                    ],
-                ),
-            )
+            parts = self._status([f"Tool call failed: {exc}"], settings, version)
+            if inspector_enabled:
+                parts.append(
+                    self._trace_part(
+                        turn=settings.turn,
+                        query=query,
+                        compare=False,
+                        active_mode=RenderMode.TOOL,
+                        stage1_source="tool_call",
+                        stage1_turn=None,
+                        tool_name=None,
+                        tool_args=None,
+                        block=None,
+                        stage1_error=f"Tool call failed: {exc}",
+                        candidates=(),
+                        version=version,
+                    )
+                )
             return parts
 
+        if not tool_turn.tool_name or tool_turn.result is None:
+            return self._no_tool_parts(
+                query,
+                session_id,
+                settings,
+                version,
+                tool_turn,
+                inspector_enabled=inspector_enabled,
+            )
+
+        surface_id = surface_id_for(settings, RenderMode.TOOL)
         tool_result = tool_turn.result
         intent = TOOL_INTENTS.get(tool_turn.tool_name, "Tool Result")
-        mutable_paths = TOOL_MUTABLE_PATHS.get(tool_turn.tool_name, ())
+        mutable_paths = tuple(TOOL_MUTABLE_PATHS.get(tool_turn.tool_name, ()))
+        actions = tuple(TOOL_ACTIONS.get(tool_turn.tool_name, ()))
+        block = DecisionBlock(
+            intent=intent,
+            payload=tool_result,
+            mutable_paths=mutable_paths,
+            actions=actions,
+        )
 
         result = await self.renderers.render_tool_result(
             intent,
@@ -662,7 +966,7 @@ class PlaygroundAgent:
             surface_id=surface_id,
             version=version,
             mutable_paths=mutable_paths,
-            actions=TOOL_ACTIONS.get(tool_turn.tool_name, ()),
+            actions=actions,
             conversation_id=session_id,
         )
 
@@ -680,14 +984,6 @@ class PlaygroundAgent:
         )
         metrics = base_metrics.plus_stage1(stage1_equivalent)
 
-        parts = list(result.parts)
-        footer_lines = [metrics.footer()]
-        if result.error:
-            footer_lines.append(f"Render failed: {result.error}")
-        parts.extend(
-            self._status(footer_lines, settings, version, suffix="tool-footer")
-        )
-
         if result.trace_lines:
             self._remember(self._last_trace, session_id, result.trace_lines)
 
@@ -701,7 +997,20 @@ class PlaygroundAgent:
             session_id,
             settings.__class__(mode=settings.mode, turn=settings.turn),
         )
-        return parts
+        return self._finalize_tool_parts(
+            query=query,
+            settings=settings,
+            version=version,
+            surface_id=surface_id,
+            result=result,
+            metrics=metrics,
+            stage1_source="tool_call",
+            stage1_turn=stage1_equivalent,
+            tool_name=tool_turn.tool_name,
+            tool_args=tool_turn.arguments,
+            block=block,
+            inspector_enabled=inspector_enabled,
+        )
 
     async def _rate_turn(
         self, session_id: str, argument: str | None, comment: str | None
