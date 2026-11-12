@@ -109,12 +109,14 @@ def _minimal_grammar() -> dict[str, Any]:
                 "levels": ["no", "now"],
             },
         },
-        "archetypes": [{
-            "id": "detail",
-            "family": "inspect",
-            "criteria": "One thing in depth.",
-            "blocks": ["prose!", "facts?"],
-        }],
+        "archetypes": [
+            {
+                "id": "detail",
+                "family": "inspect",
+                "criteria": "One thing in depth.",
+                "blocks": ["prose!", "facts?"],
+            }
+        ],
         "blocks": [
             {
                 "id": "prose",

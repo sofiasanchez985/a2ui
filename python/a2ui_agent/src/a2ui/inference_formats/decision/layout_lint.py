@@ -27,16 +27,18 @@ from .models import LayoutPlan, PlannedBlock, SlotBinding, _WireEnum
 _LABEL_PROPERTIES: frozenset[str] = frozenset(
     {"label", "accessibility", "checks", "action", "description"}
 )
-_META_PROPERTIES: frozenset[str] = frozenset({
-    "id",
-    "component",
-    "catalogId",
-    "variant",
-    "checks",
-    "accessibility",
-    "metadata",
-    "action",
-})
+_META_PROPERTIES: frozenset[str] = frozenset(
+    {
+        "id",
+        "component",
+        "catalogId",
+        "variant",
+        "checks",
+        "accessibility",
+        "metadata",
+        "action",
+    }
+)
 
 
 class LintCode(_WireEnum):
@@ -59,7 +61,14 @@ class LintSeverity(_WireEnum):
 
 @dataclass(frozen=True)
 class LintFinding:
-    """One violation or warning detected by `lint_components`."""
+    """One violation or warning detected by `lint_components`.
+
+    Attributes:
+        code: The `LintCode` identifying the violated rule.
+        message: Human-readable explanation of the finding.
+        component_id: Identifier of the offending component or block, if applicable.
+        severity: Whether the finding blocks output (`ERROR`) or advises (`WARNING`).
+    """
 
     code: LintCode
     message: str

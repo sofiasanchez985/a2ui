@@ -413,10 +413,12 @@ async def test_jev_native_filters_unrequested_options_and_fails_closed() -> None
         return httpx.Response(
             200,
             json={
-                "answers": [{
-                    "id": "q",
-                    "probabilities": {"a": "0.1", "Unlisted": 0.85, "b": "x"},
-                }]
+                "answers": [
+                    {
+                        "id": "q",
+                        "probabilities": {"a": "0.1", "Unlisted": 0.85, "b": "x"},
+                    }
+                ]
             },
         )
 
@@ -632,18 +634,22 @@ async def test_step_zero_chat_completions_case_insensitive_and_bearer_auth() -> 
         return httpx.Response(
             200,
             json={
-                "choices": [{
-                    "logprobs": {
-                        "content": [{
-                            "token": "b",
-                            "logprob": -0.05,
-                            "top_logprobs": [
-                                {"token": " b", "logprob": -0.05},
-                                {"token": "A", "logprob": -3.10},
-                            ],
-                        }]
+                "choices": [
+                    {
+                        "logprobs": {
+                            "content": [
+                                {
+                                    "token": "b",
+                                    "logprob": -0.05,
+                                    "top_logprobs": [
+                                        {"token": " b", "logprob": -0.05},
+                                        {"token": "A", "logprob": -3.10},
+                                    ],
+                                }
+                            ]
+                        }
                     }
-                }]
+                ]
             },
         )
 
@@ -906,18 +912,20 @@ def test_decision_synthesizer_from_env(clean_env: pytest.MonkeyPatch) -> None:
     from a2ui.inference_formats.decision import DecisionSynthesizer
 
     clean_env.setenv("A2UI_DECISION_BACKEND", "mock")
-    cat = Catalog.from_json({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "catalogId": "https://example.com/cat",
-        "protocolVersion": "1.0",
-        "components": {
-            "Card": {
-                "type": "object",
-                "properties": {"component": {"const": "Card"}},
-                "required": ["component"],
-            }
-        },
-    })
+    cat = Catalog.from_json(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "catalogId": "https://example.com/cat",
+            "protocolVersion": "1.0",
+            "components": {
+                "Card": {
+                    "type": "object",
+                    "properties": {"component": {"const": "Card"}},
+                    "required": ["component"],
+                }
+            },
+        }
+    )
     synth = DecisionSynthesizer.from_env([cat])
     assert isinstance(synth.backend, DeterministicMockBackend)
 

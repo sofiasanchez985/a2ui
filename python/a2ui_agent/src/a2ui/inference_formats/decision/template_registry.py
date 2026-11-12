@@ -67,6 +67,7 @@ class _SurfaceEnvelopes:
 
 
 def _mapping_or_none(value: Any) -> Mapping[str, Any] | None:
+    """Returns `value` if it is a `Mapping`, otherwise None."""
     return value if isinstance(value, Mapping) else None
 
 
@@ -203,7 +204,18 @@ def _plan_pointers(plan: LayoutPlan) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class SurfaceTemplate:
-    """Pre-validated A2UI surface template parameterized by JSON Pointer paths."""
+    """Pre-validated A2UI surface template parameterized by JSON Pointer paths.
+
+    Attributes:
+        template_id: Unique identifier of the template in a `TemplateRegistry`.
+        description: Human-readable summary used as the option text in template questions.
+        surface_id: Default surface identifier when rendering the template.
+        catalog_id: Target catalog identifier, or None for multi-catalog templates.
+        protocol_version: A2UI protocol version string (for example `1.0`).
+        components: Frozen tuple of pre-validated A2UI component dictionaries.
+        required_pointers: JSON Pointers that must exist in a payload to match.
+        is_mutable: Whether the template contains user-editable bindings (`sendDataModel`).
+    """
 
     template_id: str
     description: str
@@ -270,14 +282,16 @@ class SurfaceTemplate:
             },
         ]
         if payload:
-            raw_messages.append({
-                "version": wire_version,
-                "updateDataModel": {
-                    "surfaceId": target_surface_id,
-                    "path": "/",
-                    "value": dict(payload),
-                },
-            })
+            raw_messages.append(
+                {
+                    "version": wire_version,
+                    "updateDataModel": {
+                        "surfaceId": target_surface_id,
+                        "path": "/",
+                        "value": dict(payload),
+                    },
+                }
+            )
 
         return to_message_models(raw_messages)
 

@@ -141,6 +141,16 @@ class ShapeFilter:
     """Deterministic payload pre-filter on an archetype or block.
 
     All fields are optional; an empty filter matches every payload.
+
+    Attributes:
+        pointers: Semantic types of which at least one pointer must exist.
+        array_length: Inclusive bounds on matching array cardinality.
+        element_types: Semantic types of which at least one array element must exist.
+        element_keys: Object keys of which at least one array element must define.
+        mutable: Required mutability flag for matching pointers, when set.
+        prose_length: Allowed prose length buckets (`blurb`, `summary`, `article`).
+        count: Inclusive bounds on how many pointers match `pointers`.
+        actions_allowed: Whether the payload or block permits action controls.
     """
 
     pointers: tuple[str, ...] = ()
@@ -178,7 +188,12 @@ class ShapeFilter:
 
 @dataclass(frozen=True)
 class BlockRef:
-    """A block named by an archetype, with the requirement its mark encodes."""
+    """A block named by an archetype, with the requirement its mark encodes.
+
+    Attributes:
+        id: Block role identifier in the grammar.
+        requirement: Whether the block is required, expected, or optional.
+    """
 
     id: str
     requirement: Requirement
@@ -205,7 +220,17 @@ class BlockRef:
 
 @dataclass(frozen=True)
 class LayoutArchetype:
-    """An ordered list of blocks that together serve one family of intent."""
+    """An ordered list of blocks that together serve one family of intent.
+
+    Attributes:
+        id: Unique archetype identifier in the grammar.
+        family: Intent family (`inspect`, `browse`, `act`, `monitor`, `follow`, `talk`).
+        criteria: Prose description used as the option text in archetype questions.
+        blocks: Ordered block references with their requirement marks.
+        shape: Deterministic payload pre-filter for eligibility.
+        at_least: Minimum number of survived blocks required for a valid plan.
+        frame: Optional page-frame configuration for this archetype.
+    """
 
     id: str
     family: str
@@ -248,7 +273,24 @@ class LayoutArchetype:
 
 @dataclass(frozen=True)
 class QuestionSpec:
-    """A question template from the grammar, before placeholders are filled."""
+    """A question template from the grammar, before placeholders are filled.
+
+    Attributes:
+        kind: Question type (`CHOICE`, `BOOLEAN`, or `SCORE`).
+        question: Prompt template string with optional `{slot}` placeholders.
+        options: Map of option ID to option criteria description for `CHOICE`.
+        levels: Ordered level descriptions for `SCORE`.
+        requires: Option ID to required slots, knob options, pattern variants, or flags.
+        applies_when: Slot-level predicates gating when the question is asked.
+        derived_when: Deterministic derivation rules bypassing the model call.
+        options_from: Slot path whose bound values populate `CHOICE` options.
+        allow_none: Whether an explicit `none` option is added to `CHOICE` questions.
+        yes: Criteria text for a `yes` answer on `BOOLEAN` questions.
+        no: Criteria text for a `no` answer on `BOOLEAN` questions.
+        per_pointer: Whether a `SCORE` salience question is asked once per pointer.
+        select: Salience selection bounds (`min`, `max`, `aboveLevel`).
+        note: Authoring note explaining the question design.
+    """
 
     kind: QuestionKind
     question: str
@@ -305,7 +347,24 @@ class QuestionSpec:
 
 @dataclass(frozen=True)
 class SlotSpec:
-    """What a block slot accepts and how the deterministic binder fills it."""
+    """What a block slot accepts and how the deterministic binder fills it.
+
+    Attributes:
+        name: Slot identifier within the block or repeated item.
+        from_types: Accepted semantic types in preference order.
+        required: Whether the block cannot render without this slot bound.
+        repeat: Whether the slot binds a repeated sequence of items.
+        max: Maximum number of items bound when `repeat` is True.
+        prefer: Key hints that break ties among compatible pointers.
+        avoid_keys: Key substrings disfavored during deterministic slot binding.
+        sibling: Sibling keys of a primary bound pointer eligible to fill this slot.
+        order_by: Ordering rule applied to repeated slot items.
+        mutable: Whether this slot requires a mutable pointer (`mutable_hint=True`).
+        fields: Per-element sub-slots of a repeated slot.
+        element_types: Required element semantic types when binding an array pointer.
+        default: Default literal value used when no pointer binds.
+        note: Authoring note explaining the slot's role.
+    """
 
     name: str
     from_types: tuple[str, ...]
@@ -370,7 +429,14 @@ def _parse_questions(raw: Mapping[str, Any] | None) -> dict[str, QuestionSpec]:
 
 @dataclass(frozen=True)
 class MeasureSpec:
-    """A value computed from a bound slot, never asked, that patterns vary by."""
+    """A value computed from a bound slot, never asked, that patterns vary by.
+
+    Attributes:
+        name: Measure identifier exposed as a variant knob on the block.
+        derived_from: A ``slot.hints.<hint>`` path into the bound pointer summary.
+        levels: Map from level name to its inclusive-exclusive ``[low, high)`` range.
+        note: Authoring note explaining the measure thresholds.
+    """
 
     name: str
     derived_from: str
@@ -404,7 +470,20 @@ class MeasureSpec:
 
 @dataclass(frozen=True)
 class BlockSpec:
-    """One block of the grammar: its pattern, questions, slots, and fallbacks."""
+    """One block of the grammar: its pattern, questions, slots, and fallbacks.
+
+    Attributes:
+        id: Block role identifier (`headline`, `facts`, `collection`, etc.).
+        pattern: Primary abstract pattern name for this block.
+        shape: Deterministic payload pre-filter for block eligibility.
+        gate: Optional `BOOLEAN` gate question deciding block inclusion.
+        salience: Optional `SCORE` salience question ranking candidate pointers.
+        anatomy: Map of knob name to `QuestionSpec` for block-level variant knobs.
+        instance: Map of knob name to `QuestionSpec` for per-item instance questions.
+        measures: Map of measure name to `MeasureSpec` derived from bound slot hints.
+        slots: Map of slot name to `SlotSpec` defining bindable block inputs.
+        fallback: Ordered fallback pattern or `pattern:variant` chain.
+    """
 
     id: str
     pattern: str
@@ -459,7 +538,12 @@ class BlockSpec:
 
 @dataclass(frozen=True)
 class Rule:
-    """A prose rule the planner implements; kept for traces and documentation."""
+    """A prose rule the planner implements; kept for traces and documentation.
+
+    Attributes:
+        id: Rule identifier (for example `action-gate` or `no-orphaned-pointers`).
+        rule: Prose description of the planning invariant.
+    """
 
     id: str
     rule: str
@@ -620,7 +704,17 @@ def _schema_findings(data: Mapping[str, Any]) -> list[str]:
 
 @dataclass(frozen=True)
 class ArchetypeGrammar:
-    """A validated, linted archetype grammar."""
+    """A validated, linted archetype grammar.
+
+    Attributes:
+        version: Grammar schema version string (`grammarVersion`).
+        thresholds: Map of threshold name (`family`, `noFit`, `expected`, etc.) to float.
+        job: Map of job-level question name (`family`, `stakes`, `urgency`) to `QuestionSpec`.
+        archetypes: Ordered tuple of `LayoutArchetype` definitions.
+        blocks: Map of block ID to `BlockSpec`.
+        rules: Tuple of prose `Rule` definitions recorded in the grammar.
+        lint: Tuple of lint check identifiers enforced by the grammar.
+    """
 
     version: str
     thresholds: Mapping[str, float] = field(hash=False)

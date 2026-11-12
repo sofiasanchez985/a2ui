@@ -223,11 +223,13 @@ def test_region_update_replaces_only_named_block(
 
     # Re-plan only `headline` with `/uptimeHours` excluded so the second headline
     # tile is dropped while `banner`, `facts`, and `root` are untouched.
-    region_turn = turn({
-        **block,
-        "region": "headline",
-        "exclude": ["/uptimeHours"],
-    })
+    region_turn = turn(
+        {
+            **block,
+            "region": "headline",
+            "exclude": ["/uptimeHours"],
+        }
+    )
     assert _kinds(region_turn) == ["updateComponents", "updateDataModel"]
     emitted_ids = _ids(region_turn)
     assert emitted_ids
@@ -268,3 +270,38 @@ def test_separate_conversations_keep_separate_surfaces() -> None:
         assert _kinds(_messages(parser.parse_response(_response(block))))[0] == (
             "createSurface"
         )
+
+
+@TURN_FACTORIES
+def test_full_surface_update_after_region_update_does_not_hit_stale_cache(
+    make_turns: Callable[..., Turn],
+) -> None:
+    turn = make_turns(HOST_SCRIPTED)
+    client = _Client()
+    block = {"intent": HOST.intent, "payload": HOST.payload, "surfaceId": "ops"}
+
+    first = turn(block)
+    client.apply(first)
+    assert "headline_item_1" in client.reachable()
+
+    region_turn = turn(
+        {
+            **block,
+            "region": "headline",
+            "exclude": ["/uptimeHours"],
+        }
+    )
+    client.apply(region_turn)
+    assert "headline_item_1" not in client.reachable()
+
+    # Reverting to a full-surface update (`region=None`) with the original shape
+    # must miss the region-tainted cache entry and re-emit `updateComponents`.
+    full_turn = turn(
+        {
+            **block,
+            "payload": {**HOST.payload, "cpu": 0.44},
+        }
+    )
+    assert _kinds(full_turn) == ["updateComponents", "updateDataModel"]
+    client.apply(full_turn)
+    assert "headline_item_1" in client.reachable()

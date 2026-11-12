@@ -125,12 +125,14 @@ class TestSurfaceTemplate:
             "version": "v0.9",
             "updateComponents": {
                 "surfaceId": "metrics_surface",
-                "components": [{
-                    "id": "root",
-                    "component": "MetricGauge",
-                    "label": "CPU Usage",
-                    "value": {"path": "/cpu"},
-                }],
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "MetricGauge",
+                        "label": "CPU Usage",
+                        "value": {"path": "/cpu"},
+                    }
+                ],
             },
         }
 
@@ -262,34 +264,38 @@ class TestTemplateRegistry:
 
     def test_promote_synthesized_registers_reusable_template(self) -> None:
         registry = TemplateRegistry()
-        raw_messages = to_message_models([
-            {
-                "version": "1.0",
-                "createSurface": {
-                    "surfaceId": "synth_surface",
-                    "catalogId": "https://example.com/catalogs/finance/v1",
+        raw_messages = to_message_models(
+            [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "synth_surface",
+                        "catalogId": "https://example.com/catalogs/finance/v1",
+                    },
                 },
-            },
-            {
-                "version": "1.0",
-                "updateComponents": {
-                    "surfaceId": "synth_surface",
-                    "components": [{
-                        "id": "root",
-                        "component": "TickerCard",
-                        "symbol": {"@path": "/ticker"},
-                    }],
+                {
+                    "version": "1.0",
+                    "updateComponents": {
+                        "surfaceId": "synth_surface",
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": "TickerCard",
+                                "symbol": {"@path": "/ticker"},
+                            }
+                        ],
+                    },
                 },
-            },
-            {
-                "version": "1.0",
-                "updateDataModel": {
-                    "surfaceId": "synth_surface",
-                    "path": "/",
-                    "value": {"ticker": "GOOG"},
+                {
+                    "version": "1.0",
+                    "updateDataModel": {
+                        "surfaceId": "synth_surface",
+                        "path": "/",
+                        "value": {"ticker": "GOOG"},
+                    },
                 },
-            },
-        ])
+            ]
+        )
         output = SynthesisOutput(
             stage=SynthesisStage.ARCHETYPE,
             messages=raw_messages,
@@ -337,24 +343,30 @@ class TestTemplateRegistry:
         self,
     ) -> None:
         registry = TemplateRegistry()
-        v08_messages = to_message_models([
-            {
-                "beginRendering": {
-                    "surfaceId": "v08_surface",
-                    "catalogId": "https://example.com/catalogs/ops/v1",
-                    "root": "root",
+        v08_messages = to_message_models(
+            [
+                {
+                    "beginRendering": {
+                        "surfaceId": "v08_surface",
+                        "catalogId": "https://example.com/catalogs/ops/v1",
+                        "root": "root",
+                    },
                 },
-            },
-            {
-                "surfaceUpdate": {
-                    "surfaceId": "v08_surface",
-                    "components": [{
-                        "id": "root",
-                        "component": {"MetricGauge": {"value": {"path": "/cpu"}}},
-                    }],
+                {
+                    "surfaceUpdate": {
+                        "surfaceId": "v08_surface",
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": {
+                                    "MetricGauge": {"value": {"path": "/cpu"}}
+                                },
+                            }
+                        ],
+                    },
                 },
-            },
-        ])
+            ]
+        )
         output = SynthesisOutput(
             stage=SynthesisStage.ARCHETYPE,
             messages=v08_messages,

@@ -41,24 +41,26 @@ QUOTE = {"ticker": "GOOG", "price": 182.5}
 
 def _finance_catalog(protocol_version: str = "1.0") -> Catalog:
     """A custom catalog with no Basic components and no patterns file."""
-    return Catalog.from_json({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "catalogId": FINANCE_ID,
-        "protocolVersion": protocol_version,
-        "components": {
-            "TickerQuoteCard": {
-                "type": "object",
-                "description": "Displays a live equity quote.",
-                "properties": {
-                    "component": {"const": "TickerQuoteCard"},
-                    "ticker": {"$ref": "common_types.json#/$defs/DynamicString"},
-                    "price": {"$ref": "common_types.json#/$defs/DynamicNumber"},
+    return Catalog.from_json(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "catalogId": FINANCE_ID,
+            "protocolVersion": protocol_version,
+            "components": {
+                "TickerQuoteCard": {
+                    "type": "object",
+                    "description": "Displays a live equity quote.",
+                    "properties": {
+                        "component": {"const": "TickerQuoteCard"},
+                        "ticker": {"$ref": "common_types.json#/$defs/DynamicString"},
+                        "price": {"$ref": "common_types.json#/$defs/DynamicNumber"},
+                    },
+                    "required": ["component", "ticker", "price"],
                 },
-                "required": ["component", "ticker", "price"],
             },
-        },
-        "functions": {},
-    })
+            "functions": {},
+        }
+    )
 
 
 def _quote_registry() -> TemplateRegistry:
@@ -154,3 +156,47 @@ async def test_no_patterns_and_no_templates_needs_a_fallback() -> None:
     assert out.fallback_reason == "no eligible archetype"
     assert _components(out.messages)[0]["component"] == "TickerQuoteCard"
     validate_payload([catalog], out.messages)
+
+
+@pytest.mark.asyncio
+async def test_multi_catalog_region_update_preserves_existing_block_root_prefix() -> (
+    None
+):
+    from a2ui.core.basic_catalog import BasicCatalog
+    from a2ui.utils import RendererState
+
+    from .layout_fixtures import HOST
+
+    basic = BasicCatalog("v1.0")
+    finance = _finance_catalog()
+    scripted = {
+        "family": ("monitor", 0.90),
+        "stakes": 1.0,
+        "urgency": 1.4,
+        "archetype:monitor": ("dashboard", 0.85),
+        "gate:banner": 0.80,
+        "gate:headline": 0.90,
+        "gate:facts": 0.80,
+    }
+    synth = DecisionSynthesizer([finance, basic], mock_backend(**scripted))
+    state = RendererState([finance, basic])
+
+    first = await synth.synthesize(
+        HOST.intent, HOST.payload, surface_id="ops", state=state
+    )
+    state.apply(first.messages)
+    initial_ids = {c["id"] for c in _components(first.messages)}
+    assert "basic_headline_root" in initial_ids
+
+    region_out = await synth.synthesize(
+        HOST.intent,
+        HOST.payload,
+        surface_id="ops",
+        region="headline",
+        exclude=["/uptimeHours"],
+        state=state,
+    )
+    state.apply(region_out.messages)
+    region_ids = {c["id"] for c in _components(region_out.messages)}
+    assert "basic_headline_root" in region_ids
+    validate_payload([finance, basic], region_out.messages)

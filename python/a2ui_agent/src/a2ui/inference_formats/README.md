@@ -38,8 +38,10 @@ In chat mode, the language model writes a decision block inside `<a2ui>` tags an
 - `intent` and `payload` (required).
 - `surfaceId`: a new id creates a surface; reusing an id updates that surface in place.
 - `replace`: when `true`, the surface is deleted and created again.
+- `region`: block role name of one planned block to re-plan and update in place on an existing surface.
 - `actions`: a map from action id to a label or an options object (`label`, `scope`, `key`, `context`, `style`). The id is the event name the agent receives.
 - `exclude`: payload pointers the surface must not show.
+- `labels`: display label overrides keyed by `/`-prefixed JSON Pointer.
 - `mutablePaths`: payload pointers the user may edit. Forms and settings must list them.
 - `layout`, `title`, `summary`, and `fallbackDsl`.
 
