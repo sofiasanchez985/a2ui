@@ -261,13 +261,15 @@ class Renderers:
         )
         num = to_version_number(version)
         cap_key = "1.0" if num == "1.0" else f"v{num}"
-        return generator.create_processor({
-            cap_key: {
-                "supportedCatalogIds": [
-                    c.transformed_catalog.catalog_id for c in generator.catalogs
-                ]
+        return generator.create_processor(
+            {
+                cap_key: {
+                    "supportedCatalogIds": [
+                        c.transformed_catalog.catalog_id for c in generator.catalogs
+                    ]
+                }
             }
-        })
+        )
 
     @property
     def backend_name(self) -> str:
@@ -352,6 +354,7 @@ class Renderers:
             block.payload,
             operation=operation,
             surface_sends_data_model=sends_data_model,
+            state=state,
             **kwargs,
         )
         state.apply(output.messages)

@@ -4,7 +4,7 @@ A chat-style sample agent for exploring A2UI inference formats and tool renderin
 
 In chat mode, the agent works in two stages. Stage 1 is a single model call that turns your request into a decision block (`intent`, `payload`, optional `layout`, `title`, `summary`), which is the same structure the `decision` inference format publishes to agents. Stage 2 renders it: `decision` compiles the block with the decision model with zero additional model calls; `express` and `direct` make a second model call using that format's prompt and validate the reply. Running `/compare` renders all three modes from one payload for direct comparison.
 
-In `tool` mode, the language model is provided domain tools (`get_host_health`, `get_resort`, `get_transfer_quote`, `get_playback_settings`). The tool output is passed directly to the decision synthesizer without asking the language model to write UI code.
+In `tool` mode, the language model is provided domain tools (`get_host_health`, `get_resort`, `get_transfer_quote`, `get_playback_settings`, `get_order_details`, `get_deploy_runbook`). The tool output is passed directly to the decision synthesizer without asking the language model to write UI code. You can also run any tool directly with zero LLM calls via the example buttons under the input bar or `/tool <name>`.
 
 Every turn ends with a footer card naming the mode, the decision backend and its model id, the number of model calls, the latency, token counts, and archetype or path details, including why a fallback ran.
 
@@ -82,6 +82,7 @@ the quickest way to try your own data shapes.
 | :-------------------------------------------------- | :------------------------------------------------------------------------------------- |
 | `/mode decision` \| `express` \| `direct` \| `tool` | Picks how the next requests render.                                                    |
 | `/backend jev` \| `gemini` \| `mock`                | Switches the active decision model backend at runtime; a backend name is required.     |
+| `/tool host` \| `resort` \| `transfer` \| `settings` \| `order` \| `runbook` | Runs a specific tool directly through the decision model (0 LLM calls). |
 | `/compare`                                          | Renders the next request through all three chat modes from the same data.              |
 | `/trace`                                            | Shows the planner's questions, answers, and thresholds for the last `decision` render. |
 | `/rate <mode> [comment]`                            | Records a preference vote for the last rendered turn.                                  |

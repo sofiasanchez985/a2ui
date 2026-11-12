@@ -43,6 +43,8 @@ from modes import PlaygroundSettings, RenderMode
             Command("rate", "decision", "looks great"),
         ),
         ("/ratings", Command("ratings")),
+        ("/tool get_host_health", Command("tool", "get_host_health")),
+        ("/tool", Command("tool", None)),
         ("/remix", Command("help", "unknown:/remix")),
         ("/nope now", Command("help", "unknown:/nope now")),
         ("/", Command("help", "unknown:/")),

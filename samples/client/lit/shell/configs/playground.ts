@@ -24,4 +24,39 @@ export const playgroundConfig: AppConfig = {
   serverUrl: 'http://localhost:10010',
   // The playground reuses its main surface id across turns.
   clearSurfacesOnResponse: false,
+  quickActions: [
+    {
+      label: 'Host Health',
+      message: '/tool host',
+      title:
+        'Monitor family: render server health metrics directly via decision model (0 LLM calls)',
+    },
+    {
+      label: 'Ski Resorts',
+      message: '/tool resort',
+      title: 'Browse family: render mountain resort list directly via decision model (0 LLM calls)',
+    },
+    {
+      label: 'Transfer Quote',
+      message: '/tool transfer',
+      title:
+        'Act family: render wire transfer confirmation directly via decision model (0 LLM calls)',
+    },
+    {
+      label: 'Playback Settings',
+      message: '/tool settings',
+      title:
+        'Input family: render editable settings form directly via decision model (0 LLM calls)',
+    },
+    {
+      label: 'Order Details',
+      message: '/tool order',
+      title: 'Inspect family: render order status view directly via decision model (0 LLM calls)',
+    },
+    {
+      label: 'Deploy Runbook',
+      message: '/tool runbook',
+      title: 'Guide family: render rollout checklist directly via decision model (0 LLM calls)',
+    },
+  ],
 };

@@ -291,17 +291,19 @@ async def test_render_decision_login_form_forwards_mutable_paths() -> None:
     # Only blocks that list their editable pointers get a form; nothing is
     # promoted to mutable behind the block's back.
     for mutable_paths in (["/email", "/password", "/rememberMe"],):
-        login_block = DecisionBlock.from_mapping({
-            "intent": "Render a login form with email, password, and sign in button",
-            "payload": {
-                "title": "Welcome Back",
-                "email": "alex.smith@example.com",
-                "password": "",
-                "rememberMe": False,
-            },
-            "actions": {"sign_in": "Sign In"},
-            "mutablePaths": mutable_paths,
-        })
+        login_block = DecisionBlock.from_mapping(
+            {
+                "intent": "Render a login form with email, password, and sign in button",
+                "payload": {
+                    "title": "Welcome Back",
+                    "email": "alex.smith@example.com",
+                    "password": "",
+                    "rememberMe": False,
+                },
+                "actions": {"sign_in": "Sign In"},
+                "mutablePaths": mutable_paths,
+            }
+        )
         res = await form_renderers.render_decision(
             login_block, surface_id="turn-login", version="1.0"
         )
@@ -320,10 +322,12 @@ async def test_render_decision_login_form_forwards_mutable_paths() -> None:
         assert "**Decision time**:" in res.trace_lines[0]
 
     read_only = await form_renderers.render_decision(
-        DecisionBlock.from_mapping({
-            "intent": "Render a login form",
-            "payload": {"title": "Welcome Back", "email": "alex.smith@example.com"},
-        }),
+        DecisionBlock.from_mapping(
+            {
+                "intent": "Render a login form",
+                "payload": {"title": "Welcome Back", "email": "alex.smith@example.com"},
+            }
+        ),
         surface_id="turn-login-ro",
         version="1.0",
     )
@@ -364,13 +368,15 @@ async def test_render_tool_result_synthesizes_with_zero_llm_calls() -> None:
             scripted={"family": {"browse": 0.0}, "root": {"Card": 0.0}}
         ),
     )
-    block_with_fallback = DecisionBlock.from_mapping({
-        "intent": "Show metric count",
-        "payload": {"count": 42},
-        "fallbackDsl": (
-            'surface("turn-title")\nroot = Column([Text("Explicit Fallback DSL")])'
-        ),
-    })
+    block_with_fallback = DecisionBlock.from_mapping(
+        {
+            "intent": "Show metric count",
+            "payload": {"count": 42},
+            "fallbackDsl": (
+                'surface("turn-title")\nroot = Column([Text("Explicit Fallback DSL")])'
+            ),
+        }
+    )
     with_fallback = await abstain_renderers.render_decision(
         block_with_fallback, surface_id="turn-title", version="1.0"
     )

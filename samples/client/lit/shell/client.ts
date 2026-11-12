@@ -40,7 +40,10 @@ export class A2UIClient {
       this.#client = await A2AClient.fromCardUrl(`${baseUrl}/.well-known/agent-card.json`, {
         fetchImpl: async (url, init) => {
           const headers = new Headers(init?.headers);
-          headers.set('X-A2A-Extensions', 'https://a2ui.org/a2a-extension/a2ui/v0.9');
+          headers.set(
+            'X-A2A-Extensions',
+            'https://a2ui.org/a2a-extension/a2ui/v1.0, https://a2ui.org/a2a-extension/a2ui/v0.9',
+          );
           return fetch(url, {...init, headers});
         },
       });

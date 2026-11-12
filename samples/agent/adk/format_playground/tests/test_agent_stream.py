@@ -168,20 +168,42 @@ async def test_decision_mode_needs_a_v10_client(
 async def test_second_turn_updates_the_main_surface_in_place(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
-    scripted_llm.script("stage1", STAGE1_BLOCK, STAGE1_BLOCK)
+    different_shape_block = (
+        "<a2ui>"
+        + json.dumps(
+            {"intent": "Check host health", "payload": {"host": "prod-1", "cpu": 0.78}}
+        )
+        + "</a2ui>"
+    )
+    scripted_llm.script("stage1", STAGE1_BLOCK, STAGE1_BLOCK, different_shape_block)
     first = await collect(agent, "show the resort", "s-reuse", "1.0")
     second = await collect(agent, "show it again", "s-reuse", "1.0")
+    third = await collect(agent, "check host health", "s-reuse", "1.0")
     assert surface_ids(first) == ["main", "turn-1-decision-footer"]
-    # Turn 2 reuses `main`: no second createSurface, so no INTEGRITY_ERROR.
+    # Turn 2 has the same shape, so PlanCache emits only updateDataModel (`cache hit`).
     assert surface_ids(second) == ["turn-2-decision-footer"]
-    main_updates = [
+    data_updates = [
+        m
+        for m in messages_of(second)
+        if m.get("updateDataModel", {}).get("surfaceId") == "main"
+    ]
+    assert data_updates
+    assert not [
         m
         for m in messages_of(second)
         if m.get("updateComponents", {}).get("surfaceId") == "main"
     ]
-    assert main_updates
-    assert "surface update_root" in status_text(second)
-    assert "INTEGRITY_ERROR" not in json.dumps(messages_of(second))
+    assert "cache hit" in status_text(second)
+    # Turn 3 changes payload shape, so it re-plans and emits updateComponents (`update_root`).
+    assert surface_ids(third) == ["turn-3-decision-footer"]
+    comp_updates = [
+        m
+        for m in messages_of(third)
+        if m.get("updateComponents", {}).get("surfaceId") == "main"
+    ]
+    assert comp_updates
+    assert "surface update_root" in status_text(third)
+    assert "INTEGRITY_ERROR" not in json.dumps(messages_of(third))
 
 
 async def test_express_turn_uses_fresh_stage2_session(
@@ -411,3 +433,43 @@ async def test_set_backend_awaits_old_factory_aclose_and_skips_non_str_part_text
     )
     assert "".join(tool_chunks) == "hello world"
     assert (name, args, resp) == (None, {}, None)
+
+
+async def test_adk_llm_caller_runner_for_constructs_llm_agent_with_and_without_tools() -> (
+    None
+):
+    from agent import AdkLlmCaller
+    from tools import TOOLS
+
+    caller = AdkLlmCaller("gemini-3.6-flash", "format_playground")
+    plain_runner = caller._runner_for("stage1", "Return a decision block.")
+    assert plain_runner.agent.tools == []
+    assert plain_runner.agent.generate_content_config is not None
+    assert plain_runner.agent.generate_content_config.thinking_config is not None
+    assert (
+        plain_runner.agent.generate_content_config.thinking_config.thinking_budget
+        == 1000
+    )
+
+    tool_runner = caller._runner_for("tool_mode", "Call a tool.", tools=TOOLS)
+    assert len(tool_runner.agent.tools) == len(TOOLS)
+
+
+async def test_direct_tool_command_renders_without_llm_calls(
+    agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
+) -> None:
+    parts = await collect(agent, "/tool host", "s-direct-tool", version="1.0")
+    assert scripted_llm.calls == []
+    assert surface_ids(parts) == ["main", "turn-1-tool-footer"]
+    footer = status_text(parts)
+    assert "0 LLM calls" in footer
+
+    cached = await collect(agent, "/tool host", "s-direct-tool", version="1.0")
+    assert scripted_llm.calls == []
+    assert "cache hit" in status_text(cached)
+
+    missing = await collect(agent, "/tool", "s-direct-tool", version="1.0")
+    assert "Usage: `/tool <name>`" in status_text(missing)
+
+    unknown = await collect(agent, "/tool bogus", "s-direct-tool", version="1.0")
+    assert "Unknown tool `bogus`" in status_text(unknown)

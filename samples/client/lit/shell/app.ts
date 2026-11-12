@@ -24,6 +24,7 @@ import {repeat} from 'lit/directives/repeat.js';
 
 // A2UI
 import * as v0_9 from '@a2ui/web_core/v0_9';
+import {basicCatalog as v1BasicCatalog, injectBasicCatalogStyles} from '@a2ui/web_core/v1_0';
 import {basicCatalog, Context} from '@a2ui/lit/v0_9';
 import {renderMarkdown} from '@a2ui/markdown-it';
 
@@ -104,6 +105,10 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
         max-width: 100svw;
         padding: var(--bb-grid-size-3);
         animation: fadeIn 1s cubic-bezier(0, 0, 0.3, 1) 0.3s backwards;
+
+        &.instant {
+          animation: none;
+        }
       }
 
       form {
@@ -114,6 +119,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
         align-items: center;
         padding: 16px 0;
         animation: fadeIn 1s cubic-bezier(0, 0, 0.3, 1) 1s backwards;
+
+        &.compact {
+          animation: none;
+          padding: 16px 12px 8px;
+        }
 
         & h1 {
           color: light-dark(var(--p-40), var(--n-90));
@@ -171,6 +181,68 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
 
       .rotate {
         animation: rotate 1s linear infinite;
+      }
+
+      .pending-inline {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 6px 12px;
+        font-size: 13px;
+        opacity: 0.75;
+
+        & .spinner {
+          width: 16px;
+          height: 16px;
+          border-width: 2px;
+        }
+      }
+
+      .quick-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 0 12px 12px;
+
+        & .quick-actions-label {
+          font-size: 12px;
+          font-weight: 500;
+          opacity: 0.75;
+          margin-right: 4px;
+        }
+
+        & .quick-action-btn {
+          border: 1px solid var(--p-60);
+          background: light-dark(var(--n-100), var(--n-20));
+          color: light-dark(var(--p-40), var(--n-90));
+          border-radius: 999px;
+          padding: 6px 12px;
+          font-family: inherit;
+          font-size: 13px;
+          font-weight: 500;
+          transition:
+            background 0.15s ease,
+            transform 0.1s ease;
+
+          &:not([disabled]) {
+            cursor: pointer;
+
+            &:hover {
+              background: light-dark(rgba(81, 84, 179, 0.1), rgba(160, 163, 255, 0.18));
+            }
+
+            &:active {
+              transform: scale(0.98);
+            }
+          }
+
+          &[disabled] {
+            opacity: 0.5;
+          }
+        }
       }
 
       .pending {
@@ -512,8 +584,8 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   ];
 
   // Create a Message Processor that uses the catalogs.
-  private _processor = new v0_9.MessageProcessor(
-    [basicCatalog],
+  private _processor = new v0_9.MessageProcessor<any>(
+    [basicCatalog, v1BasicCatalog],
     async (action: v0_9.A2uiClientAction): Promise<any> => {
       console.debug('Handling action', action);
 
@@ -557,6 +629,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
 
   override connectedCallback() {
     super.connectedCallback();
+    injectBasicCatalogStyles();
 
     // Load config from URL
     const urlParams = new URLSearchParams(window.location.search);
@@ -601,6 +674,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
       this.#renderLocalModeHeader(),
       this.#renderThemeToggle(),
       this.#maybeRenderForm(),
+      this.#maybeRenderQuickActions(),
       this.#maybeRenderData(),
       this.#maybeRenderError(),
       this.#renderToast(),
@@ -645,8 +719,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   }
 
   #maybeRenderForm() {
-    if (this._requesting) return nothing;
-    if (this._lastMessages.length > 0) return nothing;
+    const clearsSurfaces = this.config.clearSurfacesOnResponse ?? true;
+    if (this._requesting && clearsSurfaces) return nothing;
+    if (this._lastMessages.length > 0 && clearsSurfaces) return nothing;
     if (this._isLocalMode) return nothing;
 
     if (this.config.key === 'local') {
@@ -697,22 +772,28 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
       `;
     }
 
+    const showHero = clearsSurfaces || this._lastMessages.length === 0;
     return html`<form
+      class=${showHero ? '' : 'compact'}
       @submit=${async (evt: Event) => {
         evt.preventDefault();
         if (!(evt.target instanceof HTMLFormElement)) {
           return;
         }
-        const data = new FormData(evt.target);
+        const formEl = evt.target;
+        const data = new FormData(formEl);
         const body = data.get('body') ?? null;
         if (!body) {
           return;
+        }
+        if (!clearsSurfaces) {
+          formEl.reset();
         }
         const message = body as any;
         await this.#sendAndProcessMessage(message);
       }}
     >
-      ${this.config.heroImage
+      ${showHero && this.config.heroImage
         ? html`<div
             style=${styleMap({
               '--background-image-light': `url(${this.config.heroImage})`,
@@ -723,11 +804,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
             id="hero-img"
           ></div>`
         : nothing}
-      <h1 class="app-title">${this.config.title}</h1>
+      ${showHero ? html`<h1 class="app-title">${this.config.title}</h1>` : nothing}
       <div>
         <input
           required
-          value="${this.config.placeholder}"
+          value=${clearsSurfaces ? this.config.placeholder : ''}
+          placeholder=${clearsSurfaces ? '' : this.config.placeholder}
           autocomplete="off"
           id="body"
           name="body"
@@ -739,6 +821,29 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
         </button>
       </div>
     </form>`;
+  }
+
+  #maybeRenderQuickActions() {
+    const actions = this.config.quickActions;
+    if (!actions?.length || this._isLocalMode) return nothing;
+    const clearsSurfaces = this.config.clearSurfacesOnResponse ?? true;
+    if (this._requesting && clearsSurfaces) return nothing;
+
+    return html`<div class="quick-actions" aria-label="Tool mode examples">
+      <span class="quick-actions-label">Tool mode (0 LLM calls):</span>
+      ${actions.map(
+        action =>
+          html`<button
+            type="button"
+            class="quick-action-btn"
+            title=${action.title ?? ''}
+            ?disabled=${this._requesting}
+            @click=${() => this.#sendAndProcessMessage(action.message)}
+          >
+            ${action.label}
+          </button>`,
+      )}
+    </div>`;
   }
 
   #startLoadingAnimation() {
@@ -765,7 +870,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
       // The catalogs that the processor renders, sent with every request.
       const response = this._a2uiClient.send(
         message,
-        this._processor.getRendererCapabilities({versions: ['v0.9']}),
+        this._processor.getRendererCapabilities({versions: ['v0.9', '1.0']}),
       );
       await response;
       this._requesting = false;
@@ -783,32 +888,41 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   }
 
   #maybeRenderData() {
-    if (this._requesting) {
-      const text = this.config.loadingText
-        ? this.config.loadingText[this._loadingTextIndex]
-        : 'Awaiting an answer...';
+    const clearsSurfaces = this.config.clearSurfacesOnResponse ?? true;
+    const surfaces = Array.from(this._processor.model.surfacesMap.entries());
+    const text = this.config.loadingText
+      ? this.config.loadingText[this._loadingTextIndex]
+      : 'Awaiting an answer...';
 
+    if (this._requesting && (clearsSurfaces || surfaces.length === 0)) {
       return html` <div class="pending">
         <div class="spinner"></div>
         <div class="loading-text">${text}</div>
       </div>`;
     }
 
-    const surfaces = Array.from(this._processor.model.surfacesMap.entries());
     if (surfaces.length === 0) {
       return nothing;
     }
     console.debug('Rendering surfaces', surfaces);
 
-    return html`<section id="surfaces">
-      ${repeat(
-        surfaces,
-        ([surfaceId]) => surfaceId,
-        ([, surface]) => {
-          return html`<a2ui-surface .surface=${surface}></a2ui-surface>`;
-        },
-      )}
-    </section>`;
+    return html`
+      ${this._requesting
+        ? html`<div class="pending-inline">
+            <div class="spinner"></div>
+            <span>${text}</span>
+          </div>`
+        : nothing}
+      <section id="surfaces" class=${clearsSurfaces ? '' : 'instant'}>
+        ${repeat(
+          surfaces,
+          ([surfaceId]) => surfaceId,
+          ([, surface]) => {
+            return html`<a2ui-surface .surface=${surface}></a2ui-surface>`;
+          },
+        )}
+      </section>
+    `;
   }
 
   async #sendAndProcessMessage(request) {
@@ -824,6 +938,29 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     if (this.config.clearSurfacesOnResponse ?? true) {
       for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
         this._processor.model.deleteSurface(surfaceId);
+      }
+    } else {
+      const deletedInBatch = new Set<string>();
+      for (const msg of messages) {
+        const deletedId = msg?.deleteSurface?.surfaceId;
+        if (typeof deletedId === 'string') {
+          deletedInBatch.add(deletedId);
+        }
+      }
+      for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
+        if (surfaceId.startsWith('turn-')) {
+          this._processor.model.deleteSurface(surfaceId);
+        }
+      }
+      for (const msg of messages) {
+        const createdId = msg?.createSurface?.surfaceId;
+        if (
+          typeof createdId === 'string' &&
+          !deletedInBatch.has(createdId) &&
+          this._processor.model.surfacesMap.has(createdId)
+        ) {
+          this._processor.model.deleteSurface(createdId);
+        }
       }
     }
 

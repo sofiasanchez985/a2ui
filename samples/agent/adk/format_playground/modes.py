@@ -101,8 +101,7 @@ class LlmCaller(Protocol):
         instruction: str,
         user_text: str,
         session_id: str | None,
-    ) -> LlmTurn:
-        ...
+    ) -> LlmTurn: ...
 
     async def call_with_tools(
         self,
@@ -112,8 +111,7 @@ class LlmCaller(Protocol):
         user_text: str,
         session_id: str | None,
         tools: Sequence[Any],
-    ) -> LlmToolTurn:
-        ...
+    ) -> LlmToolTurn: ...
 
 
 def format_decision_ms(ms: float) -> str:

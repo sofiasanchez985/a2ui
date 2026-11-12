@@ -52,7 +52,6 @@ from modes import (
     RenderMode,
     RenderResult,
     TurnMetrics,
-    as_mode,
     format_decision_ms,
     status_surface_id,
     surface_id_for,
@@ -70,7 +69,14 @@ from stage1 import (
     stage1_instruction,
     stage1_user_text,
 )
-from tools import TOOL_ACTIONS, TOOL_INTENTS, TOOL_MUTABLE_PATHS, TOOLS
+from tools import (
+    EXAMPLE_TOOL_NAMES,
+    TOOL_ACTIONS,
+    TOOL_INTENTS,
+    TOOL_MUTABLE_PATHS,
+    TOOLS,
+    run_example_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +84,7 @@ _STAGE1_KEY = "stage1"
 _MAX_SESSIONS = 100
 _VERSIONS = ("0.9", "1.0")
 _SUPPORTED_CONTENT_TYPES = ["text", "text/plain"]
+_DEFAULT_THINKING_BUDGET = 1000
 
 
 def default_model_name() -> str:
@@ -88,15 +95,29 @@ def default_model_name() -> str:
     return model_env.split("/")[-1]
 
 
+def default_thinking_budget() -> int:
+    """Maximum thinking tokens per ADK Gemini call (defaults to 1000)."""
+    raw = os.getenv("A2UI_PLAYGROUND_THINKING_BUDGET")
+    return int(raw) if raw is not None else _DEFAULT_THINKING_BUDGET
+
+
 class AdkLlmCaller:
     """`LlmCaller` over the ADK: one `LlmAgent` and `Runner` per instruction key."""
 
     def __init__(
-        self, model_name: str, app_name: str, user_id: str = "playground"
+        self,
+        model_name: str,
+        app_name: str,
+        user_id: str = "playground",
+        *,
+        thinking_budget: int | None = None,
     ) -> None:
         self._model_name = model_name
         self._app_name = app_name
         self._user_id = user_id
+        self._thinking_budget = (
+            default_thinking_budget() if thinking_budget is None else thinking_budget
+        )
         self._runners: dict[str, Runner] = {}
 
     def _runner_for(
@@ -118,7 +139,12 @@ class AdkLlmCaller:
                 ),
                 description="Format playground stage agent.",
                 instruction=instruction,
-                tools=list(tools) if tools else None,
+                tools=list(tools) if tools else [],
+                generate_content_config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=self._thinking_budget
+                    )
+                ),
             )
             runner = Runner(
                 app_name=self._app_name,
@@ -414,6 +440,10 @@ class PlaygroundAgent:
         settings: PlaygroundSettings,
         version: str,
     ) -> list[Part]:
+        if command.name == "tool":
+            return await self._render_direct_tool(
+                command.argument, session_id, settings, version
+            )
         new_settings, reply = apply_command(command, settings)
         self._remember(self._settings, session_id, new_settings)
         if command.name == "help":
@@ -422,7 +452,7 @@ class PlaygroundAgent:
             )
             if command.argument and command.argument.startswith("unknown:"):
                 lines.insert(
-                    0, f"Unknown command `{command.argument[len('unknown:'):]}`."
+                    0, f"Unknown command `{command.argument[len('unknown:') :]}`."
                 )
         elif command.name == "backend":
             lines = await self._switch_backend(command.argument)
@@ -437,6 +467,59 @@ class PlaygroundAgent:
         else:
             lines = [reply or ""]
         return self._status(lines, new_settings, version)
+
+    async def _render_direct_tool(
+        self,
+        argument: str | None,
+        session_id: str,
+        settings: PlaygroundSettings,
+        version: str,
+    ) -> list[Part]:
+        """Executes a specific example tool and renders its result with zero LLM calls."""
+        choices = ", ".join(EXAMPLE_TOOL_NAMES)
+        if not argument:
+            return self._status(
+                [f"Usage: `/tool <name>` (choose {choices})."], settings, version
+            )
+        next_settings = settings.next_turn()
+        invoked = run_example_tool(argument, next_settings.turn)
+        if invoked is None:
+            return self._status(
+                [f"Unknown tool `{argument}`; choose {choices}."], settings, version
+            )
+        tool_name, payload = invoked
+        surface_id = surface_id_for(next_settings, RenderMode.TOOL)
+        result = await self.renderers.render_tool_result(
+            TOOL_INTENTS[tool_name],
+            payload,
+            surface_id=surface_id,
+            version=version,
+            mutable_paths=TOOL_MUTABLE_PATHS.get(tool_name, ()),
+            actions=TOOL_ACTIONS.get(tool_name, ()),
+            conversation_id=session_id,
+        )
+        metrics = result.metrics or TurnMetrics(
+            mode=RenderMode.TOOL,
+            backend=self.renderers.backend_kind,
+            llm_calls=0,
+            latency_ms=0.0,
+        )
+        parts = list(result.parts)
+        footer_lines = [metrics.footer()]
+        if result.error:
+            footer_lines.append(f"Render failed: {result.error}")
+        parts.extend(
+            self._status(footer_lines, next_settings, version, suffix="tool-footer")
+        )
+        if result.trace_lines:
+            self._remember(self._last_trace, session_id, result.trace_lines)
+        self._remember(
+            self._last_turn,
+            session_id,
+            (f"/tool {tool_name}", [(RenderMode.TOOL, result, metrics)]),
+        )
+        self._remember(self._settings, session_id, next_settings)
+        return parts
 
     async def _switch_backend(self, argument: str | None) -> list[str]:
         if not argument:
@@ -558,11 +641,13 @@ class PlaygroundAgent:
                 session_id,
                 (
                     query,
-                    [(
-                        RenderMode.TOOL,
-                        RenderResult(parts=parts, metrics=metrics),
-                        metrics,
-                    )],
+                    [
+                        (
+                            RenderMode.TOOL,
+                            RenderResult(parts=parts, metrics=metrics),
+                            metrics,
+                        )
+                    ],
                 ),
             )
             return parts

@@ -54,12 +54,14 @@ class FakeLlmCaller:
         user_text: str,
         session_id: str | None,
     ) -> LlmTurn:
-        self.calls.append({
-            "instruction_key": instruction_key,
-            "instruction": instruction,
-            "user_text": user_text,
-            "session_id": session_id,
-        })
+        self.calls.append(
+            {
+                "instruction_key": instruction_key,
+                "instruction": instruction,
+                "user_text": user_text,
+                "session_id": session_id,
+            }
+        )
         queue = self.replies.get(instruction_key)
         text = queue.pop(0) if queue else self.default
         return LlmTurn(text=text, prompt_tokens=100, output_tokens=40, latency_ms=5.0)
@@ -73,13 +75,15 @@ class FakeLlmCaller:
         session_id: str | None,
         tools: Sequence[Any],
     ) -> LlmToolTurn:
-        self.calls.append({
-            "instruction_key": instruction_key,
-            "instruction": instruction,
-            "user_text": user_text,
-            "session_id": session_id,
-            "tools": tools,
-        })
+        self.calls.append(
+            {
+                "instruction_key": instruction_key,
+                "instruction": instruction,
+                "user_text": user_text,
+                "session_id": session_id,
+                "tools": tools,
+            }
+        )
         queue = self.tool_replies.get(instruction_key)
         if queue:
             return queue.pop(0)
@@ -143,6 +147,30 @@ SETTINGS_ANSWERS: dict[str, Any] = {
     "salience:/volume": 2.5,
     "salience:/subtitles": 2.1,
     "salience:/theme": 1.8,
+}
+
+ORDER_ANSWERS: dict[str, Any] = {
+    "family": ("inspect", 0.92),
+    "stakes": 0.8,
+    "urgency": 0.6,
+    "archetype:inspect": ("detail", 0.90),
+    "gate:facts": 0.92,
+    "gate:actions": 0.88,
+    "instance:actions.primary:buttons": ("track_shipment", 0.90),
+    "salience:/orderId": 2.8,
+    "salience:/status": 2.5,
+    "salience:/estimatedDelivery": 2.1,
+}
+
+RUNBOOK_ANSWERS: dict[str, Any] = {
+    "family": ("follow", 0.94),
+    "stakes": 1.2,
+    "urgency": 0.8,
+    "archetype:follow": ("guide", 0.92),
+    "gate:steps": 0.96,
+    "gate:facts": 0.75,
+    "salience:/steps": 2.9,
+    "salience:/service": 2.0,
 }
 
 
