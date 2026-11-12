@@ -442,6 +442,9 @@
             "headline_value",
             "headline_label",
             {
+              "$ifKnob": {
+                "deltas": ["yes"]
+              },
               "$if": "delta",
               "id": "headline_delta"
             },
@@ -653,6 +656,12 @@
                   },
                   "id": "item_icon"
                 },
+                {
+                  "$ifKnob": {
+                    "leading": ["number"]
+                  },
+                  "id": "item_number"
+                },
                 "item_col",
                 {
                   "$if": "meta",
@@ -696,6 +705,13 @@
               "name": {
                 "$slot": "icon",
                 "$default": "info"
+              }
+            },
+            {
+              "id": "item_number",
+              "component": "Text",
+              "text": {
+                "$text": "**{$index1}.**"
               }
             },
             {

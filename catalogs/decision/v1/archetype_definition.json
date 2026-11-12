@@ -35,8 +35,17 @@
     }
   },
   "$defs": {
-    "unitInterval": {"type": "number", "minimum": 0, "maximum": 1},
-    "identifier": {"type": "string", "pattern": "^[a-z_]+$"},
+    "unitInterval": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "A probability or score threshold in the closed interval [0, 1]."
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z_]+$",
+      "description": "A lowercase snake_case identifier for an archetype, family, block, or pattern."
+    },
     "blockMark": {
       "type": "string",
       "pattern": "^[a-z_]+[!?]?$",
@@ -44,10 +53,12 @@
     },
     "stringList": {
       "type": "array",
+      "description": "A list of strings.",
       "items": {"type": "string"}
     },
     "stringMap": {
       "type": "object",
+      "description": "A map of string keys to string values.",
       "additionalProperties": {"type": "string"}
     },
     "range": {
@@ -60,6 +71,7 @@
     },
     "thresholds": {
       "type": "object",
+      "description": "Probability thresholds governing family, archetype, block, instance, template, and action-gate selection.",
       "required": [
         "family",
         "archetype",
@@ -74,11 +86,26 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "family": {"$ref": "#/$defs/unitInterval"},
-        "archetype": {"$ref": "#/$defs/unitInterval"},
-        "expected": {"$ref": "#/$defs/unitInterval"},
-        "optional": {"$ref": "#/$defs/unitInterval"},
-        "instance": {"$ref": "#/$defs/unitInterval"},
+        "family": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum probability for a job family option to be selected."
+        },
+        "archetype": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum probability for an archetype within the chosen family to be selected."
+        },
+        "expected": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum gate probability for an unmarked (expected) block to be included."
+        },
+        "optional": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum gate probability for a `?`-marked (optional) block to be included."
+        },
+        "instance": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum probability for a per-element instance question answer."
+        },
         "template": {
           "$ref": "#/$defs/unitInterval",
           "description": "Minimum probability for the template question to render a registered template."
@@ -87,8 +114,14 @@
           "$ref": "#/$defs/unitInterval",
           "description": "Template threshold when the payload or the template is editable."
         },
-        "actionGateFloor": {"$ref": "#/$defs/unitInterval"},
-        "actionGateCap": {"$ref": "#/$defs/unitInterval"},
+        "actionGateFloor": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum archetype confidence required to enable interactive actions when stakes are 0."
+        },
+        "actionGateCap": {
+          "$ref": "#/$defs/unitInterval",
+          "description": "Minimum archetype confidence required to enable interactive actions when stakes reach the maximum level."
+        },
         "noFit": {
           "$ref": "#/$defs/unitInterval",
           "description": "Minimum probability of the job.family option `none` at which the planner gives up on archetypes and returns a no_fit outcome, so the caller falls back to free-form synthesis."
@@ -97,6 +130,7 @@
     },
     "job": {
       "type": "object",
+      "description": "Top-level surface questions that classify the user's job family, stakes, and urgency.",
       "required": ["family", "stakes", "urgency"],
       "additionalProperties": false,
       "properties": {
@@ -104,8 +138,14 @@
           "$ref": "#/$defs/choiceQuestion",
           "description": "Which kind of job the surface serves. Every option except `none` names the family of one or more archetypes. The option `none` has no archetypes: it lets the model say that no layout fits, and wins once its probability reaches thresholds.noFit."
         },
-        "stakes": {"$ref": "#/$defs/scoreQuestion"},
-        "urgency": {"$ref": "#/$defs/scoreQuestion"}
+        "stakes": {
+          "$ref": "#/$defs/scoreQuestion",
+          "description": "Score question measuring the cost or irreversibility of an error on this surface."
+        },
+        "urgency": {
+          "$ref": "#/$defs/scoreQuestion",
+          "description": "Score question measuring how quickly the person must act on the surface."
+        }
       }
     },
     "shapeFilter": {
@@ -128,6 +168,7 @@
     },
     "archetype": {
       "type": "object",
+      "description": "An ordered layout composition of blocks belonging to one job family.",
       "required": ["id", "family", "criteria", "blocks"],
       "additionalProperties": false,
       "properties": {
@@ -166,6 +207,7 @@
     },
     "questionBase": {
       "type": "object",
+      "description": "Common fields shared by choice, boolean, and score questions.",
       "required": ["kind", "question"],
       "properties": {
         "kind": {"enum": ["choice", "boolean", "score"]},
@@ -178,6 +220,7 @@
     "choiceQuestion": {
       "allOf": [{"$ref": "#/$defs/questionBase"}],
       "type": "object",
+      "description": "A multiple-choice question whose options come from a static map or a bound slot.",
       "additionalProperties": false,
       "properties": {
         "kind": {"const": "choice"},
@@ -200,6 +243,7 @@
     "booleanQuestion": {
       "allOf": [{"$ref": "#/$defs/questionBase"}],
       "type": "object",
+      "description": "A yes/no gate or anatomy question with explicit criteria for both outcomes.",
       "required": ["yes", "no"],
       "additionalProperties": false,
       "properties": {
@@ -215,6 +259,7 @@
     "scoreQuestion": {
       "allOf": [{"$ref": "#/$defs/questionBase"}],
       "type": "object",
+      "description": "An ordinal scale question evaluated as the expected level index across ordered criteria.",
       "required": ["levels"],
       "additionalProperties": false,
       "properties": {
@@ -241,6 +286,7 @@
       }
     },
     "question": {
+      "description": "Any decision question (choice, boolean, or score).",
       "oneOf": [
         {"$ref": "#/$defs/choiceQuestion"},
         {"$ref": "#/$defs/booleanQuestion"},
@@ -249,6 +295,7 @@
     },
     "slot": {
       "type": "object",
+      "description": "A data slot on a block or repeated element that binds to payload pointers matching semantic types.",
       "required": ["from"],
       "additionalProperties": false,
       "properties": {
@@ -277,6 +324,7 @@
     },
     "measure": {
       "type": "object",
+      "description": "A deterministic bucketed measure computed from payload metadata rather than asked of the model.",
       "required": ["derivedFrom", "levels"],
       "additionalProperties": false,
       "properties": {
@@ -291,6 +339,7 @@
     },
     "block": {
       "type": "object",
+      "description": "A reusable content block with its primary abstract pattern, gate, questions, slots, and fallback chain.",
       "required": ["id", "pattern", "fallback"],
       "additionalProperties": false,
       "properties": {
@@ -327,6 +376,7 @@
     },
     "rule": {
       "type": "object",
+      "description": "A named normative planning rule enforced by the layout planner and pattern expander.",
       "required": ["id", "rule"],
       "additionalProperties": false,
       "properties": {

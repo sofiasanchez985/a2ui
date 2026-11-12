@@ -7,20 +7,21 @@
 > goal yet.
 
 This directory holds the data files behind the layout stage of the decision
-inference format. The format uses a small decision model (a hosted decision
-service, a local decision server, or a logprob endpoint) to answer short questions about an
-intent and a data payload. The answers select a layout archetype, decide which
-blocks it shows, and bind payload pointers to the blocks' slots. The files here
-describe the archetypes and how each catalog draws them.
+inference format. The format uses a small decision model to answer short
+questions about an intent and a data payload. That model can be a hosted
+service, a local server, or a logprob endpoint. The answers select a layout
+archetype, decide which blocks it shows, and bind payload pointers to the
+blocks' slots.
 
-Two kinds of file take part:
+The files here describe the archetypes and how each catalog draws them. Two
+kinds of file take part:
 
 | File                          | Scope                                                                                                                                                          | Who authors it                           |
 | :---------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------- |
 | `decision/v1/archetypes.json` | Catalog-agnostic. One copy for the whole protocol, validated by `archetype_definition.json`.                                                                   | The A2UI team, with the decision format. |
 | `<catalog>/patterns.json`     | One per catalog, beside its `catalog.json`, validated by `decision/v1/pattern_definition.json`. The basic catalog's file is `catalogs/basic/v1/patterns.json`. | The catalog's maintainers.               |
 
-The grammar names abstract patterns (`page`, `banner`, `picture`, `headline`,
+The grammar defines abstract patterns (`page`, `banner`, `picture`, `headline`,
 `facts`, `prose`, `collection`, and so on). A pattern file says which real
 components of one catalog draw each abstract pattern. A catalog without a
 pattern file still works with the decision format. Before any question is
@@ -69,67 +70,77 @@ editable payloads) and the action gate bounds `actionGateFloor` and
 scores.
 
 `archetypes` are ordered lists of blocks for one family. A block entry carries a
-mark: `name!` is required and is always present, `name?` is optional and needs
-its gate to pass the `optional` threshold, and a bare `name` is expected and
-needs the `expected` threshold. An archetype may add a `shape` pre-filter, an
-`atLeast` count of blocks that must be present, and a `frame` hint for the page
-pattern (`dialog`, `stickyActions`).
+mark: `name!` is required, `name?` is optional (gated by `optional`), and a
+bare `name` is expected (gated by `expected`). An archetype may add a `shape`
+pre-filter and an `atLeast` block count. It may also add a `frame` hint for the
+page pattern (`dialog`, `stickyActions`).
 
-`blocks` describe each block once: the abstract `pattern` it draws, a `shape`
-pre-filter, a boolean `gate` question, an optional per-pointer `salience` score,
-`anatomy` questions (how the block is drawn), `instance` questions (asked per
-element with the payload value filled into the question text), computed
-`measures`, the `slots` the block binds, and a `fallback` chain of patterns to
-try when the catalog lacks the first. A fallback entry is a pattern name or a
-`pattern:variant` form such as `collection:cards`; the same `name:variant`
-spelling is used by `requires` entries such as `pattern:collection:grid`.
+`blocks` describe each block once. Each block defines the abstract `pattern` it
+draws, a `shape` pre-filter, a boolean `gate` question, and an optional
+per-pointer `salience` score. It also defines `anatomy` questions, per-element
+`instance` questions, computed `measures`, the `slots` the block binds, and a
+`fallback` chain of patterns.
+
+A fallback entry is a pattern name or a `pattern:variant` form such as
+`collection:cards`. The same `name:variant` syntax is used by `requires`
+entries such as `pattern:collection:grid`. When a block resolves to a fallback
+pattern (such as `chart` to `headline`), the planner adapts its slot bindings.
+It maps them to the slots of the target pattern and pins the target knob when a
+`:variant` suffix is present.
 
 `rules` and `lint` are prose. The rules describe behavior the planner applies
 (one primary action, the action gate, pointer-once-per-region, and so on). The
 lint list states what a loader checks before accepting a grammar.
 
-Question objects come in three kinds. A `choice` lists `options` (id to
-description) or takes them from a slot with `optionsFrom`, and gets an implicit
-"none" option unless `allowNone` is false. A `boolean` carries `yes` and `no`
-criteria texts. A `score` lists ordered `levels`, and the answer is the expected
-level index. `appliesWhen` asks the question only when a slot is bound or has a
-given type; `derivedWhen` answers it from key hints without asking; `requires`
-offers an option only when the named slots, knob options, `pattern:<name>:<variant>`
-capabilities, or the `actions_allowed` flag are available.
+Question objects come in three kinds. A `choice` lists `options` or takes them
+from a slot with `optionsFrom`, and adds an implicit "none" option unless
+`allowNone` is false. A `boolean` carries `yes` and `no` criteria texts. A
+`score` lists ordered `levels`, and the answer is the expected level index.
 
-Slots list the semantic types they accept in `from`, most preferred first, and
-may add `prefer` key hints, `avoidKeys`, `sibling` keys to look for beside the
-bound pointer, `repeat` with `max` and `orderBy` for lists, `mutable`, and nested
-`fields` for repeated elements.
+Questions also support gating and derivation rules. `appliesWhen` asks the
+question only when a slot is bound or has a given type, while `derivedWhen`
+answers it from key hints without asking. `requires` offers an option only when
+the named slots, knob options, `pattern:<name>:<variant>` capabilities, or the
+`actions_allowed` flag are available.
+
+Slots list the semantic types they accept in `from`, most preferred first. They
+may also add `prefer` key hints, `avoidKeys`, and `sibling` keys beside the
+bound pointer. List slots can declare `repeat` (with `max` and `orderBy`),
+`mutable`, and nested `fields` for repeated elements.
 
 ## `patterns.json`
 
-Each pattern names its `slots`, its `knobs` (the anatomy answers it varies by,
-with their allowed values), and either one `root` plus `components` list or a
-list of `variants`, each with a `when` clause over the knobs and its own `root`
-and `components`. A variant without `when` is the default. `fieldVariants` holds
-id-less component templates picked per element by `$byInstance`.
+Each pattern names its `slots` and its `knobs` (the anatomy answers it varies
+by, with their allowed values). It then provides either one `root` plus a
+`components` list, or a list of `variants` with a `when` clause over the knobs.
+A variant without `when` is the default.
+
+`fieldVariants` holds id-less component templates picked per element by
+`$byInstance`. A `fieldVariant` may be a single inline component template or
+include inline id-less child objects inside `child` or `children`. The expander
+recursively hoists inline children into the flat surface component list with
+generated ids.
 
 Component templates are ordinary component objects for the catalog, plus
 directives whose keys start with `$`:
 
-| Directive        | Value                              | Meaning                                                                                                                                        |
-| :--------------- | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
-| `$slot`          | slot name                          | A data binding to the pointer bound to that slot. Relative inside `$repeat`. `$default` beside it supplies a literal when the slot is unbound. |
-| `$text`          | literal with `{slot}` placeholders | A formatted string. When a placeholder is bound the expander emits a `formatString` call; `{$index1}` is the 1-based element index.            |
-| `$default`       | any JSON                           | The value used when the `$slot` or `$knobValue` beside it resolves to nothing.                                                                 |
-| `$if`            | slot name                          | Emit the component only when the slot is bound.                                                                                                |
-| `$ifKnob`        | `{knob: [values]}`                 | Emit the component only when every named knob has one of the listed values.                                                                    |
-| `$ifSelf`        | `{"true": ..., "false": ...}`      | Pick a value by whether the element's author equals the `self` knob.                                                                           |
-| `$ifInstance`    | `{answer: value}`                  | Emit the enclosing property only when the element's instance answers match.                                                                    |
-| `$byType`        | slot name                          | The sibling key equal to the slot's semantic type names the child id to emit.                                                                  |
-| `$byInstance`    | instance answer name               | Pick a `fieldVariants` entry (or a sibling key) by the element's answer.                                                                       |
-| `$repeat`        | repeated slot name                 | Turn `children` into a template child list bound to the slot's array; the sibling `component` names the template.                              |
-| `$map`           | knob or answer name                | The sibling key equal to its value is the literal to emit.                                                                                     |
-| `$event`         | action slot                        | An action `{"event": {"name": ...}}` named by the agent's action id bound to the slot, else by `$default`. Labels never become event names.    |
-| `$blocks`        | `true`                             | In the page pattern, where the block roots go, in archetype order.                                                                             |
-| `$knobValue`     | `knob.property`                    | A value looked up in the plan, with `$default` when absent.                                                                                    |
-| `$actionContext` | `true`                             | Inside `context`: the action's own context pointers, else the current item's key inside `$repeat`, else every editable pointer of a form.      |
+| Directive        | Value                              | Meaning                                                                                                                                                              |
+| :--------------- | :--------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$slot`          | slot name                          | A data binding to the pointer bound to that slot. Relative inside `$repeat`. `$default` beside it supplies a literal when the slot is unbound.                       |
+| `$text`          | literal with `{slot}` placeholders | A formatted string. When a placeholder is bound the expander emits a `formatString` call; `{$index1}` is the 1-based element index.                                  |
+| `$default`       | any JSON                           | The value used when the `$slot`, `$knobValue`, or `$event` beside it resolves to nothing.                                                                            |
+| `$if`            | slot name                          | Emit the component (or child reference identified by sibling `id`) only when the slot is bound.                                                                      |
+| `$ifKnob`        | `{knob: [values]}`                 | Emit the component (or child reference identified by sibling `id`) only when every named knob has one of the listed values.                                          |
+| `$ifSelf`        | `{"true": ..., "false": ...}`      | Pick a value (or child id) by whether the element's author equals the `self` knob.                                                                                   |
+| `$ifInstance`    | `{answer: value}`                  | Emit the enclosing property (taking the value of the sibling `value` key when wrapped as `{"$ifInstance": {...}, "value": ...}`) only when instance answers match.    |
+| `$byType`        | slot name                          | The sibling key equal to the slot's semantic type names the child id to emit.                                                                                        |
+| `$byInstance`    | instance answer name               | Pick a `fieldVariants` entry (or a sibling key) by the element's answer.                                                                                             |
+| `$repeat`        | repeated slot name                 | Turn `children` into a template child list bound to the slot's array; sibling `component` names the template and optional sibling `order` (`"primaryLast"`) orders it. |
+| `$map`           | knob or answer name                | The sibling key equal to its value is the literal to emit.                                                                                                           |
+| `$event`         | action slot                        | An action `{"event": {"name": ...}}` named by the agent's action id bound to the slot, else by `$default`. Labels never become event names.                          |
+| `$blocks`        | `true`                             | In the page pattern, where the block roots go, in archetype order.                                                                                                   |
+| `$knobValue`     | `knob.property`                    | A value looked up in the plan, with `$default` when absent.                                                                                                          |
+| `$actionContext` | `true`                             | Inside `context`: the action's own context pointers, else the current item's key inside `$repeat`, else every editable pointer of a form.                            |
 
 Component ids in a pattern are local. The expander prefixes them with the block
 id so a pattern can appear more than once on a surface. Headings use Markdown
@@ -138,7 +149,7 @@ id so a pattern can appear more than once on a surface. Headings use Markdown
 
 ## How an SDK uses these files
 
-An installed package cannot read this repository, so each SDK bundles a copy of
+An installed package cannot read this repository. Each SDK bundles a copy of
 the grammar, the two schemas, and the pattern files for the catalogs it ships.
 The Python SDK copies them into
 `python/a2ui_agent/src/a2ui/inference_formats/decision/assets/` at build time
@@ -152,7 +163,7 @@ validates each `patterns.json` against `pattern_definition.json`. A grammar or
 pattern file that fails is rejected rather than used in part.
 
 To add a pattern file for another catalog, create `patterns.json` beside that
-catalog's `catalog.json`, set `catalogId` to the catalog's id and
-`grammarVersion` to the grammar's version, implement the
-patterns the catalog can draw with its own components, and leave out the rest.
-Archetypes that need a missing pattern are not offered for that catalog.
+catalog's `catalog.json`. Set `catalogId` to the catalog's id and
+`grammarVersion` to the grammar's version. Implement the patterns the catalog
+can draw with its own components, and leave out the rest. Archetypes that need
+a missing pattern are not offered for that catalog.
