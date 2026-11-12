@@ -53,10 +53,12 @@ from modes import PlaygroundSettings, RenderMode
     ],
 )
 def test_parse_command(text: str, expected: Command | None) -> None:
+    """Verifies `parse_command` across known slash commands, unknown commands, and prose."""
     assert parse_command(text) == expected
 
 
 def test_apply_command_transitions() -> None:
+    """Verifies `apply_command` state transitions for `/mode`, `/compare`, `/trace`, and `/help`."""
     settings = PlaygroundSettings()
     changed, reply = apply_command(Command("mode", "express"), settings)
     assert changed.mode is RenderMode.EXPRESS and reply == "Mode set to `express`."
@@ -76,6 +78,7 @@ def test_apply_command_transitions() -> None:
 
 
 def test_help_text_names_every_mode_backend_and_model() -> None:
+    """Verifies `help_text` includes every `RenderMode`, the backend label, and the model name."""
     lines = help_text(PlaygroundSettings(mode=RenderMode.DIRECT), "mock", "gemini-x")
     joined = "\n".join(lines)
     for mode in RenderMode:
@@ -85,6 +88,7 @@ def test_help_text_names_every_mode_backend_and_model() -> None:
 
 
 def test_classify_data_part_shapes() -> None:
+    """Verifies `classify_data_part` across streaming flags, v0.9/v1.0 actions, and payloads."""
     assert classify_data_part({"useStreaming": False}) == ("streaming", False)
     for ver in ("v0.9", "v0.9.1", "1.0"):
         act = {"version": ver, "action": {"name": "submit", "context": {"a": 1}}}
@@ -97,6 +101,7 @@ def test_classify_data_part_shapes() -> None:
 
 
 def test_build_query_prefers_actions_then_payloads_then_text() -> None:
+    """Verifies `build_query` prioritizes UI actions over JSON data parts and plain text."""
     text = Part(root=TextPart(text="Show this"))
     action = Part(
         root=DataPart(data={"userAction": {"name": "submit", "context": {"x": 1}}})

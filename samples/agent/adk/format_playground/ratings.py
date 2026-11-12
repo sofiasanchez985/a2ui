@@ -30,7 +30,17 @@ RATINGS_PATH = Path(__file__).parent / "logs" / "ratings.jsonl"
 
 @dataclass(frozen=True)
 class RatingRecord:
-    """A record capturing a user preference between playground render modes."""
+    """A record capturing a user preference between playground render modes.
+
+    Attributes:
+        session_id: Conversation identifier where the vote was cast.
+        request: Original user query or tool command for the rated turn.
+        winner: Winning render mode name (`"decision"`, `"express"`,
+            `"direct"`, or `"tool"`).
+        comment: Optional free-form feedback comment.
+        timestamp: ISO-8601 UTC timestamp when the rating was created.
+        candidates: Per-mode summary dictionaries from the rated turn.
+    """
 
     session_id: str
     request: str
@@ -42,10 +52,23 @@ class RatingRecord:
     candidates: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serializes this rating record to a JSON-compatible dictionary.
+
+        Returns:
+            A dictionary containing all fields of this `RatingRecord`.
+        """
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RatingRecord:
+        """Constructs a `RatingRecord` from a decoded JSON dictionary.
+
+        Args:
+            data: Dictionary read from a ratings JSONL line.
+
+        Returns:
+            The reconstructed `RatingRecord`.
+        """
         return cls(
             session_id=str(data.get("session_id", "")),
             request=str(data.get("request", "")),
@@ -57,7 +80,12 @@ class RatingRecord:
 
 
 def append_rating(path: str | Path, record: RatingRecord) -> None:
-    """Appends a rating record to a JSONL file, creating parent directories if needed."""
+    """Appends a rating record to a JSONL file, creating parent directories if needed.
+
+    Args:
+        path: Destination JSONL file path.
+        record: The `RatingRecord` to append.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
@@ -65,7 +93,14 @@ def append_rating(path: str | Path, record: RatingRecord) -> None:
 
 
 def summarize_ratings(path: str | Path) -> dict[str, int]:
-    """Reads a ratings JSONL file and summarizes win counts per mode."""
+    """Reads a ratings JSONL file and summarizes win counts per mode.
+
+    Args:
+        path: Source JSONL file path.
+
+    Returns:
+        A dictionary mapping lowercase mode names to their total win counts.
+    """
     p = Path(path)
     if not p.is_file():
         return {}

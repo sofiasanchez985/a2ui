@@ -41,10 +41,26 @@ STAGE1_BLOCK = (
 
 
 def messages_of(parts: list[Part]) -> list[dict[str, Any]]:
+    """Extracts dictionary payloads from all `DataPart` entries in `parts`.
+
+    Args:
+        parts: List of A2A message parts.
+
+    Returns:
+        List of dictionary payloads.
+    """
     return [p.root.data for p in parts if isinstance(p.root, DataPart)]
 
 
 def surface_ids(parts: list[Part]) -> list[str]:
+    """Collects `surfaceId` values from all `createSurface` messages in `parts`.
+
+    Args:
+        parts: List of A2A message parts.
+
+    Returns:
+        Ordered list of created surface identifiers.
+    """
     ids: list[str] = []
     for msg in messages_of(parts):
         create = msg.get("createSurface")
@@ -54,7 +70,14 @@ def surface_ids(parts: list[Part]) -> list[str]:
 
 
 def _component_text(comp: dict[str, Any]) -> str | None:
-    """The `text` of a `Text` component in either the v0.9 or v1.0 shape."""
+    """Extracts the `text` string from a `Text` component in either v0.9 or v1.0 shape.
+
+    Args:
+        comp: Component dictionary from a surface message.
+
+    Returns:
+        The literal text string, or `None` if not a `Text` component.
+    """
     kind = comp.get("component")
     props = kind.get("Text") if isinstance(kind, dict) else comp
     text = props.get("text") if isinstance(props, dict) else None
@@ -62,7 +85,14 @@ def _component_text(comp: dict[str, Any]) -> str | None:
 
 
 def _components_of(msg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Components carried by a `createSurface` (v1.0) or `updateComponents` message."""
+    """Returns components carried by a `createSurface` or `updateComponents` message.
+
+    Args:
+        msg: Single A2UI wire message dictionary.
+
+    Returns:
+        List of component dictionaries found in the message.
+    """
     found: list[dict[str, Any]] = []
     for key in ("createSurface", "updateComponents"):
         body = msg.get(key)
@@ -72,7 +102,14 @@ def _components_of(msg: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def status_text(parts: list[Part]) -> str:
-    """Joins every `Text` literal in the parts, in order."""
+    """Joins every `Text` literal across `parts` with newlines.
+
+    Args:
+        parts: List of A2A message parts.
+
+    Returns:
+        Newline-joined text content from all `Text` components.
+    """
     texts = [
         text
         for msg in messages_of(parts)
@@ -90,6 +127,18 @@ async def collect(
     *,
     inspector_enabled: bool = False,
 ) -> list[Part]:
+    """Runs a single turn of `agent.stream` and returns the completed task parts.
+
+    Args:
+        agent: The `PlaygroundAgent` under test.
+        query: User query or slash command.
+        session: Session identifier.
+        version: Negotiated A2UI protocol version, or `None` for text-only.
+        inspector_enabled: Whether the split-screen inspector metadata flag is active.
+
+    Returns:
+        The list of A2A `Part` entries emitted for the completed turn.
+    """
     items = [
         item
         async for item in agent.stream(
@@ -101,6 +150,14 @@ async def collect(
 
 
 def trace_parts_of(parts: list[Part]) -> list[dict[str, Any]]:
+    """Extracts in-band playground trace payloads from `parts`.
+
+    Args:
+        parts: List of A2A message parts.
+
+    Returns:
+        List of playground trace dictionaries matching `PLAYGROUND_TRACE_MIME_TYPE`.
+    """
     return [
         p.root.data
         for p in parts
@@ -111,6 +168,14 @@ def trace_parts_of(parts: list[Part]) -> list[dict[str, Any]]:
 
 @pytest.fixture
 def agent(scripted_llm: FakeLlmCaller) -> PlaygroundAgent:
+    """Builds a `PlaygroundAgent` wired to `scripted_llm` and `DeterministicMockBackend`.
+
+    Args:
+        scripted_llm: Scripted `FakeLlmCaller` fixture.
+
+    Returns:
+        A configured `PlaygroundAgent` instance.
+    """
     renderers = Renderers(versions=["0.9", "1.0"], backend=DeterministicMockBackend())
     return PlaygroundAgent(
         "http://localhost:10010",
@@ -121,6 +186,7 @@ def agent(scripted_llm: FakeLlmCaller) -> PlaygroundAgent:
 
 
 async def test_agent_card_advertises_both_versions(agent: PlaygroundAgent) -> None:
+    """Verifies that `agent_card` advertises both v0.9 and v1.0 A2UI extensions."""
     uris = [e.uri for e in agent.agent_card.capabilities.extensions or []]
     assert len(uris) == 2
     assert agent.agent_card.skills[0].id == "render_ui"
@@ -129,6 +195,7 @@ async def test_agent_card_advertises_both_versions(agent: PlaygroundAgent) -> No
 async def test_help_mode_and_trace_before_any_render(
     agent: PlaygroundAgent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Verifies `/help`, `/mode`, `/backend`, and `/trace` commands before any render turn."""
     help_parts = await collect(agent, "/help", "s1")
     assert surface_ids(help_parts) == ["turn-0-status"]
     text = status_text(help_parts)
@@ -160,6 +227,7 @@ async def test_help_mode_and_trace_before_any_render(
 async def test_decision_turn_renders_surface_footer_and_trace(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies a decision turn renders `main`, a footer surface, and populates `/trace`."""
     scripted_llm.script("stage1", STAGE1_BLOCK)
     parts = await collect(agent, "I want to see the resort", "s2", "1.0")
     ids = surface_ids(parts)
@@ -179,6 +247,7 @@ async def test_decision_turn_renders_surface_footer_and_trace(
 async def test_decision_mode_needs_a_v10_client(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that decision mode returns a v1.0-only error card for v0.9 clients."""
     scripted_llm.script("stage1", STAGE1_BLOCK)
     parts = await collect(agent, "I want to see the resort", "s2-v09", "0.9")
     assert surface_ids(parts) == ["turn-1-decision-footer"]
@@ -188,6 +257,7 @@ async def test_decision_mode_needs_a_v10_client(
 async def test_second_turn_updates_the_main_surface_in_place(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies `main` surface reuse across `PlanCache` hit and shape-change turns."""
     different_shape_block = (
         "<a2ui>"
         + json.dumps(
@@ -229,6 +299,7 @@ async def test_second_turn_updates_the_main_surface_in_place(
 async def test_express_turn_uses_fresh_stage2_session(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that Express mode runs Stage 2 in a stateless (`session_id=None`) LLM call."""
     await collect(agent, "/mode express", "s3")
     scripted_llm.script("stage1", STAGE1_BLOCK)
     scripted_llm.script("express:0.9", EXPRESS_OK.replace("turn-1", "turn-1"))
@@ -243,6 +314,7 @@ async def test_express_turn_uses_fresh_stage2_session(
 async def test_compare_renders_three_surfaces_and_resets(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies `/compare` renders decision, express, and direct surfaces and resets afterwards."""
     await collect(agent, "/compare", "s4", "1.0")
     scripted_llm.script("stage1", STAGE1_BLOCK, STAGE1_BLOCK)
     scripted_llm.script("express:1.0", EXPRESS_OK.replace("turn-1", "turn-1-express"))
@@ -273,6 +345,7 @@ async def test_compare_renders_three_surfaces_and_resets(
 async def test_prose_from_stage1_and_stage2_failures_never_raise(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that Stage 1 and Stage 2 extraction failures emit status surfaces cleanly."""
     scripted_llm.script("stage1", "I would show a card with the resort name.")
     prose = await collect(agent, "show the resort", "s5")
     assert surface_ids(prose) == ["turn-1-status"]
@@ -290,6 +363,7 @@ async def test_prose_from_stage1_and_stage2_failures_never_raise(
 async def test_ui_action_text_goes_through_stage1(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that UI action queries are routed through Stage 1 without JSON pinning."""
     scripted_llm.script("stage1", STAGE1_BLOCK)
     action_text = "User interacted with the UI: action `submit` with context {}."
     parts = await collect(agent, action_text, "s6", "1.0")
@@ -302,6 +376,7 @@ async def test_ui_action_text_goes_through_stage1(
 async def test_default_mode_starts_new_session_in_configured_mode(
     scripted_llm: FakeLlmCaller,
 ) -> None:
+    """Verifies that `PlaygroundAgent(default_mode=...)` initializes new sessions in that mode."""
     renderers = Renderers(versions=["0.9"], backend=DeterministicMockBackend())
     express_agent = PlaygroundAgent(
         "http://localhost:10010",
@@ -317,6 +392,7 @@ async def test_default_mode_starts_new_session_in_configured_mode(
 async def test_tool_mode_renders_surface_with_tool_result(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that `tool` mode calls a Python tool and synthesizes the result via decision model."""
     await collect(agent, "/mode tool", "s-tool-1")
     scripted_llm.script_tool(
         "tool_mode",
@@ -340,6 +416,7 @@ async def test_tool_mode_renders_surface_with_tool_result(
 async def test_tool_mode_plain_text_reply_when_no_tool_called(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that `tool` mode renders a status card when the LLM replies without calling a tool."""
     await collect(agent, "/mode tool", "s-tool-2")
     scripted_llm.script_tool(
         "tool_mode",
@@ -364,6 +441,7 @@ async def test_rate_command_records_preference_and_summarizes(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verifies `/rate` validation, JSONL persistence, and `/ratings` tally output."""
     ratings_file = tmp_path / "ratings.jsonl"
     monkeypatch.setattr("agent.RATINGS_PATH", ratings_file)
 
@@ -397,6 +475,7 @@ async def test_rate_command_records_preference_and_summarizes(
 
 
 async def test_action_events_route_by_id_with_context() -> None:
+    """Verifies that v1.0 action events are classified and formatted with their context payload."""
     from agent_executor import action_query, build_query, classify_data_part
 
     event = {
@@ -422,6 +501,7 @@ async def test_action_events_route_by_id_with_context() -> None:
 async def test_set_backend_awaits_old_factory_aclose_and_skips_non_str_part_text() -> (
     None
 ):
+    """Verifies `set_backend` closes the old factory and event text helpers skip non-string parts."""
     from types import SimpleNamespace
     from agent import _append_part_texts, _collect_tool_event_parts
 
@@ -458,6 +538,7 @@ async def test_set_backend_awaits_old_factory_aclose_and_skips_non_str_part_text
 async def test_adk_llm_caller_runner_for_constructs_llm_agent_with_and_without_tools() -> (
     None
 ):
+    """Verifies `AdkLlmCaller._runner_for` configures `LlmAgent` tools and thinking budget."""
     from agent import AdkLlmCaller
     from tools import TOOLS
 
@@ -478,6 +559,7 @@ async def test_adk_llm_caller_runner_for_constructs_llm_agent_with_and_without_t
 async def test_direct_tool_command_renders_without_llm_calls(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies `/tool <name>` renders with 0 LLM calls and clears pending `/compare` state."""
     parts = await collect(agent, "/tool host", "s-direct-tool", version="1.0")
     assert scripted_llm.calls == []
     assert surface_ids(parts) == ["main", "turn-1-tool-footer"]
@@ -494,10 +576,24 @@ async def test_direct_tool_command_renders_without_llm_calls(
     unknown = await collect(agent, "/tool bogus", "s-direct-tool", version="1.0")
     assert "Unknown tool `bogus`" in status_text(unknown)
 
+    # Running /compare followed by /tool <name> resets compare=False and targets 'main' (M1).
+    await collect(agent, "/compare", "s-direct-compare", version="1.0")
+    after_compare = await collect(
+        agent,
+        "/tool resort",
+        "s-direct-compare",
+        version="1.0",
+        inspector_enabled=True,
+    )
+    assert surface_ids(after_compare) == ["main"]
+    assert trace_parts_of(after_compare)[0]["compare"] is False
+    assert agent._settings["s-direct-compare"].compare is False
+
 
 async def test_inspector_enabled_omits_footers_and_attaches_trace_part(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that `inspector_enabled=True` omits footer surfaces and attaches a trace part."""
     scripted_llm.script("stage1", STAGE1_BLOCK)
     parts = await collect(
         agent,
@@ -525,6 +621,7 @@ async def test_inspector_enabled_omits_footers_and_attaches_trace_part(
 async def test_inspector_enabled_classifies_pasted_json_vs_ui_action(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that Stage 1 source distinguishes `pasted_json` queries from UI actions."""
     scripted_llm.script("stage1", STAGE1_BLOCK, STAGE1_BLOCK)
     pasted_query = 'Use this JSON:\n```json\n{"host": "prod-1", "cpu": 0.5}\n```'
     pasted_parts = await collect(
@@ -544,6 +641,7 @@ async def test_inspector_enabled_classifies_pasted_json_vs_ui_action(
 async def test_inspector_enabled_direct_tool_and_plan_cache_hit(
     agent: PlaygroundAgent,
 ) -> None:
+    """Verifies that `/tool` turns emit `direct_tool` traces and record `PlanCache` hits."""
     first = await collect(
         agent, "/tool host", "s-insp-tool", "1.0", inspector_enabled=True
     )
@@ -567,6 +665,7 @@ async def test_inspector_enabled_direct_tool_and_plan_cache_hit(
 async def test_inspector_enabled_tool_mode_with_and_without_tool_call(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies `tool` mode trace payloads when the LLM either abstains or calls a tool."""
     await collect(agent, "/mode tool", "s-insp-tm", "1.0", inspector_enabled=True)
 
     # No-tool prose reply omits turn-N-tool-footer and emits a trace part with candidates=[].
@@ -617,6 +716,7 @@ async def test_inspector_enabled_tool_mode_with_and_without_tool_call(
 async def test_inspector_enabled_compare_and_slash_commands_and_error_fallbacks(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies `/compare` traces, slash-command status cards, and failure fallback cards."""
     # Slash commands emit turn-N-status with zero trace parts even when inspector_enabled=True.
     for cmd in ("/help", "/trace", "/ratings", "/compare"):
         cmd_parts = await collect(
@@ -672,6 +772,7 @@ async def test_inspector_enabled_compare_and_slash_commands_and_error_fallbacks(
 async def test_executor_forwards_inspector_metadata_to_agent_stream(
     agent: PlaygroundAgent, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that `PlaygroundAgentExecutor.execute` forwards `a2uiPlaygroundInspector` metadata."""
     from types import SimpleNamespace
     from a2a.server.events import EventQueue
     from a2a.types import Message, Role

@@ -16,6 +16,9 @@
 
 import {AppConfig} from './types.js';
 
+/**
+ * Shell configuration for the A2UI Format Playground (`?app=playground`).
+ */
 export const playgroundConfig: AppConfig = {
   key: 'playground',
   title: 'A2UI Format Playground',

@@ -30,6 +30,13 @@ class FakeLlmCaller:
 
     A key with no scripted replies falls back to the `default` reply so a test
     can script only the stage it cares about.
+
+    Attributes:
+        replies: Queued text replies keyed by `instruction_key`.
+        default: Default reply text returned when a queue is empty.
+        tool_replies: Queued `LlmToolTurn` replies keyed by `instruction_key`.
+        default_tool_turn: Default `LlmToolTurn` returned when a tool queue is empty.
+        calls: Recorded call dictionaries in invocation order.
     """
 
     replies: dict[str, list[str]] = field(default_factory=dict)
@@ -41,9 +48,21 @@ class FakeLlmCaller:
     calls: list[dict[str, object]] = field(default_factory=list)
 
     def script(self, instruction_key: str, *texts: str) -> None:
+        """Queues one or more text replies for `instruction_key`.
+
+        Args:
+            instruction_key: Runner cache key (`stage1`, `express:1.0`, etc.).
+            *texts: Ordered reply strings to pop on subsequent calls.
+        """
         self.replies.setdefault(instruction_key, []).extend(texts)
 
     def script_tool(self, instruction_key: str, *turns: LlmToolTurn) -> None:
+        """Queues one or more `LlmToolTurn` replies for `instruction_key`.
+
+        Args:
+            instruction_key: Runner cache key (typically `tool_mode`).
+            *turns: Ordered `LlmToolTurn` results to pop on subsequent tool calls.
+        """
         self.tool_replies.setdefault(instruction_key, []).extend(turns)
 
     async def __call__(
@@ -54,6 +73,17 @@ class FakeLlmCaller:
         user_text: str,
         session_id: str | None,
     ) -> LlmTurn:
+        """Records the call and pops the next scripted `LlmTurn` for `instruction_key`.
+
+        Args:
+            instruction_key: Runner cache key.
+            instruction: System instruction string.
+            user_text: User message text.
+            session_id: Optional conversation session identifier.
+
+        Returns:
+            A synthetic `LlmTurn` with the next scripted reply text.
+        """
         self.calls.append(
             {
                 "instruction_key": instruction_key,
@@ -75,6 +105,18 @@ class FakeLlmCaller:
         session_id: str | None,
         tools: Sequence[Any],
     ) -> LlmToolTurn:
+        """Records the tool-enabled call and pops the next scripted `LlmToolTurn`.
+
+        Args:
+            instruction_key: Runner cache key.
+            instruction: System instruction string.
+            user_text: User message text.
+            session_id: Optional conversation session identifier.
+            tools: Sequence of Python tool callables.
+
+        Returns:
+            The next scripted `LlmToolTurn` or `default_tool_turn`.
+        """
         self.calls.append(
             {
                 "instruction_key": instruction_key,
@@ -90,6 +132,14 @@ class FakeLlmCaller:
         return self.default_tool_turn
 
     def calls_for(self, instruction_key: str) -> list[dict[str, object]]:
+        """Filters recorded calls to those matching `instruction_key`.
+
+        Args:
+            instruction_key: Runner cache key to filter by.
+
+        Returns:
+            List of recorded call dictionaries for `instruction_key`.
+        """
         return [c for c in self.calls if c["instruction_key"] == instruction_key]
 
 
@@ -175,5 +225,12 @@ RUNBOOK_ANSWERS: dict[str, Any] = {
 
 
 def scripted_backend(answers: dict[str, Any]) -> DeterministicMockBackend:
-    """Builds a DeterministicMockBackend with scripted question answers."""
+    """Builds a `DeterministicMockBackend` with scripted question answers.
+
+    Args:
+        answers: Mapping of question IDs to scripted winners or probability weights.
+
+    Returns:
+        A `DeterministicMockBackend` configured with `answers`.
+    """
     return DeterministicMockBackend(scripted_answers=answers)

@@ -51,6 +51,7 @@ HOST_BLOCK = DecisionBlock(
 
 
 async def test_sanitize_endpoint_url_strips_userinfo_query_and_fragment() -> None:
+    """Verifies `sanitize_endpoint_url` strips credentials, query strings, and fragments."""
     raw = (
         "https://user:super_secret@jev.example.com:8443/v1beta/decisions"
         "?key=AIzaSySecretKey123&alt=json#frag"
@@ -70,6 +71,7 @@ async def test_sanitize_endpoint_url_strips_userinfo_query_and_fragment() -> Non
 async def test_format_wire_request_matches_jev_http_backend_for_gemini_decisions_and_systemone() -> (
     None
 ):
+    """Verifies `format_wire_request` matches `JevHttpBackend` wire payloads across formats."""
     renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
     synthesizer = renderers.synthesizer_or_none("1.0")
     assert synthesizer is not None
@@ -147,6 +149,7 @@ async def test_format_wire_request_matches_jev_http_backend_for_gemini_decisions
 async def test_build_turn_trace_marks_pruned_questions_and_excludes_synthetic_fit_score() -> (
     None
 ):
+    """Verifies `build_turn_trace` marks pruned questions and excludes synthetic `fit_score` rows."""
     renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
     result = await renderers.render_decision(
         RESORT_BLOCK, surface_id="main", version="1.0", conversation_id="conv-1"
@@ -215,6 +218,7 @@ async def test_build_turn_trace_marks_pruned_questions_and_excludes_synthetic_fi
 async def test_build_turn_trace_handles_list_payload_exclude_and_labels_cache_key_parity() -> (
     None
 ):
+    """Verifies list payload normalization and `exclude`/`labels` cache key parity."""
     renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
     synthesizer = renderers.synthesizer_or_none("1.0")
     assert synthesizer is not None
@@ -290,6 +294,7 @@ async def test_build_turn_trace_handles_list_payload_exclude_and_labels_cache_ke
 async def test_build_turn_trace_plan_cache_hit_and_region_update_and_two_stage() -> (
     None
 ):
+    """Verifies `PlanCache` hit traces, region-update batches, and two-stage decision batches."""
     renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
     synthesizer = renderers.synthesizer_or_none("1.0")
     assert synthesizer is not None
@@ -410,6 +415,7 @@ async def test_build_turn_trace_plan_cache_hit_and_region_update_and_two_stage()
 
 
 async def test_build_turn_trace_express_candidate_populates_llm_stage2() -> None:
+    """Verifies that Express mode candidates populate `llmStage2` and omit decision stages."""
     metrics = TurnMetrics(
         mode=RenderMode.EXPRESS,
         backend="llm",
@@ -451,3 +457,86 @@ async def test_build_turn_trace_express_candidate_populates_llm_stage2() -> None
         cand["llmStage2"]["rawReply"] == "<a2ui-express>surface turn-1</a2ui-express>"
     )
     assert cand["wireOutput"]["decompiledExpress"] == "surface turn-1"
+
+
+async def test_build_turn_trace_abstention_marks_unreached_questions_pruned() -> None:
+    """Verifies that abstention turns (`layout_plan is None`) mark unreached questions as pruned."""
+    # Force an early family abstention so output.layout_plan is None while output.trace is non-empty (M2).
+    abstain_backend = DeterministicMockBackend(
+        scripted={"family": {"browse": 0.05, "monitor": 0.05}}
+    )
+    abstain_renderers = Renderers(versions=["1.0"], backend=abstain_backend)
+    synthesizer = abstain_renderers.synthesizer_or_none("1.0")
+    assert synthesizer is not None
+
+    res = await abstain_renderers.render_decision(
+        RESORT_BLOCK, surface_id="main", version="1.0"
+    )
+    assert res.ok and res.output is not None and res.metrics is not None
+    assert res.output.layout_plan is None
+
+    trace = build_turn_trace(
+        turn=1,
+        query="abstain resort",
+        compare=False,
+        active_mode=RenderMode.DECISION,
+        stage1_source="llm",
+        model_name="fake-model",
+        stage1_turn=None,
+        tool_name=None,
+        tool_args=None,
+        block=RESORT_BLOCK,
+        stage1_error=None,
+        candidates=[(RenderMode.DECISION, "main", res, res.metrics)],
+        synthesizer=synthesizer,
+    )
+    cand = trace["candidates"][0]
+    d_in = cand["decisionInput"]
+    d_out = cand["decisionOutput"]
+    assert d_in is not None and d_out is not None
+    assert d_out["layoutPlan"] is None
+    assert any(q["pruned"] for q in d_in["questions"])
+    assert any(not q["pruned"] for q in d_in["questions"])
+    assert any(r["pruned"] for r in d_out["records"])
+
+
+async def test_build_turn_trace_empty_payload_returns_zero_questions_when_no_archetype_eligible() -> (
+    None
+):
+    """Verifies that `_build_planner_batch` returns an empty batch when no archetype is eligible."""
+    renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
+    synthesizer = renderers.synthesizer_or_none("1.0")
+    assert synthesizer is not None
+
+    # Excluding the only field leaves 0 pointers and 0 eligible archetypes (L1).
+    empty_after_exclude = DecisionBlock.from_mapping(
+        {
+            "intent": "Show empty payload",
+            "payload": {"internal_only": "secret"},
+            "exclude": ["/internal_only"],
+            "fallbackDsl": 'surface("main")\nroot = Column([Text("Empty")])',
+        }
+    )
+    res = await renderers.render_decision(
+        empty_after_exclude, surface_id="main", version="1.0"
+    )
+    assert res.ok and res.metrics is not None
+    trace = build_turn_trace(
+        turn=1,
+        query="empty payload",
+        compare=False,
+        active_mode=RenderMode.DECISION,
+        stage1_source="llm",
+        model_name="fake-model",
+        stage1_turn=None,
+        tool_name=None,
+        tool_args=None,
+        block=empty_after_exclude,
+        stage1_error=None,
+        candidates=[(RenderMode.DECISION, "main", res, res.metrics)],
+        synthesizer=synthesizer,
+    )
+    d_in = trace["candidates"][0]["decisionInput"]
+    assert d_in is not None
+    assert d_in["questionCount"] == 0
+    assert d_in["questions"] == []

@@ -47,11 +47,15 @@ DataPartKind = Literal["streaming", "action", "payload"]
 
 
 def classify_data_part(data: Any) -> tuple[DataPartKind, Any]:
-    """Classifies one `DataPart` payload.
+    """Classifies one incoming A2A `DataPart` payload.
 
-    Returns ``("streaming", bool)`` for the `useStreaming` flag,
-    ``("action", mapping)`` for a v0.9 `action` or a `userAction` payload, and
-    ``("payload", data)`` for anything else (a pasted JSON object).
+    Args:
+        data: Decoded JSON value carried inside `DataPart.data`.
+
+    Returns:
+        A `(kind, value)` pair: `("streaming", bool)` for the `useStreaming`
+        flag, `("action", mapping)` for a v0.9/v1.0 `action` or a `userAction`
+        payload, and `("payload", data)` for any other JSON payload.
     """
     if not isinstance(data, Mapping):
         return "payload", data
@@ -69,11 +73,18 @@ def classify_data_part(data: Any) -> tuple[DataPartKind, Any]:
 
 
 def action_query(action: Mapping[str, Any]) -> str:
-    """The stage-1 text for a UI action, routed by its action id.
+    """Formats the stage-1 user message for a client UI action event.
 
-    The event name is the action id the decision block declared, and its
-    context carries the values the action bound (form fields, the item id).
-    The surface id lets stage 1 update the same surface.
+    The event name is the action identifier declared on the decision block, and
+    its context carries bound values such as form fields or item identifiers.
+    Including the surface identifier allows stage 1 to update the same surface.
+
+    Args:
+        action: Action dictionary containing `name`, `context`, and optional
+            `surfaceId`.
+
+    Returns:
+        A formatted stage-1 prompt describing the user interaction.
     """
     action_id = action.get("name", "unknown")
     context = action.get("context", {})
@@ -87,14 +98,30 @@ def action_query(action: Mapping[str, Any]) -> str:
 
 
 def payload_query(data: Any, text: str) -> str:
-    """The stage-1 text for a pasted JSON payload, prefixed by any typed text."""
+    """Formats the stage-1 prompt for a pasted JSON payload.
+
+    Args:
+        data: Parsed JSON payload value from a `DataPart`.
+        text: Optional user text accompanying the payload.
+
+    Returns:
+        A stage-1 prompt pinning `data` as the verbatim payload.
+    """
     encoded = json.dumps(data, indent=2)
     prefix = f"{text}\n\n" if text else ""
     return f"{prefix}Use this JSON verbatim as the payload:\n```json\n{encoded}\n```"
 
 
 def build_query(parts: list[Any]) -> str:
-    """Builds the agent query from the message parts, text first."""
+    """Builds the stage-1 query string from incoming A2A message parts.
+
+    Args:
+        parts: List of A2A `Part` wrappers from the user message.
+
+    Returns:
+        The resolved query string, prioritizing UI action parts, then JSON
+        payload parts, and finally plain text parts.
+    """
     text = " ".join(
         p.root.text for p in parts if isinstance(p.root, TextPart) and p.root.text
     ).strip()
@@ -110,19 +137,38 @@ def build_query(parts: list[Any]) -> str:
 
 
 def _is_inspector_enabled(context: RequestContext) -> bool:
-    """Returns whether the incoming A2A message requested the playground inspector."""
+    """Returns whether the incoming A2A message requested the playground inspector.
+
+    Args:
+        context: A2A request context for the active turn.
+
+    Returns:
+        `True` if `a2uiPlaygroundInspector` is truthy in message metadata.
+    """
     if context.message is None:
         return False
     return bool((context.message.metadata or {}).get("a2uiPlaygroundInspector"))
 
 
 class PlaygroundAgentExecutor(AgentExecutor):
-    """Routes A2A requests to `PlaygroundAgent.stream`."""
+    """Routes A2A execution requests to `PlaygroundAgent.stream`."""
 
     def __init__(self, agent: PlaygroundAgent) -> None:
+        """Initializes the executor with a configured `PlaygroundAgent`.
+
+        Args:
+            agent: The playground agent instance that handles turns.
+        """
         self._agent = agent
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        """Executes one A2A message turn and publishes status updates.
+
+        Args:
+            context: Incoming A2A request context containing message parts and
+                client extension metadata.
+            event_queue: Event queue receiving task creation and status updates.
+        """
         active_ui_version = try_activate_a2ui_extension(context, self._agent.agent_card)
         parts = list(context.message.parts) if context.message else []
         query = build_query(parts) or context.get_user_input()
@@ -162,4 +208,13 @@ class PlaygroundAgentExecutor(AgentExecutor):
     async def cancel(
         self, request: RequestContext, event_queue: EventQueue
     ) -> Task | None:
+        """Rejects task cancellation requests as unsupported.
+
+        Args:
+            request: Incoming cancellation request context.
+            event_queue: Event queue for task updates.
+
+        Raises:
+            ServerError: Always raised with `UnsupportedOperationError`.
+        """
         raise ServerError(error=UnsupportedOperationError())

@@ -47,4 +47,9 @@ from fakes import FakeLlmCaller  # noqa: E402  (needs the sys.path change above)
 
 @pytest.fixture
 def scripted_llm() -> FakeLlmCaller:
+    """Provides a fresh `FakeLlmCaller` test double for each test function.
+
+    Returns:
+        An empty `FakeLlmCaller` instance.
+    """
     return FakeLlmCaller()

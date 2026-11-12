@@ -22,6 +22,7 @@ from ratings import RatingRecord, append_rating, summarize_ratings
 
 
 def test_append_and_summarize_ratings(tmp_path: Path) -> None:
+    """Verifies `append_rating` creates parent directories and `summarize_ratings` tallies votes."""
     ratings_file = tmp_path / "logs" / "ratings.jsonl"
     assert summarize_ratings(ratings_file) == {}
 
@@ -53,6 +54,7 @@ def test_append_and_summarize_ratings(tmp_path: Path) -> None:
 
 
 def test_corrupt_lines_ignored(tmp_path: Path) -> None:
+    """Verifies `summarize_ratings` skips blank, malformed JSON, and missing-winner lines."""
     ratings_file = tmp_path / "corrupt.jsonl"
     ratings_file.write_text(
         '{"winner": "decision"}\n'
@@ -68,6 +70,7 @@ def test_corrupt_lines_ignored(tmp_path: Path) -> None:
 
 
 def test_rating_record_dict_roundtrip() -> None:
+    """Verifies `RatingRecord.to_dict` and `RatingRecord.from_dict` round-trip all fields."""
     rec = RatingRecord(
         session_id="sess-42",
         request="Query text",

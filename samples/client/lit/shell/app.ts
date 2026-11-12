@@ -42,8 +42,13 @@ const configs: Record<string, AppConfig> = {
 
 type MarkdownRendererFn = (value: string, options?: any) => Promise<string>;
 
+/**
+ * Shell application element hosting A2UI demo apps, local JSON mockups,
+ * and the Format Playground split-screen pipeline inspector.
+ */
 @customElement('a2ui-shell')
 export class A2UILayoutEditor extends SignalWatcher(LitElement) {
+  /** Markdown renderer callback provided via Lit context to child A2UI components. */
   @provide({context: Context.markdown})
   markdownRenderer: MarkdownRendererFn = (value: string, options?: any) => {
     return Promise.resolve(renderMarkdown(value, options));
@@ -55,6 +60,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   @state()
   private _lastMessages: any[] = [];
 
+  /** Active shell application configuration selected via the `?app=` URL query parameter. */
   @state()
   config: AppConfig = restaurantConfig;
 
@@ -689,12 +695,21 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
 
   private _error: string | undefined;
 
+  /**
+   * Renders an application-level error banner when `_error` is set.
+   *
+   * @return The error banner template, or `nothing`.
+   */
   #maybeRenderError() {
     if (!this._error) return nothing;
 
     return html`<div class="app-error">${this._error}</div>`;
   }
 
+  /**
+   * Initializes catalog styles, resolves the app configuration from the URL,
+   * adopts app-specific CSS overrides, and creates the A2UI client.
+   */
   override connectedCallback() {
     super.connectedCallback();
     injectBasicCatalogStyles();
@@ -729,6 +744,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     this._a2uiClient = new A2UIClient(this.config.serverUrl);
   }
 
+  /**
+   * Synchronizes host layout classes and attributes with the inspector state after each update.
+   */
   protected override updated() {
     const inspectorEnabled = this.#isInspectorEnabled();
     this.classList.toggle('inspector-layout', inspectorEnabled);
@@ -737,14 +755,25 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     this.toggleAttribute('inspector-collapsed', inspectorEnabled && !this._inspectorOpen);
   }
 
+  /**
+   * Checks whether the split-screen pipeline inspector is active for the current app.
+   *
+   * @return `true` when the active config enables the inspector and local mode is off.
+   */
   #isInspectorEnabled(): boolean {
     return Boolean(this.config.inspector) && !this._isLocalMode;
   }
 
+  /**
+   * Toggles the visibility of the split-screen inspector drawer.
+   */
   #toggleInspector = () => {
     this._inspectorOpen = !this._inspectorOpen;
   };
 
+  /**
+   * Resets the A2A conversation session, clears all active surfaces, and resets the trace.
+   */
   #resetSession = () => {
     this._a2uiClient.resetSession();
     for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
@@ -754,6 +783,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     this._trace = null;
   };
 
+  /**
+   * Flushes any queued snackbar messages once the shell DOM is first rendered.
+   */
   protected override firstUpdated() {
     if (this._pendingSnackbarMessages.length > 0) {
       for (const {message, replaceAll} of this._pendingSnackbarMessages) {
@@ -763,6 +795,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     }
   }
 
+  /**
+   * Renders the shell layout, including the optional split-screen pipeline inspector.
+   *
+   * @return The shell template array.
+   */
   override render() {
     if (this.#isInspectorEnabled()) {
       return [
@@ -802,6 +839,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     ];
   }
 
+  /**
+   * Renders the floating button to re-open the pipeline inspector when collapsed.
+   *
+   * @return The toggle button template, or `nothing` when the inspector is open.
+   */
   #renderInspectorToggle() {
     if (this._inspectorOpen) {
       return nothing;
@@ -818,6 +860,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     </button>`;
   }
 
+  /**
+   * Renders the banner indicating that a local JSON mockup file is currently loaded.
+   *
+   * @return The local mode header template, or `nothing` when not in local mode.
+   */
   #renderLocalModeHeader() {
     if (!this._isLocalMode) return nothing;
 
@@ -833,6 +880,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     `;
   }
 
+  /**
+   * Renders the light/dark color-scheme toggle button.
+   *
+   * @return The theme toggle button template.
+   */
   #renderThemeToggle() {
     return html` <div>
       <button
@@ -854,6 +906,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     </div>`;
   }
 
+  /**
+   * Renders the prompt input form or the local JSON upload section when applicable.
+   *
+   * @return The form template, or `nothing` when hidden.
+   */
   #maybeRenderForm() {
     const clearsSurfaces = this.config.clearSurfacesOnResponse ?? true;
     if ((this._requesting || this._lastMessages.length > 0) && clearsSurfaces) {
@@ -889,6 +946,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     </form>`;
   }
 
+  /**
+   * Determines whether the hero banner and full title should be shown above the prompt input.
+   *
+   * @param clearsSurfaces Whether the active app clears surfaces on every response.
+   * @return `true` when the hero header should be displayed.
+   */
   #shouldShowHero(clearsSurfaces: boolean): boolean {
     if (clearsSurfaces) return true;
     return (
@@ -898,6 +961,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     );
   }
 
+  /**
+   * Renders the themed hero image block when enabled and configured.
+   *
+   * @param showHero Whether the hero block should be visible.
+   * @return The hero element template, or `nothing`.
+   */
   #maybeRenderHero(showHero: boolean) {
     if (!showHero || !this.config.heroImage) return nothing;
     return html`<div
@@ -909,6 +978,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     ></div>`;
   }
 
+  /**
+   * Handles prompt form submission and dispatches the user message to the A2UI server.
+   *
+   * @param evt The form submit event.
+   * @param clearsSurfaces Whether the active app clears surfaces on each turn.
+   */
   async #onFormSubmit(evt: Event, clearsSurfaces: boolean) {
     evt.preventDefault();
     if (!(evt.target instanceof HTMLFormElement)) return;
@@ -921,6 +996,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     await this.#sendAndProcessMessage(body as any);
   }
 
+  /**
+   * Renders the local file upload and built-in sample selector for the local mockup mode.
+   *
+   * @return The local upload section template.
+   */
   #renderLocalUploadSection() {
     return html`
       <div class="local-header-section">
@@ -967,6 +1047,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     `;
   }
 
+  /**
+   * Renders the quick-action pill buttons configured for the active app.
+   *
+   * @return The quick actions bar template, or `nothing`.
+   */
   #maybeRenderQuickActions() {
     const actions = this.config.quickActions;
     if (!actions?.length || this._isLocalMode) return nothing;
@@ -990,6 +1075,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     </div>`;
   }
 
+  /**
+   * Starts cycling through `config.loadingText` entries while a request is pending.
+   */
   #startLoadingAnimation() {
     const loadingText = this.config.loadingText;
     if (loadingText && loadingText.length > 1) {
@@ -1000,6 +1088,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     }
   }
 
+  /**
+   * Stops the loading text rotation timer if one is active.
+   */
   #stopLoadingAnimation() {
     if (this._loadingInterval) {
       clearInterval(this._loadingInterval);
@@ -1007,6 +1098,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     }
   }
 
+  /**
+   * Sends a single turn message to the A2UI backend while managing loading state.
+   *
+   * @param message User text or client action object to send.
+   * @return The turn result containing A2UI wire messages and optional inspector trace.
+   */
   async #sendMessage(message: any): Promise<A2UIClientTurnResult> {
     try {
       this._requesting = true;
@@ -1032,6 +1129,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     return {messages: [], trace: null, contextId: null};
   }
 
+  /**
+   * Renders the active A2UI surfaces and loading spinner.
+   *
+   * @return The surface container template, or `nothing` when no surfaces exist.
+   */
   #maybeRenderData() {
     const clearsSurfaces = this.config.clearSurfacesOnResponse ?? true;
     const surfaces = Array.from(this._processor.model.surfacesMap.entries());
@@ -1070,6 +1172,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     `;
   }
 
+  /**
+   * Sends a turn request, updates the inspector trace, prunes superseded surfaces,
+   * and feeds the incoming wire messages into the A2UI message processor.
+   *
+   * @param request User prompt string or client action payload.
+   */
   async #sendAndProcessMessage(request) {
     const result = await this.#sendMessage(request);
     const messages = result.messages as any[];
@@ -1089,12 +1197,40 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     this._processor.processMessages(messages);
   }
 
+  /**
+   * Deletes all surfaces currently stored in the message processor model.
+   */
   #deleteAllSurfaces() {
     for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
       this._processor.model.deleteSurface(surfaceId);
     }
   }
 
+  /**
+   * Checks whether any message in a batch creates a turn-scoped render surface.
+   *
+   * @param messages Incoming A2UI wire message batch.
+   * @return `true` if a `turn-*` render surface (not `-status`, `-footer`, or `-compare`) is created.
+   */
+  #createsTurnRenderSurface(messages: any[]): boolean {
+    return messages.some(msg => {
+      const id = msg?.createSurface?.surfaceId;
+      return (
+        typeof id === 'string' &&
+        id.startsWith('turn-') &&
+        !id.endsWith('-status') &&
+        !id.endsWith('-footer') &&
+        !id.endsWith('-compare')
+      );
+    });
+  }
+
+  /**
+   * Prunes previous turn-scoped surfaces, stale `'main'` surfaces when switching
+   * to turn-scoped render surfaces, and re-created surfaces before applying a batch.
+   *
+   * @param messages Incoming A2UI wire message batch.
+   */
   #pruneTurnSurfacesBeforeBatch(messages: any[]) {
     const deletedInBatch = new Set<string>();
     for (const msg of messages) {
@@ -1102,6 +1238,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
       if (typeof deletedId === 'string') {
         deletedInBatch.add(deletedId);
       }
+    }
+    if (this.#createsTurnRenderSurface(messages) && this._processor.model.surfacesMap.has('main')) {
+      this._processor.model.deleteSurface('main');
     }
     for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
       if (surfaceId.startsWith('turn-')) {
@@ -1120,6 +1259,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     }
   }
 
+  /**
+   * Opens the hidden file input dialog for local JSON mockup uploads.
+   */
   #triggerFileUpload() {
     const fileInput = this.shadowRoot?.getElementById('local-file-input') as HTMLInputElement;
     if (fileInput) {
@@ -1127,6 +1269,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     }
   }
 
+  /**
+   * Reads and processes an uploaded local A2UI JSON mockup file.
+   *
+   * @param evt File input change event.
+   */
   #onLocalFileChange(evt: Event) {
     const fileInput = evt.target as HTMLInputElement;
     const file = fileInput.files?.[0];
@@ -1163,6 +1310,9 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     fileInput.value = '';
   }
 
+  /**
+   * Exits local mockup mode and clears all loaded surfaces.
+   */
   #clearLocalFile() {
     this._isLocalMode = false;
     this._localFileName = '';
@@ -1173,6 +1323,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     this.showToast('Local mockup cleared.', 'info');
   }
 
+  /**
+   * Fetches and renders a built-in JSON sample file in local mockup mode.
+   *
+   * @param filename File name under `/samples/` to fetch.
+   */
   async #loadBuiltinSample(filename: string) {
     try {
       this._localFileName = filename;
@@ -1202,6 +1357,11 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     }
   }
 
+  /**
+   * Renders the transient toast notification banner when `_toastMessage` is non-empty.
+   *
+   * @return The toast element template, or `nothing`.
+   */
   #renderToast() {
     if (!this._toastMessage) return nothing;
 
@@ -1215,6 +1375,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     `;
   }
 
+  /**
+   * Displays a transient toast notification at the bottom of the viewport.
+   *
+   * @param msg Notification text to display.
+   * @param type Visual style variant (`info` or `error`).
+   */
   showToast(msg: string, type = 'info') {
     if (this._toastTimeout) {
       window.clearTimeout(this._toastTimeout);

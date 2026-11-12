@@ -41,18 +41,30 @@ _KNOWN: tuple[CommandName, ...] = (
 
 @dataclass(frozen=True)
 class Command:
-    """A parsed slash command."""
+    """A parsed slash command from the user input bar.
+
+    Attributes:
+        name: Canonical command name.
+        argument: First word after the command name, lowercased. For `/help`,
+            holds an `unknown:<text>` marker when the command is unrecognized.
+        text: Remainder of the command line after `argument`, or `None`.
+    """
 
     name: CommandName
     argument: str | None = None
-    """The first word after the command, lowercased; for `/help`, an `unknown:<text>`
-    marker when the user typed a command that does not exist."""
     text: str | None = None
-    """The remainder of the command line after the argument, if any."""
 
 
 def parse_command(text: str) -> Command | None:
-    """Parses `/mode express`, `/compare`, `/trace`, `/rate`, `/ratings`, or `/help`."""
+    """Parses a slash command such as `/mode express`, `/compare`, or `/help`.
+
+    Args:
+        text: Raw user input string.
+
+    Returns:
+        A `Command` instance when `text` starts with `/`, or `None` for normal
+        render requests.
+    """
     stripped = text.strip()
     if not stripped.startswith("/"):
         return None
@@ -70,10 +82,15 @@ def parse_command(text: str) -> Command | None:
 def apply_command(
     cmd: Command, settings: PlaygroundSettings
 ) -> tuple[PlaygroundSettings, str | None]:
-    """Applies `cmd` to `settings`.
+    """Applies a parsed `Command` to conversation `settings`.
 
-    Returns the new settings and a reply, or `None` as the reply for `/help`
-    and `/trace`, which the agent answers itself.
+    Args:
+        cmd: Parsed slash command to apply.
+        settings: Current conversation settings.
+
+    Returns:
+        A `(new_settings, reply)` pair. `reply` is `None` for commands such as
+        `/help` and `/trace` that the agent answers using its own state.
     """
     if cmd.name == "mode":
         mode = as_mode(cmd.argument) if cmd.argument else None
@@ -91,7 +108,16 @@ def apply_command(
 def help_text(
     settings: PlaygroundSettings, backend_name: str, model_name: str
 ) -> list[str]:
-    """The `/help` reply, one entry per line."""
+    """Builds the `/help` status card lines.
+
+    Args:
+        settings: Active conversation settings.
+        backend_name: Display name of the active decision backend.
+        model_name: Name of the stage-1 language model.
+
+    Returns:
+        A list of Markdown lines describing active settings and commands.
+    """
     return [
         "**Format playground**",
         "Describe an interface and it is rendered through the active mode.",

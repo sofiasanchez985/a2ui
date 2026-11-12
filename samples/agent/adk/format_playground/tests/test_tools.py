@@ -51,6 +51,7 @@ from .fakes import (
 
 
 def test_all_tools_have_intents_and_mutable_paths() -> None:
+    """Verifies every tool in `TOOLS` is registered in `TOOL_INTENTS`, `TOOL_MUTABLE_PATHS`, and `TOOL_ACTIONS`."""
     assert len(TOOLS) == 6
     for tool in TOOLS:
         name = getattr(tool, "__name__", "")
@@ -61,6 +62,7 @@ def test_all_tools_have_intents_and_mutable_paths() -> None:
 
 
 def test_tool_direct_calls() -> None:
+    """Verifies direct invocation of all 6 sample tools and `run_example_tool` alias rotation."""
     assert "cpu" in get_host_health("host-01")
     assert "resorts" in get_resort("vail")
     assert "fee" in get_transfer_quote(100.0, "hotel")
@@ -94,6 +96,7 @@ def test_tool_direct_calls() -> None:
     ],
 )
 async def test_tool_result_synthesizes_to_archetype(tool_fn, kwargs, answers) -> None:
+    """Verifies each sample tool output synthesizes to `SynthesisStage.ARCHETYPE`."""
     catalog = BasicCatalog("1.0")
     graph = CatalogDecisionGraph([catalog])
     synthesizer = DecisionSynthesizer(

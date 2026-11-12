@@ -35,10 +35,19 @@ _BLOCK = {
 
 
 def _wrap(body: str) -> str:
+    """Wraps a JSON string body in `<a2ui>...</a2ui>` tags.
+
+    Args:
+        body: Inner JSON string.
+
+    Returns:
+        The tagged `<a2ui>` block string.
+    """
     return f"<a2ui>{body}</a2ui>"
 
 
 def test_extract_block_reads_a_well_formed_block() -> None:
+    """Verifies `extract_block` parses a standard `<a2ui>` block embedded in prose."""
     block = extract_block("Sure!\n" + _wrap(json.dumps(_BLOCK)) + "\nDone.")
     assert block is not None
     assert block.intent == "Show the resort overview"
@@ -49,6 +58,7 @@ def test_extract_block_reads_a_well_formed_block() -> None:
 def test_extract_block_accepts_a_list_wrapper_tolerant_json_and_tags_in_strings() -> (
     None
 ):
+    """Verifies `extract_block` handles list wrappers, trailing commas, and literal tags in strings."""
     listed = extract_block(
         _wrap(json.dumps([_BLOCK, {"intent": "second", "payload": {}}]))
     )
@@ -65,6 +75,7 @@ def test_extract_block_accepts_a_list_wrapper_tolerant_json_and_tags_in_strings(
 
 
 def test_extract_block_returns_none_for_prose_or_invalid_blocks() -> None:
+    """Verifies `extract_block` returns `None` when tags or required fields are missing."""
     assert extract_block("I would show a card with the resort name.") is None
     assert extract_block(_wrap("not json at all")) is None
     assert extract_block(_wrap(json.dumps({"payload": {"a": 1}}))) is None
@@ -74,6 +85,7 @@ def test_extract_block_returns_none_for_prose_or_invalid_blocks() -> None:
 def test_extract_pasted_json_finds_objects_and_arrays_and_ignores_prose_braces() -> (
     None
 ):
+    """Verifies `extract_pasted_json` locates embedded JSON objects/arrays and skips prose braces."""
     assert extract_pasted_json('Show this: {"a": 1, "b": [1, 2]}') == {
         "a": 1,
         "b": [1, 2],
@@ -85,6 +97,7 @@ def test_extract_pasted_json_finds_objects_and_arrays_and_ignores_prose_braces()
 
 
 def test_stage1_user_text_pins_pasted_json_only_when_present() -> None:
+    """Verifies `stage1_user_text` appends the verbatim JSON instruction only for pasted JSON."""
     plain = stage1_user_text("Give me an address entry form")
     assert plain == "Give me an address entry form"
     pinned = stage1_user_text('Render {"name": "Casa Verde"}')
@@ -97,6 +110,7 @@ def test_stage1_user_text_pins_pasted_json_only_when_present() -> None:
 
 
 def test_stage1_instruction_lists_every_brief_role() -> None:
+    """Verifies `stage1_instruction` includes `STAGE1_PREAMBLE` and all grammar brief roles."""
     grammar = ArchetypeGrammar.default()
     instruction = stage1_instruction(grammar)
     assert instruction.startswith(STAGE1_PREAMBLE)

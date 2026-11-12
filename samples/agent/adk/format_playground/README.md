@@ -91,7 +91,7 @@ four-stage collapsible waterfall:
 
 1. `1. Block Input` shows how the `DecisionBlock` was produced (Stage 1 LLM call,
    direct `/tool` command, tool call, or pasted JSON) along with its `intent`,
-   `payload`, `mutablePaths`, and `actions`.
+   `surfaceId`, `operation`, `layout`, `mutablePaths`, `actions`, and `payload`.
 2. `2. Decision Input` (collapsed initially) shows the backend, model id,
    `PlanCache` hit status, `shapeSignature`, decision context JSON, and
    planner question batch (with pruned questions and `Raw Wire JSON`).

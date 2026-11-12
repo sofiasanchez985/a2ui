@@ -47,6 +47,7 @@ from a2ui.inference_formats.decision import (
     QuestionKind,
     SynthesisOutput,
     coerce_decision_payload,
+    eligible_archetypes,
     inspect_payload_pointers,
 )
 from modes import LlmTurn, RenderMode, RenderResult, TurnMetrics
@@ -59,7 +60,15 @@ Stage1Source = Literal["llm", "direct_tool", "tool_call", "pasted_json"]
 
 
 def sanitize_endpoint_url(url: str | None) -> str | None:
-    """Retains only `scheme://hostname[:port]/path`, stripping credentials, queries, and fragments."""
+    """Strips credentials, query parameters, and fragments from `url`.
+
+    Args:
+        url: Raw endpoint URL string, or `None`.
+
+    Returns:
+        The sanitized `scheme://hostname[:port]/path` string, or `None` if
+        `url` is empty or invalid.
+    """
     if not isinstance(url, str) or not url.strip():
         return None
     parts = urllib.parse.urlsplit(url.strip())
@@ -77,7 +86,14 @@ def sanitize_endpoint_url(url: str | None) -> str | None:
 def resolve_wire_format(
     backend: DecisionBackend,
 ) -> Literal["gemini_decisions", "systemone", "jev", "in_process"]:
-    """Derives the wire format from public `DecisionBackend` attributes."""
+    """Derives the inspector wire format identifier from `backend`.
+
+    Args:
+        backend: Active `DecisionBackend` instance.
+
+    Returns:
+        One of `"gemini_decisions"`, `"systemone"`, `"jev"`, or `"in_process"`.
+    """
     endpoint_url = getattr(backend, "endpoint_url", None)
     if isinstance(endpoint_url, str) and endpoint_url.strip():
         path = urllib.parse.urlsplit(endpoint_url.strip()).path.rstrip("/")
@@ -98,7 +114,16 @@ def resolve_wire_format(
 def _pointers_summary(
     context: Mapping[str, Any], label: str, *, max_pointers: int = 12
 ) -> str | None:
-    """Formats the available payload pointers clause when present in `context`."""
+    """Formats the available payload pointers clause when present in `context`.
+
+    Args:
+        context: Shared decision context dictionary.
+        label: Prefix label for the pointers list.
+        max_pointers: Maximum number of pointer paths to include.
+
+    Returns:
+        A formatted pointer list string, or `None` if `context` has no pointers.
+    """
     pointers = context.get("pointers")
     if not isinstance(pointers, (list, tuple)) or not pointers:
         return None
@@ -107,7 +132,14 @@ def _pointers_summary(
 
 
 def _build_systemone_state(shared_context: Mapping[str, Any]) -> str:
-    """Formats `shared_context` into a non-empty `/v1/systemone` or `/v1beta/decisions` context string."""
+    """Formats `shared_context` into a `/v1/systemone` or `/v1beta/decisions` context string.
+
+    Args:
+        shared_context: Shared context dictionary from a `DecisionBatch`.
+
+    Returns:
+        A non-empty state/input string summarizing intent and payload fields.
+    """
     intent = shared_context.get("intent")
     intent_part = f"User intent: {intent}" if intent else None
     ptr_part = _pointers_summary(shared_context, "Payload data fields")
@@ -118,7 +150,14 @@ def _build_systemone_state(shared_context: Mapping[str, Any]) -> str:
 
 
 def _serialize_choice_criteria(question: DecisionQuestion) -> dict[str, str]:
-    """Builds the candidate->description map for a choice question."""
+    """Builds the candidate-to-description map for a categorical choice question.
+
+    Args:
+        question: Categorical `DecisionQuestion`.
+
+    Returns:
+        A dictionary mapping each candidate option to its description string.
+    """
     desc_map: dict[str, str] = {}
     if question.option_texts:
         desc_map.update(
@@ -139,7 +178,14 @@ def _serialize_choice_criteria(question: DecisionQuestion) -> dict[str, str]:
 
 
 def _serialize_score_criteria(question: DecisionQuestion) -> list[str]:
-    """Serializes level criteria for a score question."""
+    """Serializes level criteria for a score question.
+
+    Args:
+        question: Score `DecisionQuestion`.
+
+    Returns:
+        A list of formatted level criteria strings.
+    """
     if question.option_texts and len(question.option_texts) == len(question.options):
         return [
             f"{lvl}: {txt}" if txt else str(lvl)
@@ -151,7 +197,16 @@ def _serialize_score_criteria(question: DecisionQuestion) -> list[str]:
 def _serialize_systemone_question(
     question: DecisionQuestion, *, gemini_decisions: bool
 ) -> dict[str, Any]:
-    """Serializes one `DecisionQuestion` for `/v1/systemone` or `/v1beta/decisions`."""
+    """Serializes one `DecisionQuestion` for `/v1/systemone` or `/v1beta/decisions`.
+
+    Args:
+        question: Planner `DecisionQuestion` to serialize.
+        gemini_decisions: Whether to use `/v1beta/decisions` boolean criteria
+            keys (`true_description` and `false_description`).
+
+    Returns:
+        A wire-format question specification dictionary.
+    """
     if question.kind is QuestionKind.BOOLEAN:
         spec: dict[str, Any] = {
             "type": "noul",
@@ -181,7 +236,14 @@ def _serialize_systemone_question(
 
 
 def _serialize_native_question(question: DecisionQuestion) -> dict[str, Any]:
-    """Serializes one `DecisionQuestion` into a native Jev batch request item."""
+    """Serializes one `DecisionQuestion` into a native Jev batch request item.
+
+    Args:
+        question: Planner `DecisionQuestion` to serialize.
+
+    Returns:
+        A dictionary matching the native Jev question schema.
+    """
     entry: dict[str, Any] = {
         "id": question.id,
         "kind": question.kind.value,
@@ -206,7 +268,18 @@ def _format_systemone_wire_request(
     *,
     gemini_decisions: bool,
 ) -> dict[str, Any] | None:
-    """Formats a `/v1beta/decisions` or `/v1/systemone` batch request dictionary."""
+    """Formats a `/v1beta/decisions` or `/v1/systemone` batch request dictionary.
+
+    Args:
+        backend: Active `DecisionBackend`.
+        batch: Reconstructed `DecisionBatch`.
+        gemini_decisions: Whether to format for `/v1beta/decisions` (`input`
+            and `q_<index>` keys) rather than `/v1/systemone`.
+
+    Returns:
+        The wire request dictionary, or `None` if no questions remain after
+        filtering single-option choice questions.
+    """
     wire_questions: dict[str, dict[str, Any]] = {}
     for idx, q in enumerate(batch.questions):
         if q.kind is QuestionKind.CHOICE and len(q.candidates()) < 2:
@@ -230,7 +303,18 @@ def format_wire_request(
     batch: DecisionBatch,
     wire_format: str,
 ) -> dict[str, Any] | None:
-    """Formats the exact JSON request body sent to `backend` for `batch`."""
+    """Formats the JSON request body sent to `backend` for `batch`.
+
+    Args:
+        backend: Active `DecisionBackend`.
+        batch: Reconstructed `DecisionBatch`.
+        wire_format: Wire format identifier (`"gemini_decisions"`,
+            `"systemone"`, `"jev"`, or `"in_process"`).
+
+    Returns:
+        The JSON-serializable wire request dictionary, or `None` when `batch`
+        has no questions or `wire_format` is unrecognized.
+    """
     if not batch.questions:
         return None
     if wire_format in ("gemini_decisions", "systemone"):
@@ -246,7 +330,14 @@ def format_wire_request(
 
 
 def create_trace_part(trace: Mapping[str, Any]) -> Part:
-    """Wraps a `PlaygroundTurnTrace` dictionary in an A2A `DataPart`."""
+    """Wraps a `PlaygroundTurnTrace` dictionary in an A2A `DataPart`.
+
+    Args:
+        trace: Serialized `PlaygroundTurnTrace` mapping.
+
+    Returns:
+        An A2A `Part` tagged with `PLAYGROUND_TRACE_MIME_TYPE`.
+    """
     return Part(
         root=DataPart(
             data=dict(trace),
@@ -256,7 +347,14 @@ def create_trace_part(trace: Mapping[str, Any]) -> Part:
 
 
 def _normalize_payload_data(payload: Any) -> Mapping[str, Any]:
-    """Normalizes a block payload into a surface data-model mapping."""
+    """Normalizes a block payload into a surface data-model mapping.
+
+    Args:
+        payload: Raw payload object or sequence from a `DecisionBlock`.
+
+    Returns:
+        A mapping suitable for pointer inspection and layout planning.
+    """
     coerced = coerce_decision_payload(payload)
     if isinstance(coerced, Mapping):
         return coerced
@@ -267,7 +365,16 @@ def _inspect_filtered_pointers(
     data: Mapping[str, Any],
     block: DecisionBlock,
 ) -> tuple[PointerSummary, ...]:
-    """Inspects payload pointers, drops `block.exclude`, and applies `block.labels`."""
+    """Inspects payload pointers, drops `block.exclude`, and applies `block.labels`.
+
+    Args:
+        data: Normalized payload mapping.
+        block: Source `DecisionBlock` carrying `mutable_paths`, `exclude`, and
+            `labels`.
+
+    Returns:
+        A tuple of filtered and relabeled `PointerSummary` entries.
+    """
     raw = inspect_payload_pointers(data, mutable_paths=block.mutable_paths or ())
     if block.exclude:
         filtered = tuple(
@@ -290,7 +397,16 @@ def _inspect_filtered_pointers(
 def _parse_optional_brief(
     block: DecisionBlock, synthesizer: DecisionSynthesizer
 ) -> LayoutBrief | None:
-    """Parses `block.layout` against `synthesizer.archetypes`, returning None on empty/error."""
+    """Parses `block.layout` against `synthesizer.archetypes`.
+
+    Args:
+        block: Source `DecisionBlock`.
+        synthesizer: Active `DecisionSynthesizer` providing valid brief roles.
+
+    Returns:
+        A non-empty `LayoutBrief`, or `None` if `block.layout` is unset or
+        invalid.
+    """
     if not block.layout:
         return None
     try:
@@ -308,7 +424,17 @@ def _reconstruct_batch_and_key(
     surface_id: str,
     output: SynthesisOutput | None,
 ) -> tuple[DecisionBatch, PlanCacheKey, tuple[PointerSummary, ...]]:
-    """Reconstructs `(batch, cache_key, pointers)` for a decision or tool render."""
+    """Reconstructs `(batch, cache_key, pointers)` for a decision or tool render.
+
+    Args:
+        synthesizer: Active `DecisionSynthesizer`.
+        block: Source `DecisionBlock`.
+        surface_id: Target A2UI surface identifier.
+        output: Completed `SynthesisOutput`, if available.
+
+    Returns:
+        A `(batch, cache_key, pointers)` tuple.
+    """
     data = _normalize_payload_data(block.payload)
     pointers = _inspect_filtered_pointers(data, block)
     brief = _parse_optional_brief(block, synthesizer)
@@ -346,7 +472,21 @@ def _build_planner_batch(
     labels: dict[str, str],
     output: SynthesisOutput | None,
 ) -> DecisionBatch:
-    """Builds the speculative, region, or two-stage `DecisionBatch` for `block`."""
+    """Builds the speculative, region, or two-stage `DecisionBatch` for `block`.
+
+    Args:
+        synthesizer: Active `DecisionSynthesizer`.
+        block: Source `DecisionBlock`.
+        data: Normalized payload mapping.
+        pointers: Filtered payload pointer summaries.
+        brief: Optional parsed `LayoutBrief`.
+        copy: Optional `AuthoredCopy` overrides.
+        labels: Pointer label overrides.
+        output: Completed `SynthesisOutput`, if available.
+
+    Returns:
+        The reconstructed `DecisionBatch` matching `DecisionSynthesizer._plan_layout`.
+    """
     planner = synthesizer.planner
     if (
         block.region is not None
@@ -362,8 +502,20 @@ def _build_planner_batch(
             labels=labels or None,
             payload=data,
             actions=block.actions,
+            exclude=block.exclude,
         )
         return batch
+    eligible = eligible_archetypes(
+        synthesizer.archetypes, synthesizer.patterns, pointers
+    )
+    if not eligible:
+        return DecisionBatch(
+            shared_context={
+                "intent": block.intent,
+                "pointers": [p.path for p in pointers],
+            },
+            questions=(),
+        )
     templates = synthesizer.registry.matching_templates([p.path for p in pointers])
     if synthesizer.backend.capabilities.two_stage:
         s1_batch, state = planner.build_stage1_batch(
@@ -375,6 +527,7 @@ def _build_planner_batch(
             templates=templates,
             actions=block.actions,
             labels=labels or None,
+            exclude=block.exclude,
         )
         answers = output.decision_answers if output is not None else ()
         s1_len = len(s1_batch.questions)
@@ -391,6 +544,7 @@ def _build_planner_batch(
         templates=templates,
         actions=block.actions,
         labels=labels or None,
+        exclude=block.exclude,
     )
     return batch
 
@@ -398,12 +552,27 @@ def _build_planner_batch(
 def _question_kind_label(
     question: DecisionQuestion,
 ) -> Literal["boolean", "categorical"]:
-    """Maps `QuestionKind` to the inspector's `'boolean' | 'categorical'` union."""
+    """Maps `QuestionKind` to the inspector's `'boolean' | 'categorical'` union.
+
+    Args:
+        question: Planner `DecisionQuestion`.
+
+    Returns:
+        `"boolean"` for boolean questions, otherwise `"categorical"`.
+    """
     return "boolean" if question.kind is QuestionKind.BOOLEAN else "categorical"
 
 
 def _question_options_list(question: DecisionQuestion) -> list[dict[str, str]]:
-    """Builds `{value, description}` option descriptors for categorical questions."""
+    """Builds `{value, description}` option descriptors for categorical questions.
+
+    Args:
+        question: Planner `DecisionQuestion`.
+
+    Returns:
+        A list of `{value, description}` dictionaries, or an empty list for
+        boolean questions.
+    """
     if question.kind is QuestionKind.BOOLEAN:
         return []
     desc_map = dict(zip(question.options, question.option_texts))
@@ -425,7 +594,17 @@ def _serialize_input_question(
     pruned: bool,
     wire_format: str,
 ) -> dict[str, Any]:
-    """Serializes one `DecisionQuestion` for `DecisionInputStage.questions`."""
+    """Serializes one `DecisionQuestion` for `DecisionInputStage.questions`.
+
+    Args:
+        question: Planner `DecisionQuestion`.
+        index: Zero-based question index in the batch.
+        pruned: Whether the planner pruned this speculative question.
+        wire_format: Resolved backend wire format identifier.
+
+    Returns:
+        A dictionary representing one `DecisionInputStage` question row.
+    """
     wire_id = f"q_{index}" if wire_format == "gemini_decisions" else question.id
     return {
         "id": question.id,
@@ -442,7 +621,14 @@ def _serialize_input_question(
 
 
 def _backend_temperature(backend: DecisionBackend) -> float | None:
-    """Extracts the calibration temperature from `backend` when present."""
+    """Extracts the calibration temperature from `backend` when present.
+
+    Args:
+        backend: Active `DecisionBackend`.
+
+    Returns:
+        The float calibration temperature, or `None` if uncalibrated.
+    """
     calibration = getattr(backend, "calibration", None)
     if calibration is not None and hasattr(calibration, "temperature"):
         return float(calibration.temperature)
@@ -452,7 +638,15 @@ def _backend_temperature(backend: DecisionBackend) -> float | None:
 def _non_synthetic_trace_map(
     output: SynthesisOutput | None,
 ) -> dict[str, DecisionRecord]:
-    """Builds `{question.id: record}` for non-synthetic trace rows (`answer is not None`)."""
+    """Builds `{question.id: record}` for non-synthetic trace rows (`answer is not None`).
+
+    Args:
+        output: Completed `SynthesisOutput`, or `None`.
+
+    Returns:
+        A dictionary mapping evaluated question identifiers to their
+        `DecisionRecord` instances.
+    """
     if output is None:
         return {}
     return {r.question.id: r for r in output.trace if r.answer is not None}
@@ -466,16 +660,30 @@ def _build_decision_input_stage(
     output: SynthesisOutput | None,
     metrics: TurnMetrics,
 ) -> dict[str, Any]:
-    """Builds Stage 2 (`DecisionInputStage`) for a decision or tool candidate."""
+    """Builds Stage 2 (`DecisionInputStage`) for a decision or tool candidate.
+
+    Args:
+        synthesizer: Active `DecisionSynthesizer`.
+        batch: Reconstructed `DecisionBatch`.
+        cache_key: Computed `PlanCacheKey` for the render.
+        pointers: Filtered payload pointer summaries.
+        output: Completed `SynthesisOutput`, or `None`.
+        metrics: Candidate `TurnMetrics`.
+
+    Returns:
+        A serialized `DecisionInputStage` dictionary.
+    """
     backend = synthesizer.backend
     wire_format = resolve_wire_format(backend)
     trace_by_id = _non_synthetic_trace_map(output)
-    has_plan = output is not None and output.layout_plan is not None
+    has_trace = bool(trace_by_id) or (
+        output is not None and output.layout_plan is not None
+    )
     questions = [
         _serialize_input_question(
             q,
             idx,
-            pruned=bool(has_plan and q.id not in trace_by_id),
+            pruned=bool(has_trace and q.id not in trace_by_id),
             wire_format=wire_format,
         )
         for idx, q in enumerate(batch.questions)
@@ -524,7 +732,15 @@ def _answer_winner_and_probs(
     question: DecisionQuestion,
     answer: DecisionAnswer | None,
 ) -> tuple[str, float, list[dict[str, Any]], dict[str, float]]:
-    """Extracts `(winner, winner_prob, prob_entries, prob_map)` from `answer`."""
+    """Extracts `(winner, winner_prob, prob_entries, prob_map)` from `answer`.
+
+    Args:
+        question: Planner `DecisionQuestion`.
+        answer: Backend `DecisionAnswer`, or `None`.
+
+    Returns:
+        A `(winner, winner_prob, prob_entries, prob_map)` tuple.
+    """
     if answer is None:
         return "", 0.0, [], {}
     probs_map = {str(k): float(v) for k, v in answer.distribution.probabilities.items()}
@@ -551,7 +767,18 @@ def _serialize_output_record(
     *,
     pruned: bool,
 ) -> dict[str, Any]:
-    """Serializes one joined question/answer/trace row for `DecisionOutputStage.records`."""
+    """Serializes one joined question/answer/trace row for `DecisionOutputStage.records`.
+
+    Args:
+        question: Planner `DecisionQuestion`.
+        record: Evaluated `DecisionRecord` from `output.trace`, or `None` if
+            pruned.
+        answer: Raw `DecisionAnswer` from the backend, or `None`.
+        pruned: Whether the planner pruned this speculative question.
+
+    Returns:
+        A serialized record dictionary for `DecisionOutputStage.records`.
+    """
     winner, winner_prob, prob_entries, prob_map = _answer_winner_and_probs(
         question, answer
     )
@@ -588,7 +815,14 @@ def _serialize_output_record(
 
 
 def _extract_fit_score(output: SynthesisOutput) -> float | None:
-    """Returns `layout_plan.fit_score` or parses the synthetic `fit_score` trace record."""
+    """Returns `layout_plan.fit_score` or parses the synthetic `fit_score` trace record.
+
+    Args:
+        output: Completed `SynthesisOutput`.
+
+    Returns:
+        The float fit score, or `None` if no fit score was computed.
+    """
     if output.layout_plan is not None and output.layout_plan.fit_score is not None:
         return float(output.layout_plan.fit_score)
     for rec in output.trace:
@@ -604,7 +838,14 @@ def _extract_fit_score(output: SynthesisOutput) -> float | None:
 def _extract_surface_components(
     messages: Sequence[Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
-    """Collects component dictionaries from `createSurface` or `updateComponents`."""
+    """Collects component dictionaries from `createSurface` or `updateComponents`.
+
+    Args:
+        messages: Emitted A2UI protocol message dictionaries.
+
+    Returns:
+        A flat list of component dictionaries.
+    """
     found: list[Mapping[str, Any]] = []
     for msg in messages:
         for key in ("createSurface", "updateComponents"):
@@ -615,7 +856,14 @@ def _extract_surface_components(
 
 
 def _component_type_name(comp: Mapping[str, Any]) -> str:
-    """Extracts the component type name from a v1.0 or v0.9 component dictionary."""
+    """Extracts the component type name from a v1.0 or v0.9 component dictionary.
+
+    Args:
+        comp: Serialized A2UI component dictionary.
+
+    Returns:
+        The component type name string, or `""` if absent.
+    """
     raw = comp.get("component")
     if isinstance(raw, str):
         return raw
@@ -628,7 +876,15 @@ def _serialize_planned_block(
     planned: PlannedBlock,
     components: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Serializes one `PlannedBlock` for `DecisionOutputStage.layoutPlan.blocks`."""
+    """Serializes one `PlannedBlock` for `DecisionOutputStage.layoutPlan.blocks`.
+
+    Args:
+        planned: `PlannedBlock` from `LayoutPlan.blocks`.
+        components: Emitted A2UI component dictionaries for the surface.
+
+    Returns:
+        A serialized block dictionary for the inspector block tree.
+    """
     prefix = f"{planned.block_id}_"
     matching = [
         c
@@ -667,7 +923,17 @@ def _serialize_layout_plan(
     fit_score: float | None,
     messages: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Serializes `LayoutPlan` for `DecisionOutputStage.layoutPlan`."""
+    """Serializes `LayoutPlan` for `DecisionOutputStage.layoutPlan`.
+
+    Args:
+        plan: Winning `LayoutPlan`.
+        surface_id: Target A2UI surface identifier.
+        fit_score: Resolved fit score fallback.
+        messages: Emitted A2UI message dictionaries.
+
+    Returns:
+        A serialized layout plan dictionary.
+    """
     components = _extract_surface_components(messages)
     root_comp = next((c for c in components if c.get("id") == "root"), None)
     root_container = (
@@ -698,7 +964,15 @@ def _serialize_raw_answer(
     answer: DecisionAnswer,
     question: DecisionQuestion | None,
 ) -> dict[str, Any]:
-    """Serializes one `DecisionAnswer` for `DecisionOutputStage.rawAnswers`."""
+    """Serializes one `DecisionAnswer` for `DecisionOutputStage.rawAnswers`.
+
+    Args:
+        answer: Backend `DecisionAnswer`.
+        question: Matching `DecisionQuestion`, if found in the batch.
+
+    Returns:
+        A dictionary containing the raw probability distribution for `answer`.
+    """
     probs = {str(k): float(v) for k, v in answer.distribution.probabilities.items()}
     is_bool = (
         question.kind is QuestionKind.BOOLEAN
@@ -727,7 +1001,16 @@ def _resolve_record_answer(
     trace_by_id: Mapping[str, DecisionRecord],
     answers_by_id: Mapping[str, DecisionAnswer],
 ) -> DecisionAnswer | None:
-    """Returns the non-null `DecisionAnswer` from `trace_by_id` or `answers_by_id`."""
+    """Returns the non-null `DecisionAnswer` from `trace_by_id` or `answers_by_id`.
+
+    Args:
+        question_id: Question identifier to look up.
+        trace_by_id: Map of evaluated `DecisionRecord` entries by question id.
+        answers_by_id: Map of raw backend `DecisionAnswer` entries by question id.
+
+    Returns:
+        The resolved `DecisionAnswer`, or `None` if unavailable.
+    """
     rec = trace_by_id.get(question_id)
     if rec is not None and rec.answer is not None:
         return rec.answer
@@ -738,7 +1021,15 @@ def _output_questions(
     output: SynthesisOutput,
     batch: DecisionBatch | None,
 ) -> tuple[DecisionQuestion, ...]:
-    """Returns `batch.questions` when present, falling back to non-synthetic `output.trace` questions."""
+    """Returns `batch.questions` when present, falling back to `output.trace` questions.
+
+    Args:
+        output: Completed `SynthesisOutput`.
+        batch: Reconstructed `DecisionBatch`, or `None`.
+
+    Returns:
+        A tuple of `DecisionQuestion` instances in batch order.
+    """
     if batch is not None and batch.questions:
         return batch.questions
     return tuple(r.question for r in output.trace if r.answer is not None)
@@ -750,17 +1041,27 @@ def _build_decision_output_stage(
     surface_id: str,
     messages: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Builds Stage 3 (`DecisionOutputStage`) for a decision or tool candidate."""
+    """Builds Stage 3 (`DecisionOutputStage`) for a decision or tool candidate.
+
+    Args:
+        output: Completed `SynthesisOutput`.
+        batch: Reconstructed `DecisionBatch`, or `None`.
+        surface_id: Target A2UI surface identifier.
+        messages: Emitted A2UI message dictionaries.
+
+    Returns:
+        A serialized `DecisionOutputStage` dictionary.
+    """
     trace_by_id = _non_synthetic_trace_map(output)
     answers_by_id = {a.question_id: a for a in output.decision_answers}
     questions = _output_questions(output, batch)
-    has_plan = output.layout_plan is not None
+    has_trace = bool(trace_by_id) or output.layout_plan is not None
     records = [
         _serialize_output_record(
             q,
             trace_by_id.get(q.id),
             _resolve_record_answer(q.id, trace_by_id, answers_by_id),
-            pruned=bool(has_plan and q.id not in trace_by_id),
+            pruned=bool(has_trace and q.id not in trace_by_id),
         )
         for q in questions
     ]
@@ -800,7 +1101,18 @@ def _build_llm_stage2_trace(
     surface_id: str,
     result: RenderResult,
 ) -> dict[str, Any] | None:
-    """Builds `LlmStage2Trace` for `express` and `direct` candidates."""
+    """Builds `LlmStage2Trace` for `express` and `direct` candidates.
+
+    Args:
+        mode: Candidate `RenderMode`.
+        block: Source `DecisionBlock`, or `None`.
+        surface_id: Target A2UI surface identifier.
+        result: Completed `RenderResult`.
+
+    Returns:
+        A serialized `LlmStage2Trace` dictionary, or `None` for non-LLM stage-2
+        modes.
+    """
     if mode not in (RenderMode.EXPRESS, RenderMode.DIRECT):
         return None
     attempts = (
@@ -822,7 +1134,14 @@ def _build_llm_stage2_trace(
 
 
 def _message_kinds(messages: Sequence[Mapping[str, Any]]) -> list[str]:
-    """Extracts the ordered A2UI envelope keys (excluding `'version'`) from `messages`."""
+    """Extracts the ordered A2UI envelope keys (excluding `'version'`) from `messages`.
+
+    Args:
+        messages: Sequence of A2UI protocol message dictionaries.
+
+    Returns:
+        A list of message envelope key names (such as `"createSurface"`).
+    """
     kinds: list[str] = []
     for msg in messages:
         for key in msg.keys():
@@ -836,7 +1155,16 @@ def _build_wire_output_stage(
     result: RenderResult,
     metrics: TurnMetrics,
 ) -> dict[str, Any]:
-    """Builds Stage 4 (`WireJsonStage`) for a candidate."""
+    """Builds Stage 4 (`WireJsonStage`) for a candidate.
+
+    Args:
+        surface_id: Target A2UI surface identifier.
+        result: Completed `RenderResult`.
+        metrics: Candidate `TurnMetrics`.
+
+    Returns:
+        A serialized `WireJsonStage` dictionary.
+    """
     output: SynthesisOutput | None = result.output
     operation = str(
         metrics.operation or (output.operation if output is not None else "create")
@@ -860,7 +1188,19 @@ def _build_candidate_trace(
     block: DecisionBlock | None,
     synthesizer: DecisionSynthesizer | None,
 ) -> dict[str, Any]:
-    """Builds one `CandidateTrace` entry."""
+    """Builds one `CandidateTrace` entry.
+
+    Args:
+        mode: Candidate `RenderMode`.
+        surface_id: Target A2UI surface identifier.
+        result: Completed `RenderResult`.
+        metrics: Combined `TurnMetrics` for the candidate.
+        block: Source `DecisionBlock`, or `None`.
+        synthesizer: Active `DecisionSynthesizer`, or `None`.
+
+    Returns:
+        A serialized `CandidateTrace` dictionary.
+    """
     output: SynthesisOutput | None = result.output
     is_decision = mode in (RenderMode.DECISION, RenderMode.TOOL)
     decision_input: dict[str, Any] | None = None
@@ -911,7 +1251,14 @@ def _build_candidate_trace(
 
 
 def _serialize_stage1_block(block: DecisionBlock | None) -> dict[str, Any] | None:
-    """Serializes `DecisionBlock` into the `BlockInputStage.block` shape."""
+    """Serializes `DecisionBlock` into the `BlockInputStage.block` shape.
+
+    Args:
+        block: Extracted or constructed `DecisionBlock`, or `None`.
+
+    Returns:
+        A serialized block dictionary, or `None` when `block` is `None`.
+    """
     if block is None:
         return None
     return {
@@ -951,7 +1298,26 @@ def build_turn_trace(
     candidates: Sequence[tuple[RenderMode, str, RenderResult, TurnMetrics]],
     synthesizer: DecisionSynthesizer | None,
 ) -> dict[str, Any]:
-    """Builds a Version 1 `PlaygroundTurnTrace` dictionary."""
+    """Builds a Version 1 `PlaygroundTurnTrace` dictionary.
+
+    Args:
+        turn: 1-based turn counter.
+        query: User query or slash command for the turn.
+        compare: Whether the turn rendered all three comparison modes.
+        active_mode: Active `RenderMode` for the turn.
+        stage1_source: How the `DecisionBlock` was produced.
+        model_name: Stage-1 language model name, or `None`.
+        stage1_turn: Stage-1 `LlmTurn`, or `None` for direct tool calls.
+        tool_name: Invoked tool name in `tool` mode, or `None`.
+        tool_args: Invoked tool arguments in `tool` mode, or `None`.
+        block: Extracted or constructed `DecisionBlock`, or `None`.
+        stage1_error: Stage-1 error string, or `None`.
+        candidates: Sequence of `(mode, surface_id, result, metrics)` tuples.
+        synthesizer: Active `DecisionSynthesizer`, or `None`.
+
+    Returns:
+        A JSON-serializable `PlaygroundTurnTrace` dictionary.
+    """
     stage1: dict[str, Any] = {
         "source": stage1_source,
         "model": None if stage1_source == "direct_tool" else model_name,

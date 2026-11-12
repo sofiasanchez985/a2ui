@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import {LitElement, TemplateResult, css, html, nothing} from 'lit';
+import {LitElement, PropertyValues, TemplateResult, css, html, nothing} from 'lit';
 import {customElement, property, state} from 'lit/decorators.js';
 
 import {
@@ -26,14 +26,24 @@ import {
   PlaygroundTurnTrace,
 } from '../types/inspector.js';
 
+/**
+ * Split-screen pipeline inspector element for the Format Playground.
+ *
+ * Displays the four-stage synthesis waterfall (Block Input, Decision Input,
+ * Decision Output and Plan, and A2UI JSON) along with compare-mode candidate
+ * switching and raw wire JSON views.
+ */
 @customElement('playground-inspector')
 export class PlaygroundInspector extends LitElement {
+  /** The structured pipeline trace for the most recent playground turn. */
   @property({attribute: false})
   accessor trace: PlaygroundTurnTrace | null = null;
 
+  /** Whether a playground turn request is currently in flight. */
   @property({type: Boolean})
   accessor loading = false;
 
+  /** Per-stage accordion expansion state keyed by stage number (1 to 4). */
   @state()
   accessor _stageOpen: Record<number, boolean> = {
     1: true,
@@ -42,21 +52,27 @@ export class PlaygroundInspector extends LitElement {
     4: true,
   };
 
+  /** Active sub-view for Stage 2 (`structured` or `raw` wire JSON). */
   @state()
   accessor _stage2View: 'structured' | 'raw' = 'structured';
 
+  /** Active sub-view for Stage 3 (`structured` or `raw` wire JSON). */
   @state()
   accessor _stage3View: 'structured' | 'raw' = 'structured';
 
+  /** Active sub-view for Stage 4 (`json` wire messages or `express` DSL). */
   @state()
   accessor _stage4View: 'json' | 'express' = 'json';
 
+  /** Whether speculative questions pruned by early gates are shown in Stages 2 and 3. */
   @state()
   accessor _showPruned = false;
 
+  /** User-selected compare candidate mode override, or `null` to use `trace.activeMode`. */
   @state()
   accessor _selectedMode: string | null = null;
 
+  /** Key of the most recently copied payload for transient button feedback. */
   @state()
   private accessor _copiedKey: string | null = null;
 
@@ -439,6 +455,30 @@ export class PlaygroundInspector extends LitElement {
     }
   `;
 
+  /**
+   * Resets transient mode and copy selections when a new turn or active mode arrives.
+   *
+   * @param changedProperties Map of changed reactive properties with their previous values.
+   */
+  protected override willUpdate(changedProperties: PropertyValues<this>): void {
+    if (changedProperties.has('trace')) {
+      const prevTrace = changedProperties.get('trace');
+      if (
+        this.trace?.turn !== prevTrace?.turn ||
+        this.trace?.activeMode !== prevTrace?.activeMode
+      ) {
+        this._selectedMode = null;
+        this._copiedKey = null;
+      }
+    }
+  }
+
+  /**
+   * Resolves the currently active candidate trace from the turn trace.
+   *
+   * @param trace The current playground turn trace.
+   * @return The selected or active candidate trace, or `null` if no candidates exist.
+   */
   #getActiveCandidate(trace: PlaygroundTurnTrace): CandidateTrace | null {
     if (trace.candidates.length === 0) {
       return null;
@@ -453,6 +493,11 @@ export class PlaygroundInspector extends LitElement {
     return active ?? trace.candidates[0];
   }
 
+  /**
+   * Toggles the expanded state of a waterfall stage card.
+   *
+   * @param stageNum The stage number (1 to 4) to toggle.
+   */
   #toggleStage(stageNum: number): void {
     this._stageOpen = {
       ...this._stageOpen,
@@ -460,11 +505,20 @@ export class PlaygroundInspector extends LitElement {
     };
   }
 
+  /**
+   * Copies text to the system clipboard and records the copied key for feedback.
+   *
+   * @param key Identifier of the copy button that triggered the action.
+   * @param text Payload string to write to the clipboard.
+   */
   #copyText(key: string, text: string): void {
     void navigator.clipboard?.writeText(text);
     this._copiedKey = key;
   }
 
+  /**
+   * Dispatches a bubbling `toggle-inspector` event to collapse the inspector drawer.
+   */
   #dispatchToggleInspector(): void {
     this.dispatchEvent(
       new CustomEvent('toggle-inspector', {
@@ -474,7 +528,12 @@ export class PlaygroundInspector extends LitElement {
     );
   }
 
+  /**
+   * Resets transient inspector selections and dispatches a `reset-session` event.
+   */
   #dispatchResetSession(): void {
+    this._selectedMode = null;
+    this._copiedKey = null;
     this.dispatchEvent(
       new CustomEvent('reset-session', {
         bubbles: true,
@@ -483,6 +542,11 @@ export class PlaygroundInspector extends LitElement {
     );
   }
 
+  /**
+   * Renders the inspector panel and four-stage synthesis waterfall.
+   *
+   * @return The inspector template.
+   */
   override render(): TemplateResult {
     const trace = this.trace;
     const candidate = trace ? this.#getActiveCandidate(trace) : null;
@@ -501,6 +565,11 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders the top header bar with session reset and close controls.
+   *
+   * @return The top bar template.
+   */
   #renderTopBar(): TemplateResult {
     return html`
       <div class="top-bar">
@@ -534,6 +603,11 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders the empty placeholder shown before the first playground turn.
+   *
+   * @return The empty state template.
+   */
   #renderEmptyState(): TemplateResult {
     return html`
       <div class="empty-state" data-testid="inspector-empty">
@@ -546,6 +620,13 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders the turn summary header with latency, token counts, and compare tabs.
+   *
+   * @param trace The current playground turn trace.
+   * @param candidate The currently selected candidate trace, or `null`.
+   * @return The summary header template.
+   */
   #renderSummaryHeader(
     trace: PlaygroundTurnTrace,
     candidate: CandidateTrace | null,
@@ -559,9 +640,11 @@ export class PlaygroundInspector extends LitElement {
       candidate?.metrics.decisionLatencyMs !== undefined
         ? Math.round(candidate.metrics.decisionLatencyMs)
         : null;
-    const totalMs = Math.round(trace.stage1.latencyMs + (candidate?.metrics.totalLatencyMs ?? 0));
-    const promptTokens = trace.stage1.promptTokens + (candidate?.metrics.promptTokens ?? 0);
-    const outputTokens = trace.stage1.outputTokens + (candidate?.metrics.outputTokens ?? 0);
+    // Candidate metrics produced by the Python agent already include Stage 1 latency
+    // and token counts; fall back to Stage 1 metrics only when no candidate is active.
+    const totalMs = Math.round(candidate?.metrics.totalLatencyMs ?? trace.stage1.latencyMs);
+    const promptTokens = candidate?.metrics.promptTokens ?? trace.stage1.promptTokens;
+    const outputTokens = candidate?.metrics.outputTokens ?? trace.stage1.outputTokens;
     const isCacheHit = Boolean(candidate?.metrics.cacheHit || candidate?.decisionInput?.cacheHit);
 
     return html`
@@ -589,6 +672,13 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders the segmented compare-mode candidate switcher when multiple candidates exist.
+   *
+   * @param trace The current playground turn trace.
+   * @param activeCandidate The currently active candidate trace, or `null`.
+   * @return The compare switcher template, or `nothing` for single-mode turns.
+   */
   #renderCompareSwitcher(
     trace: PlaygroundTurnTrace,
     activeCandidate: CandidateTrace | null,
@@ -623,6 +713,16 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders a collapsible waterfall stage card.
+   *
+   * @param stageNum Stage index (1 to 4).
+   * @param title Human-readable stage title.
+   * @param badges Header summary pills for the stage.
+   * @param body Collapsible body content.
+   * @param hasError Whether the stage encountered an error.
+   * @return The stage card template.
+   */
   #renderStageCard(
     stageNum: number,
     title: string,
@@ -654,6 +754,13 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders a copy-to-clipboard button for a stage payload.
+   *
+   * @param key Unique identifier for the copy target.
+   * @param text Text content to copy when clicked.
+   * @return The copy button template.
+   */
   #renderCopyButton(key: string, text: string): TemplateResult {
     const copied = this._copiedKey === key;
     return html`
@@ -669,6 +776,12 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders an error alert banner when an error string is present.
+   *
+   * @param error Error message to display, or `null`.
+   * @return The error callout template, or `nothing` when no error occurred.
+   */
   #renderErrorCallout(error: string | null): TemplateResult | typeof nothing {
     if (!error) {
       return nothing;
@@ -681,6 +794,12 @@ export class PlaygroundInspector extends LitElement {
     `;
   }
 
+  /**
+   * Renders Stage 1 (Block Input) showing the source, tool arguments, and extracted `<a2ui-block>`.
+   *
+   * @param stage1 The Stage 1 trace payload.
+   * @return The Stage 1 card template.
+   */
   #renderStage1(stage1: BlockInputStage): TemplateResult {
     const badges = html`
       <span class="pill accent">${stage1.source}</span>
@@ -712,36 +831,52 @@ export class PlaygroundInspector extends LitElement {
     return this.#renderStageCard(1, '1. Block Input', badges, body, Boolean(stage1.error));
   }
 
+  /**
+   * Renders a labeled key-value grid cell when `value` is non-empty.
+   *
+   * @param label The uppercase field label.
+   * @param value The rendered string value, or null/empty to omit.
+   * @return The key-value cell template, or `nothing` when empty.
+   */
+  #renderKvItem(label: string, value: string | null | undefined): TemplateResult | typeof nothing {
+    if (!value) {
+      return nothing;
+    }
+    return html`<div class="kv-item">
+      <span class="kv-label">${label}</span>
+      <span class="kv-value">${value}</span>
+    </div>`;
+  }
+
+  /**
+   * Renders the extracted Stage 1 block fields and JSON payload.
+   *
+   * @param block The extracted block metadata and payload.
+   * @return The Stage 1 block template.
+   */
   #renderStage1Block(block: NonNullable<BlockInputStage['block']>): TemplateResult {
+    const actionsText = block.actions
+      .map(a => (a.label ? `${a.name} (${a.label})` : a.name))
+      .join(', ');
     return html`
       <div class="kv-grid">
-        <div class="kv-item">
-          <span class="kv-label">Intent</span>
-          <span class="kv-value">${block.intent}</span>
-        </div>
-        ${block.surfaceId
-          ? html`<div class="kv-item">
-              <span class="kv-label">Surface ID</span>
-              <span class="kv-value">${block.surfaceId}</span>
-            </div>`
-          : nothing}
-        ${block.operation
-          ? html`<div class="kv-item">
-              <span class="kv-label">Operation</span>
-              <span class="kv-value">${block.operation}</span>
-            </div>`
-          : nothing}
-        ${block.layout
-          ? html`<div class="kv-item">
-              <span class="kv-label">Layout</span>
-              <span class="kv-value">${block.layout}</span>
-            </div>`
-          : nothing}
+        ${this.#renderKvItem('Intent', block.intent)}
+        ${this.#renderKvItem('Surface ID', block.surfaceId)}
+        ${this.#renderKvItem('Operation', block.operation)}
+        ${this.#renderKvItem('Layout', block.layout)}
+        ${this.#renderKvItem('Mutable Paths', block.mutablePaths.join(', '))}
+        ${this.#renderKvItem('Actions', actionsText)}
       </div>
       <pre class="code-block">${JSON.stringify(block.payload, null, 2)}</pre>
     `;
   }
 
+  /**
+   * Renders Stage 2 (Decision Input) with structured question list and raw wire request views.
+   *
+   * @param candidate The active candidate trace, or `null`.
+   * @return The Stage 2 card template.
+   */
   #renderStage2(candidate: CandidateTrace | null): TemplateResult {
     const input = candidate?.decisionInput ?? null;
     const badges = input
@@ -802,6 +937,12 @@ ${JSON.stringify(input.wireRequest, null, 2)}</pre
     return this.#renderStageCard(2, '2. Decision Input', badges, body);
   }
 
+  /**
+   * Renders the structured view for Stage 2 (metadata, context JSON, and question rows).
+   *
+   * @param input The Stage 2 decision input trace.
+   * @return The Stage 2 structured view template.
+   */
   #renderStage2Structured(input: DecisionInputStage): TemplateResult {
     const totalCount = input.questions.length;
     const prunedCount = input.questions.filter(q => q.pruned).length;
@@ -839,6 +980,12 @@ ${JSON.stringify(input.wireRequest, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders a single speculative decision question row in Stage 2.
+   *
+   * @param q The serialized decision question.
+   * @return The question row template.
+   */
   #renderQuestionRow(q: DecisionInputStage['questions'][number]): TemplateResult {
     const optionSummary =
       q.kind === 'boolean'
@@ -859,6 +1006,13 @@ ${JSON.stringify(input.wireRequest, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders the toggle button to show or hide pruned speculative questions.
+   *
+   * @param totalCount Total number of speculative questions in the batch.
+   * @param prunedCount Number of questions pruned by early gates.
+   * @return The toggle button template, or `nothing` when no questions were pruned.
+   */
   #renderPrunedToggle(totalCount: number, prunedCount: number): TemplateResult | typeof nothing {
     if (prunedCount === 0) {
       return nothing;
@@ -881,6 +1035,12 @@ ${JSON.stringify(input.wireRequest, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders Stage 3 (Decision Output and Plan) or LLM Stage 2 trace for LLM modes.
+   *
+   * @param candidate The active candidate trace, or `null`.
+   * @return The Stage 3 card template.
+   */
   #renderStage3(candidate: CandidateTrace | null): TemplateResult {
     const output = candidate?.decisionOutput ?? null;
     const llmStage2 = candidate?.llmStage2 ?? null;
@@ -909,6 +1069,13 @@ ${JSON.stringify(input.wireRequest, null, 2)}</pre
     return this.#renderStageCard(3, '3. Decision Output & Plan', badges, body, hasError);
   }
 
+  /**
+   * Renders the Stage 3 toolbar and structured or raw decision output view.
+   *
+   * @param output The Stage 3 decision output trace.
+   * @param cacheHit Whether the layout plan came from `PlanCache`.
+   * @return The Stage 3 decision output template.
+   */
   #renderStage3DecisionOutput(output: DecisionOutputStage, cacheHit: boolean): TemplateResult {
     const copyContent = JSON.stringify(
       this._stage3View === 'raw' ? output.rawAnswers : output,
@@ -949,6 +1116,13 @@ ${JSON.stringify(output.rawAnswers, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders the structured view for Stage 3 (probability bars, gate badges, and layout plan).
+   *
+   * @param output The Stage 3 decision output trace.
+   * @param cacheHit Whether the layout plan came from `PlanCache`.
+   * @return The Stage 3 structured view template.
+   */
   #renderStage3Structured(output: DecisionOutputStage, cacheHit: boolean): TemplateResult {
     const totalCount = output.records.length;
     const prunedCount = output.records.filter(r => r.pruned).length;
@@ -982,6 +1156,12 @@ ${JSON.stringify(output.rawAnswers, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders a single decision record row with its winning option probability bar and threshold tick.
+   *
+   * @param rec The decision record to render.
+   * @return The record row template.
+   */
   #renderRecordRow(rec: DecisionOutputStage['records'][number]): TemplateResult {
     const pct = Math.max(0, Math.min(100, rec.winnerProb * 100));
     const thresholdPct =
@@ -1015,6 +1195,12 @@ ${JSON.stringify(output.rawAnswers, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders the synthesized layout plan summary and block-to-component bindings.
+   *
+   * @param plan The synthesized layout plan summary.
+   * @return The layout plan template.
+   */
   #renderLayoutPlan(plan: NonNullable<DecisionOutputStage['layoutPlan']>): TemplateResult {
     return html`
       <div class="kv-grid">
@@ -1043,6 +1229,12 @@ ${JSON.stringify(output.rawAnswers, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders the Stage 2 LLM prompt preview and raw reply for Express, Elemental, and Atom modes.
+   *
+   * @param llmStage2 The Stage 2 LLM trace payload.
+   * @return The LLM Stage 2 template.
+   */
   #renderLlmStage2(llmStage2: LlmStage2Trace): TemplateResult {
     return html`
       <div class="badge-row">
@@ -1063,6 +1255,12 @@ ${JSON.stringify(output.rawAnswers, null, 2)}</pre
     `;
   }
 
+  /**
+   * Renders Stage 4 (A2UI JSON) with toggleable wire JSON and decompiled Express views.
+   *
+   * @param candidate The active candidate trace, or `null`.
+   * @return The Stage 4 card template.
+   */
   #renderStage4(candidate: CandidateTrace | null): TemplateResult {
     const wire = candidate?.wireOutput ?? null;
     const badges = wire

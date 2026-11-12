@@ -21,6 +21,12 @@ import {A2UIClient, PLAYGROUND_TRACE_MIME_TYPE, PlaygroundTurnTrace} from '../cl
 import '../ui/inspector.js';
 import {PlaygroundInspector} from '../ui/inspector.js';
 
+/**
+ * Builds a complete `PlaygroundTurnTrace` test fixture with optional top-level overrides.
+ *
+ * @param overrides Partial fields to override on the default turn trace fixture.
+ * @return A populated `PlaygroundTurnTrace` fixture.
+ */
 function makeFixtureTrace(overrides: Partial<PlaygroundTurnTrace> = {}): PlaygroundTurnTrace {
   return {
     schemaVersion: 1,
@@ -32,9 +38,9 @@ function makeFixtureTrace(overrides: Partial<PlaygroundTurnTrace> = {}): Playgro
       source: 'direct_tool',
       model: null,
       llmCalls: 0,
-      latencyMs: 2,
-      promptTokens: 0,
-      outputTokens: 0,
+      latencyMs: 20,
+      promptTokens: 50,
+      outputTokens: 15,
       rawText: null,
       toolName: 'get_ski_resorts',
       toolArgs: {region: 'Tahoe'},
@@ -47,8 +53,8 @@ function makeFixtureTrace(overrides: Partial<PlaygroundTurnTrace> = {}): Playgro
         layout: null,
         region: null,
         operation: 'replace',
-        mutablePaths: [],
-        actions: [],
+        mutablePaths: ['/resorts/0/openLifts'],
+        actions: [{name: 'book_lift', label: 'Book Lift', context: ['/resorts/0/name']}],
       },
       error: null,
     },
@@ -404,6 +410,29 @@ describe('<playground-inspector>', () => {
     expect(root.querySelector('[data-stage="2"] .stage-body')).toBeNull();
     expect(root.querySelector('[data-stage="3"] .stage-body')).not.toBeNull();
     expect(root.querySelector('[data-stage="4"] .stage-body')).not.toBeNull();
+
+    // Summary header uses candidate totals directly without double-counting Stage 1 (H1)
+    const headerText = root.querySelector('[data-testid="turn-summary-header"]')?.textContent ?? '';
+    expect(headerText).toContain('Stage 1: 20ms');
+    expect(headerText).toContain('Decision: 79ms');
+    expect(headerText).toContain('Total: 84ms');
+    expect(headerText).toContain('120 in / 32 out');
+
+    // Stage 1 block renders Mutable Paths and Actions when non-empty (L2)
+    const stage1Text = root.querySelector('[data-stage="1"] .stage-body')?.textContent ?? '';
+    expect(stage1Text).toContain('Mutable Paths');
+    expect(stage1Text).toContain('/resorts/0/openLifts');
+    expect(stage1Text).toContain('Actions');
+    expect(stage1Text).toContain('book_lift (Book Lift)');
+  });
+
+  it('falls back to Stage 1 latency and token counts when a turn has no candidates', async () => {
+    const el = await mountInspector(makeFixtureTrace({candidates: []}));
+    const headerText =
+      el.shadowRoot?.querySelector('[data-testid="turn-summary-header"]')?.textContent ?? '';
+    expect(headerText).toContain('Stage 1: 20ms');
+    expect(headerText).toContain('Total: 20ms');
+    expect(headerText).toContain('50 in / 15 out');
   });
 
   it('persists @state() toggles across new trace assignments and reveals pruned questions', async () => {
@@ -588,11 +617,27 @@ describe('<playground-inspector>', () => {
 
     expect(el._selectedMode).toBe('direct');
     expect(root.textContent).toContain('turn-1-direct');
+
+    // Clicking copy sets transient copied state
+    const copyBtn = root.querySelector<HTMLButtonElement>('[data-copy-key="stage1"]')!;
+    copyBtn.click();
+    await el.updateComplete;
+    expect(copyBtn.textContent).toContain('Copied');
+
+    // Advancing to a new turn or activeMode resets _selectedMode and _copiedKey (M4)
+    el.trace = makeFixtureTrace({turn: 2, activeMode: 'decision'});
+    await el.updateComplete;
+    expect(el._selectedMode).toBeNull();
+    expect(root.querySelector('[data-copy-key="stage1"]')?.textContent).toContain('Copy');
   });
 
   it('dispatches toggle-inspector and reset-session events with bubbles and composed', async () => {
     const el = await mountInspector(makeFixtureTrace());
     const root = el.shadowRoot!;
+
+    el._selectedMode = 'express';
+    root.querySelector<HTMLButtonElement>('[data-copy-key="stage1"]')!.click();
+    await el.updateComplete;
 
     const toggleSpy = vi.fn();
     const resetSpy = vi.fn();
@@ -601,6 +646,10 @@ describe('<playground-inspector>', () => {
 
     root.querySelector<HTMLButtonElement>('[data-testid="toggle-inspector"]')!.click();
     root.querySelector<HTMLButtonElement>('[data-testid="reset-session"]')!.click();
+    await el.updateComplete;
+
+    expect(el._selectedMode).toBeNull();
+    expect(root.querySelector('[data-copy-key="stage1"]')?.textContent).toContain('Copy');
 
     expect(toggleSpy).toHaveBeenCalledTimes(1);
     expect(toggleSpy.mock.calls[0][0].bubbles).toBe(true);

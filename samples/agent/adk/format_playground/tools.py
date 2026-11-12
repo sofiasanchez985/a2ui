@@ -22,7 +22,15 @@ from a2ui.inference_formats.decision import ActionSpec, ActionStyle
 
 
 def get_host_health(host: str = "prod-1") -> dict[str, Any]:
-    """Retrieves operational and health metrics for a production host server."""
+    """Retrieves operational and health metrics for a production host server.
+
+    Args:
+        host: Host identifier to inspect.
+
+    Returns:
+        A dictionary containing host name, CPU utilization, CPU delta, status,
+        and uptime hours.
+    """
     return {
         "host": host,
         "cpu": 0.78,
@@ -33,7 +41,14 @@ def get_host_health(host: str = "prod-1") -> dict[str, Any]:
 
 
 def get_resort(name: str = "Snowbird") -> dict[str, Any]:
-    """Fetches details, elevation, and open trail information for mountain ski resorts."""
+    """Fetches details, elevation, and open trail information for mountain ski resorts.
+
+    Args:
+        name: Primary resort name to include in the returned collection.
+
+    Returns:
+        A dictionary containing a `resorts` list of resort summary objects.
+    """
     return {
         "resorts": [
             {"name": name, "elevation": 11000, "openRuns": 85},
@@ -45,7 +60,15 @@ def get_resort(name: str = "Snowbird") -> dict[str, Any]:
 def get_transfer_quote(
     amount: float = 15000.0, recipient: str = "Acme Corp"
 ) -> dict[str, Any]:
-    """Calculates fee and prepares a quote for an outbound bank wire transfer."""
+    """Calculates fee and prepares a quote for an outbound bank wire transfer.
+
+    Args:
+        amount: Transfer amount in US dollars.
+        recipient: Beneficiary name for the wire transfer.
+
+    Returns:
+        A dictionary with recipient, amount, fee, and source account details.
+    """
     return {
         "recipient": recipient,
         "amount": amount,
@@ -55,7 +78,11 @@ def get_transfer_quote(
 
 
 def get_playback_settings() -> dict[str, Any]:
-    """Loads current audio, subtitle, and user interface playback settings."""
+    """Loads current audio, subtitle, and user interface playback settings.
+
+    Returns:
+        A dictionary containing volume, subtitles flag, and theme name.
+    """
     return {
         "volume": 80,
         "subtitles": True,
@@ -64,7 +91,15 @@ def get_playback_settings() -> dict[str, Any]:
 
 
 def get_order_details(order_id: str = "ORD-8492") -> dict[str, Any]:
-    """Fetches fulfillment status, carrier details, and totals for one order."""
+    """Fetches fulfillment status, carrier details, and totals for one order.
+
+    Args:
+        order_id: Order identifier to look up.
+
+    Returns:
+        A dictionary containing fulfillment status, carrier, estimated delivery,
+        shipping address, and total in USD.
+    """
     return {
         "orderId": order_id,
         "status": "Out for delivery",
@@ -76,7 +111,15 @@ def get_order_details(order_id: str = "ORD-8492") -> dict[str, Any]:
 
 
 def get_deploy_runbook(service: str = "checkout-api") -> dict[str, Any]:
-    """Loads the ordered production rollout checklist for a backend service."""
+    """Loads the ordered production rollout checklist for a backend service.
+
+    Args:
+        service: Service name being deployed.
+
+    Returns:
+        A dictionary containing service name, target environment, and ordered
+        deployment steps.
+    """
     return {
         "service": service,
         "environment": "us-central1-prod",
@@ -178,7 +221,16 @@ EXAMPLE_TOOL_NAMES: tuple[str, ...] = (
 
 
 def run_example_tool(name: str, turn: int = 1) -> tuple[str, dict[str, Any]] | None:
-    """Executes a named tool directly (0 LLM calls) and returns `(tool_name, payload)`."""
+    """Executes a named tool directly with zero LLM calls.
+
+    Args:
+        name: Short alias or canonical function name of the tool to invoke.
+        turn: Current 1-based turn counter used to rotate host health snapshots.
+
+    Returns:
+        A `(canonical_tool_name, payload)` tuple, or `None` if `name` is not a
+        registered example tool.
+    """
     fn = _TOOL_ALIASES.get(name.strip().lower())
     if fn is None:
         return None

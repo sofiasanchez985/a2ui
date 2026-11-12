@@ -61,7 +61,15 @@ EXPRESS_BAD = "<a2ui>root = Nope(</a2ui>"
 
 
 def direct_json_reply(renderers: Renderers, version: str) -> str:
-    """A valid Direct JSON reply for `version`, built from a compiled surface."""
+    """Builds a valid Direct JSON reply for `version` from a compiled surface.
+
+    Args:
+        renderers: Playground renderers instance used to build a status surface.
+        version: Target A2UI protocol version.
+
+    Returns:
+        An `<a2ui-json>` tagged JSON array string.
+    """
     parts = renderers.status_surface(
         ["Portfolio"], surface_id="turn-1", version=version
     )
@@ -69,10 +77,26 @@ def direct_json_reply(renderers: Renderers, version: str) -> str:
 
 
 def messages_of(parts: list[Part]) -> list[dict[str, Any]]:
+    """Extracts the raw dictionary payloads from all `DataPart` entries.
+
+    Args:
+        parts: List of A2A message parts.
+
+    Returns:
+        List of dictionary payloads.
+    """
     return [p.root.data for p in parts if isinstance(p.root, DataPart)]
 
 
 def surface_ids(parts: list[Part]) -> list[str]:
+    """Collects `surfaceId` values from all `createSurface` messages in `parts`.
+
+    Args:
+        parts: List of A2A message parts.
+
+    Returns:
+        Ordered list of created surface identifiers.
+    """
     ids: list[str] = []
     for msg in messages_of(parts):
         create = msg.get("createSurface")
@@ -83,12 +107,18 @@ def surface_ids(parts: list[Part]) -> list[str]:
 
 @pytest.fixture(scope="module")
 def renderers() -> Renderers:
+    """Provides a module-scoped `Renderers` instance backed by `DeterministicMockBackend`.
+
+    Returns:
+        A configured `Renderers` instance for versions 0.9 and 1.0.
+    """
     return Renderers(versions=["0.9", "1.0"], backend=DeterministicMockBackend())
 
 
 def test_backend_display_name_maps_bundled_backends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verifies that `backend_display_name` and `build_named_backend` format backend labels."""
     from a2ui.inference_formats.decision import JevHttpBackend
     from renderers import build_named_backend
 
@@ -122,8 +152,78 @@ def test_backend_display_name_maps_bundled_backends(
     assert backend_display_name(Custom()) == "Custom"  # type: ignore[arg-type]
 
 
+def test_build_named_backend_isolates_preset_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that `/backend` preset switching ignores `A2UI_DECISION_*` for other presets."""
+    from a2ui.inference_formats.decision import JevHttpBackend
+    from renderers import build_named_backend
+
+    # Simulate starting with A2UI_DECISION_BACKEND=gemini and Gemini-specific A2UI_DECISION_* vars.
+    monkeypatch.setenv("A2UI_DECISION_BACKEND", "gemini")
+    monkeypatch.setenv(
+        "A2UI_DECISION_URL",
+        "https://generativelanguage.googleapis.com/v1beta/decisions",
+    )
+    monkeypatch.setenv("A2UI_DECISION_MODEL", "models/gemini-3.1-flash-lite-preview")
+    monkeypatch.setenv("A2UI_DECISION_AUTH", "gemini-startup-secret")
+    monkeypatch.setenv("JEV_API_KEY", "vcp_jev_secret")
+    monkeypatch.setenv("JEV_MODEL", "jev-custom-model")
+
+    # Switching to jev at runtime must not inherit the Gemini A2UI_DECISION_* variables (H2).
+    jev_backend = build_named_backend("jev")
+    assert isinstance(jev_backend, JevHttpBackend)
+    assert (
+        jev_backend.endpoint_url == "https://ai-gateway.vercel.sh/typesafe/v1/systemone"
+    )
+    assert jev_backend.model_id == "jev-custom-model"
+
+    # Building gemini when A2UI_DECISION_BACKEND=gemini honors the matching A2UI_DECISION_* vars.
+    gemini_backend = build_named_backend("gemini")
+    assert isinstance(gemini_backend, JevHttpBackend)
+    assert (
+        gemini_backend.endpoint_url
+        == "https://generativelanguage.googleapis.com/v1beta/decisions"
+    )
+    assert gemini_backend.model_id == "models/gemini-3.1-flash-lite-preview"
+
+    # Now flip A2UI_DECISION_BACKEND=jev and verify build_named_backend("gemini") uses Gemini defaults.
+    monkeypatch.setenv("A2UI_DECISION_BACKEND", "jev")
+    monkeypatch.setenv("A2UI_DECISION_URL", "https://api.typesafe.ai/v1/systemone")
+    monkeypatch.setenv("A2UI_DECISION_MODEL", "systemone-default")
+    monkeypatch.setenv("A2UI_DECISION_AUTH", "vcp_startup_secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "gem_runtime_secret")
+    monkeypatch.delenv("GEMINI_DECISION_MODEL", raising=False)
+
+    gemini_from_jev = build_named_backend("gemini")
+    assert isinstance(gemini_from_jev, JevHttpBackend)
+    assert (
+        gemini_from_jev.endpoint_url
+        == "https://generativelanguage.googleapis.com/v1beta/decisions"
+    )
+    assert gemini_from_jev.model_id == "gemini-decision-1"
+
+
+def test_renderers_state_for_evicts_oldest_conversation_states() -> None:
+    """Verifies that `Renderers.state_for` bounds `_states` to 100 entries with LRU eviction."""
+    local_renderers = Renderers(versions=["1.0"], backend=DeterministicMockBackend())
+    for i in range(100):
+        local_renderers.state_for(f"conv-{i}")
+    assert len(local_renderers._states) == 100
+
+    # Touch conv-0 so conv-1 becomes the least-recently-used entry.
+    local_renderers.state_for("conv-0")
+    local_renderers.state_for("conv-100")
+
+    assert len(local_renderers._states) == 100
+    assert "conv-0" in local_renderers._states
+    assert "conv-1" not in local_renderers._states
+    assert "conv-100" in local_renderers._states
+
+
 @pytest.mark.asyncio
 async def test_render_decision_rejects_v09_clients(renderers: Renderers) -> None:
+    """Verifies that `render_decision` returns an error for v0.9 clients."""
     result = await renderers.render_decision(
         RESORT_BLOCK, surface_id="turn-1", version="0.9"
     )
@@ -136,6 +236,7 @@ async def test_render_decision_rejects_v09_clients(renderers: Renderers) -> None
 async def test_render_decision_produces_a_surface_without_llm_calls(
     renderers: Renderers, version: str
 ) -> None:
+    """Verifies that `render_decision` synthesizes a valid v1.0 surface with 0 LLM calls."""
     result = await renderers.render_decision(
         RESORT_BLOCK, surface_id="turn-1", version=version
     )
@@ -159,6 +260,7 @@ async def test_render_decision_produces_a_surface_without_llm_calls(
 async def test_render_with_llm_express_succeeds_retries_and_fails(
     renderers: Renderers, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies `render_with_llm` in Express mode across first-pass, retry, and failure paths."""
     scripted_llm.script("express:1.0", EXPRESS_OK)
     ok = await renderers.render_with_llm(
         RenderMode.EXPRESS,
@@ -212,6 +314,7 @@ async def test_render_with_llm_express_succeeds_retries_and_fails(
 async def test_render_with_llm_direct_and_prose_reply(
     renderers: Renderers, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies `render_with_llm` in Direct JSON mode for valid JSON and prose-only failures."""
     scripted_llm.script("direct:1.0", direct_json_reply(renderers, "1.0"))
     ok = await renderers.render_with_llm(
         RenderMode.DIRECT,
@@ -240,6 +343,7 @@ async def test_render_with_llm_direct_and_prose_reply(
 async def test_render_with_llm_rejects_decision_mode(
     renderers: Renderers, scripted_llm: FakeLlmCaller
 ) -> None:
+    """Verifies that `render_with_llm` raises `ValueError` for non-LLM render modes."""
     with pytest.raises(ValueError, match="express or direct"):
         await renderers.render_with_llm(
             RenderMode.DECISION,
@@ -254,6 +358,7 @@ async def test_render_with_llm_rejects_decision_mode(
 def test_status_surface_validates_and_escapes(
     renderers: Renderers, version: str
 ) -> None:
+    """Verifies that `status_surface` escapes quotes and backslashes into valid A2UI messages."""
     lines = [
         "**decision** · mock · 1 LLM call",
         'He said "hi" \\ bye',
@@ -269,6 +374,7 @@ def test_status_surface_validates_and_escapes(
 
 
 def test_stage2_user_text_mentions_intent_surface_and_payload() -> None:
+    """Verifies that `stage2_user_text` includes the intent, target surface ID, and JSON payload."""
     text = stage2_user_text(RESORT_BLOCK, "turn-7")
     assert "Show the resort overview" in text
     assert 'surface id "turn-7"' in text
@@ -278,6 +384,7 @@ def test_stage2_user_text_mentions_intent_surface_and_payload() -> None:
 def test_prompt_for_each_mode_is_that_formats_prompt(
     renderers: Renderers,
 ) -> None:
+    """Verifies that `prompt_for` returns distinct format-specific system instructions."""
     express = renderers.prompt_for(RenderMode.EXPRESS, "1.0")
     direct = renderers.prompt_for(RenderMode.DIRECT, "1.0")
     assert express != direct
@@ -287,6 +394,7 @@ def test_prompt_for_each_mode_is_that_formats_prompt(
 
 @pytest.mark.asyncio
 async def test_render_decision_login_form_forwards_mutable_paths() -> None:
+    """Verifies that `render_decision` forwards `mutablePaths` to synthesize a form archetype."""
     backend = DeterministicMockBackend(
         scripted={
             "family": {"input": 0.92, "browse": 0.02},
@@ -345,6 +453,7 @@ async def test_render_decision_login_form_forwards_mutable_paths() -> None:
 
 @pytest.mark.asyncio
 async def test_render_tool_result_synthesizes_with_zero_llm_calls() -> None:
+    """Verifies `render_tool_result` synthesis, `PlanCache` reuse, and explicit `fallbackDsl`."""
     backend = DeterministicMockBackend(
         scripted={
             "family": {"dashboard": 0.95, "browse": 0.05},

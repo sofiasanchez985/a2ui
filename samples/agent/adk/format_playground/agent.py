@@ -91,7 +91,11 @@ _DEFAULT_THINKING_BUDGET = 1000
 
 
 def default_model_name() -> str:
-    """The model name from `MODEL_NAME`, `LITELLM_MODEL`, or the sample default."""
+    """Resolves the stage-1 model name from environment variables or defaults.
+
+    Returns:
+        The model identifier string without a provider prefix.
+    """
     model_env = (
         os.getenv("MODEL_NAME") or os.getenv("LITELLM_MODEL") or "gemini-3.6-flash"
     )
@@ -99,13 +103,17 @@ def default_model_name() -> str:
 
 
 def default_thinking_budget() -> int:
-    """Maximum thinking tokens per ADK Gemini call (defaults to 1000)."""
+    """Resolves the maximum thinking token budget per ADK Gemini call.
+
+    Returns:
+        The configured integer thinking budget, defaulting to 1000.
+    """
     raw = os.getenv("A2UI_PLAYGROUND_THINKING_BUDGET")
     return int(raw) if raw is not None else _DEFAULT_THINKING_BUDGET
 
 
 class AdkLlmCaller:
-    """`LlmCaller` over the ADK: one `LlmAgent` and `Runner` per instruction key."""
+    """`LlmCaller` implementation over ADK with one `Runner` per instruction key."""
 
     def __init__(
         self,
@@ -115,6 +123,14 @@ class AdkLlmCaller:
         *,
         thinking_budget: int | None = None,
     ) -> None:
+        """Initializes the ADK caller with model and session settings.
+
+        Args:
+            model_name: Gemini model identifier.
+            app_name: ADK application name used for in-memory sessions.
+            user_id: ADK user identifier used for in-memory sessions.
+            thinking_budget: Optional thinking token budget override.
+        """
         self._model_name = model_name
         self._app_name = app_name
         self._user_id = user_id
@@ -129,6 +145,16 @@ class AdkLlmCaller:
         instruction: str,
         tools: Sequence[Any] | None = None,
     ) -> Runner:
+        """Returns a cached ADK `Runner` for `instruction_key` and `tools`.
+
+        Args:
+            instruction_key: Cache key identifying the system prompt.
+            instruction: System instruction text for the `LlmAgent`.
+            tools: Optional sequence of callable tools exposed to the agent.
+
+        Returns:
+            The cached or newly created `Runner`.
+        """
         cache_key = f"{instruction_key}:{len(tools or ())}"
         runner = self._runners.get(cache_key)
         if runner is None:
@@ -160,7 +186,16 @@ class AdkLlmCaller:
         return runner
 
     async def _session_for(self, runner: Runner, session_id: str | None) -> str:
-        """Returns an existing session id, or creates one (fresh when `session_id` is None)."""
+        """Resolves or creates an in-memory ADK session on `runner`.
+
+        Args:
+            runner: Target ADK `Runner`.
+            session_id: Existing session identifier, or `None` to allocate a
+                fresh one-shot session identifier.
+
+        Returns:
+            The active session identifier string.
+        """
         sid = session_id or f"oneshot-{uuid.uuid4()}"
         session = await runner.session_service.get_session(
             app_name=self._app_name, user_id=self._user_id, session_id=sid
@@ -179,6 +214,18 @@ class AdkLlmCaller:
         user_text: str,
         session_id: str | None,
     ) -> LlmTurn:
+        """Runs a text-only turn against the ADK `Runner`.
+
+        Args:
+            instruction_key: Cache key for the system instruction.
+            instruction: System instruction text.
+            user_text: User prompt text.
+            session_id: Conversation session identifier, or `None` for a
+                stateless stage-2 turn.
+
+        Returns:
+            The completed `LlmTurn` with response text, tokens, and latency.
+        """
         runner = self._runner_for(instruction_key, instruction)
         sid = await self._session_for(runner, session_id)
         started = time.perf_counter()
@@ -216,6 +263,19 @@ class AdkLlmCaller:
         session_id: str | None,
         tools: Sequence[Any],
     ) -> LlmToolTurn:
+        """Runs a tool-enabled turn against the ADK `Runner`.
+
+        Args:
+            instruction_key: Cache key for the system instruction.
+            instruction: System instruction text.
+            user_text: User prompt text.
+            session_id: Conversation session identifier, or `None` for a
+                stateless call.
+            tools: Sequence of callable tools exposed to the model.
+
+        Returns:
+            The completed `LlmToolTurn` with invoked tool metadata and usage.
+        """
         runner = self._runner_for(instruction_key, instruction, tools=tools)
         sid = await self._session_for(runner, session_id)
         started = time.perf_counter()
@@ -262,7 +322,12 @@ class AdkLlmCaller:
 
 
 def _append_part_texts(parts: Sequence[Any], chunks: list[str]) -> None:
-    """Appends string `text` attributes from `parts` onto `chunks`."""
+    """Appends non-empty string `text` attributes from `parts` onto `chunks`.
+
+    Args:
+        parts: Sequence of GenAI content part objects.
+        chunks: Mutable list accumulating string fragments.
+    """
     for part in parts:
         p_text = getattr(part, "text", None)
         if isinstance(p_text, str) and p_text:
@@ -276,7 +341,18 @@ def _collect_tool_event_parts(
     tool_args: dict[str, Any],
     tool_result: Any,
 ) -> tuple[str | None, dict[str, Any], Any]:
-    """Collects text chunks, function call args, and function responses from `parts`."""
+    """Collects text chunks, function call args, and function responses from `parts`.
+
+    Args:
+        parts: Sequence of GenAI content part objects from a runner event.
+        chunks: Mutable list accumulating text fragments.
+        tool_name: Previously observed tool name, if any.
+        tool_args: Previously observed tool arguments dictionary.
+        tool_result: Previously observed tool response payload, if any.
+
+    Returns:
+        An updated `(tool_name, tool_args, tool_result)` tuple.
+    """
     for part in parts:
         p_text = getattr(part, "text", None)
         if isinstance(p_text, str):
@@ -294,7 +370,16 @@ def _collect_tool_event_parts(
 def _execute_fallback_tool(
     tools: Sequence[Any], tool_name: str, tool_args: dict[str, Any]
 ) -> Any:
-    """Invokes the matching callable in `tools` when the runner returned no response."""
+    """Invokes the matching callable in `tools` when the runner returned no response.
+
+    Args:
+        tools: Sequence of registered tool callables.
+        tool_name: Name of the tool function to invoke.
+        tool_args: Keyword arguments to pass to the tool function.
+
+    Returns:
+        The tool's return value, or `None` if not found or if execution failed.
+    """
     for tool in tools:
         if getattr(tool, "__name__", None) == tool_name:
             try:
@@ -306,7 +391,15 @@ def _execute_fallback_tool(
 
 
 def _classify_stage1_source(query: str) -> Stage1Source:
-    """Classifies whether `query` came from pasted JSON or a normal/action LLM turn."""
+    """Classifies whether `query` came from pasted JSON or a normal/action LLM turn.
+
+    Args:
+        query: Incoming stage-1 query text.
+
+    Returns:
+        `"pasted_json"` when `query` is not a UI action report and embeds JSON,
+        otherwise `"llm"`.
+    """
     if (
         not query.startswith(UI_ACTION_PREFIX)
         and extract_pasted_json(query) is not None
@@ -316,7 +409,16 @@ def _classify_stage1_source(query: str) -> Stage1Source:
 
 
 class PlaygroundAgent:
-    """Chat agent that renders one request through the chosen inference mode."""
+    """Chat agent that renders one request through the chosen inference mode.
+
+    Attributes:
+        base_url: Base HTTP URL advertised in the A2A `AgentCard`.
+        model_name: Stage-1 and stage-2 language model identifier.
+        default_mode: Initial `RenderMode` for new conversation sessions.
+        llm: `LlmCaller` used for stage-1, stage-2, and tool-mode calls.
+        renderers: `Renderers` registry managing format processors and state.
+        agent_card: Published A2A `AgentCard` with A2UI extension metadata.
+    """
 
     def __init__(
         self,
@@ -327,6 +429,15 @@ class PlaygroundAgent:
         model_name: str | None = None,
         default_mode: RenderMode = RenderMode.DECISION,
     ) -> None:
+        """Initializes the playground agent and its per-version renderers.
+
+        Args:
+            base_url: Base HTTP URL for the agent card.
+            llm: Optional custom `LlmCaller` (defaults to `AdkLlmCaller`).
+            renderers: Optional preconfigured `Renderers` instance.
+            model_name: Optional language model name override.
+            default_mode: Default `RenderMode` for new conversations.
+        """
         self.base_url = base_url
         self.model_name = model_name or default_model_name()
         self.default_mode = default_mode
@@ -350,6 +461,11 @@ class PlaygroundAgent:
         self.agent_card = self._build_agent_card()
 
     def _build_agent_card(self) -> AgentCard:
+        """Constructs the A2A `AgentCard` advertising A2UI extensions.
+
+        Returns:
+            The configured `AgentCard`.
+        """
         extensions = [
             get_a2ui_agent_extension(
                 version,
@@ -384,9 +500,17 @@ class PlaygroundAgent:
             skills=[skill],
         )
 
-    # --- per-conversation state -------------------------------------------------
+    # Per-conversation state helpers.
 
     def _settings_for(self, session_id: str) -> PlaygroundSettings:
+        """Returns or initializes `PlaygroundSettings` for `session_id`.
+
+        Args:
+            session_id: Conversation session identifier.
+
+        Returns:
+            The active `PlaygroundSettings` for `session_id`.
+        """
         settings = self._settings.get(session_id)
         if settings is None:
             settings = PlaygroundSettings(mode=self.default_mode)
@@ -395,12 +519,19 @@ class PlaygroundAgent:
 
     @staticmethod
     def _remember(store: OrderedDict[str, Any], key: str, value: Any) -> None:
+        """Inserts or updates `key` in an LRU `OrderedDict` capped at `_MAX_SESSIONS`.
+
+        Args:
+            store: Target `OrderedDict` session store.
+            key: Conversation session identifier.
+            value: Value to store under `key`.
+        """
         store[key] = value
         store.move_to_end(key)
         while len(store) > _MAX_SESSIONS:
             store.popitem(last=False)
 
-    # --- replies ---------------------------------------------------------------
+    # Reply construction helpers.
 
     def _status(
         self,
@@ -409,6 +540,17 @@ class PlaygroundAgent:
         version: str,
         suffix: str = "status",
     ) -> list[Part]:
+        """Renders `lines` as a per-turn A2UI status surface.
+
+        Args:
+            lines: Markdown text lines to render.
+            settings: Active conversation settings.
+            version: A2UI protocol version string.
+            suffix: Surface identifier suffix.
+
+        Returns:
+            A list of A2UI `Part` wrappers for the status surface.
+        """
         return self.renderers.status_surface(
             lines,
             surface_id=status_surface_id(settings, suffix),
@@ -431,6 +573,25 @@ class PlaygroundAgent:
         candidates: Sequence[tuple[RenderMode, str, RenderResult, TurnMetrics]],
         version: str,
     ) -> Part:
+        """Builds an in-band `application/x-a2ui-playground-trace+json` `DataPart`.
+
+        Args:
+            turn: 1-based turn number.
+            query: User query or slash command for the turn.
+            compare: Whether the turn rendered all three comparison modes.
+            active_mode: Active `RenderMode` for the turn.
+            stage1_source: How the `DecisionBlock` was produced.
+            stage1_turn: Stage-1 `LlmTurn`, or `None` for direct tool calls.
+            tool_name: Invoked tool name in `tool` mode, or `None`.
+            tool_args: Invoked tool arguments in `tool` mode, or `None`.
+            block: Extracted or constructed `DecisionBlock`, or `None`.
+            stage1_error: Stage-1 error string, or `None`.
+            candidates: Rendered `(mode, surface_id, result, metrics)` tuples.
+            version: Negotiated A2UI protocol version string.
+
+        Returns:
+            An A2A `Part` wrapping the serialized `PlaygroundTurnTrace`.
+        """
         return create_trace_part(
             build_turn_trace(
                 turn=turn,
@@ -465,6 +626,25 @@ class PlaygroundAgent:
         block: DecisionBlock,
         inspector_enabled: bool,
     ) -> list[Part]:
+        """Packages a rendered tool result with either a footer or an inspector trace.
+
+        Args:
+            query: User query or `/tool <name>` command.
+            settings: Updated conversation settings for the turn.
+            version: A2UI protocol version string.
+            surface_id: Target A2UI surface identifier.
+            result: Completed `RenderResult` from `render_tool_result`.
+            metrics: Combined `TurnMetrics` for the turn.
+            stage1_source: `"direct_tool"` or `"tool_call"`.
+            stage1_turn: Stage-1 `LlmTurn` when an LLM selected the tool.
+            tool_name: Canonical tool function name.
+            tool_args: Arguments passed to the tool.
+            block: Constructed `DecisionBlock` for the tool output.
+            inspector_enabled: Whether the client requested an in-band trace.
+
+        Returns:
+            A list of A2A `Part` items for the response.
+        """
         parts = list(result.parts)
         if not inspector_enabled:
             footer_lines = [metrics.footer()]
@@ -508,7 +688,18 @@ class PlaygroundAgent:
         *,
         inspector_enabled: bool = False,
     ) -> AsyncIterable[dict[str, Any]]:
-        """Handles one chat message and yields a single final item of parts."""
+        """Handles one chat message and yields a single final response item.
+
+        Args:
+            query: User query, slash command, or formatted action/payload text.
+            session_id: A2A conversation context identifier.
+            ui_version: Negotiated A2UI protocol version, or `None` if missing.
+            inspector_enabled: Whether to omit inline footers and attach an
+                in-band `PlaygroundTurnTrace` `DataPart`.
+
+        Yields:
+            A dictionary with `is_task_complete=True` and response `parts`.
+        """
         if ui_version is None:
             yield {
                 "is_task_complete": True,
@@ -561,6 +752,18 @@ class PlaygroundAgent:
         *,
         inspector_enabled: bool = False,
     ) -> list[Part]:
+        """Executes a slash command and returns its response parts.
+
+        Args:
+            command: Parsed `Command` instance.
+            session_id: Conversation session identifier.
+            settings: Current conversation settings.
+            version: Negotiated A2UI protocol version string.
+            inspector_enabled: Whether the client requested an in-band trace.
+
+        Returns:
+            A list of A2A `Part` items for the command response.
+        """
         if command.name == "tool":
             return await self._render_direct_tool(
                 command.argument,
@@ -602,13 +805,27 @@ class PlaygroundAgent:
         *,
         inspector_enabled: bool = False,
     ) -> list[Part]:
-        """Executes a specific example tool and renders its result with zero LLM calls."""
+        """Executes a named example tool and renders its result with zero LLM calls.
+
+        Args:
+            argument: Tool alias or function name passed to `/tool`.
+            session_id: Conversation session identifier.
+            settings: Current conversation settings.
+            version: Negotiated A2UI protocol version string.
+            inspector_enabled: Whether the client requested an in-band trace.
+
+        Returns:
+            A list of A2A `Part` items containing the rendered surface and
+            footer or inspector trace.
+        """
         choices = ", ".join(EXAMPLE_TOOL_NAMES)
         if not argument:
             return self._status(
                 [f"Usage: `/tool <name>` (choose {choices})."], settings, version
             )
-        next_settings = settings.next_turn()
+        # Direct tool execution always targets a single tool render on "main"
+        # and clears any pending one-shot /compare flag.
+        next_settings = PlaygroundSettings(mode=settings.mode, turn=settings.turn + 1)
         invoked = run_example_tool(argument, next_settings.turn)
         if invoked is None:
             return self._status(
@@ -664,6 +881,14 @@ class PlaygroundAgent:
         )
 
     async def _switch_backend(self, argument: str | None) -> list[str]:
+        """Switches the active decision backend to the preset named by `argument`.
+
+        Args:
+            argument: Backend preset name (`"jev"`, `"gemini"`, or `"mock"`).
+
+        Returns:
+            Status lines reporting the active or newly configured backend.
+        """
         if not argument:
             choices = ", ".join(DECISION_BACKENDS)
             return [
@@ -692,6 +917,22 @@ class PlaygroundAgent:
         list[tuple[RenderMode, RenderResult, TurnMetrics]],
         list[tuple[RenderMode, str, RenderResult, TurnMetrics]],
     ]:
+        """Renders `block` across `modes` and collects surface parts and metrics.
+
+        Args:
+            modes: Sequence of render modes to execute (1 for normal turns, 3
+                for `/compare`).
+            block: Extracted stage-1 `DecisionBlock`.
+            stage1: Completed stage-1 `LlmTurn`.
+            settings: Active conversation settings for this turn.
+            version: Negotiated A2UI protocol version string.
+            session_id: Conversation session identifier.
+            inspector_enabled: Whether inline footers and compare cards should
+                be omitted in favor of an inspector trace.
+
+        Returns:
+            A `(parts, turn_candidates, trace_candidates)` tuple.
+        """
         parts: list[Part] = []
         results: list[tuple[RenderMode, RenderResult]] = []
         turn_candidates: list[tuple[RenderMode, RenderResult, TurnMetrics]] = []
@@ -732,6 +973,18 @@ class PlaygroundAgent:
         *,
         inspector_enabled: bool = False,
     ) -> list[Part]:
+        """Runs a two-stage chat render turn (`decision`, `express`, `direct`, or `/compare`).
+
+        Args:
+            query: User message text.
+            session_id: Conversation session identifier.
+            settings: Current conversation settings.
+            version: Negotiated A2UI protocol version string.
+            inspector_enabled: Whether to attach an in-band inspector trace.
+
+        Returns:
+            A list of A2A `Part` items for the completed turn.
+        """
         settings = settings.next_turn()
         stage1_source = _classify_stage1_source(query)
         try:
@@ -841,6 +1094,19 @@ class PlaygroundAgent:
         *,
         inspector_enabled: bool,
     ) -> list[Part]:
+        """Builds status and trace parts when a `tool` mode turn invoked no tool.
+
+        Args:
+            query: User message text.
+            session_id: Conversation session identifier.
+            settings: Updated conversation settings for the turn.
+            version: Negotiated A2UI protocol version string.
+            tool_turn: Completed `LlmToolTurn` with no tool call.
+            inspector_enabled: Whether to attach an in-band inspector trace.
+
+        Returns:
+            A list of A2A `Part` items for the prose reply.
+        """
         self._remember(self._settings, session_id, settings)
         prose = tool_turn.text.strip() or "No relevant tool was found for that request."
         metrics = TurnMetrics(
@@ -906,6 +1172,18 @@ class PlaygroundAgent:
         *,
         inspector_enabled: bool = False,
     ) -> list[Part]:
+        """Runs a `tool` mode turn where the LLM selects a tool and the decision model renders it.
+
+        Args:
+            query: User message text.
+            session_id: Conversation session identifier.
+            settings: Current conversation settings.
+            version: Negotiated A2UI protocol version string.
+            inspector_enabled: Whether to attach an in-band inspector trace.
+
+        Returns:
+            A list of A2A `Part` items for the completed tool turn.
+        """
         settings = settings.next_turn()
         try:
             tool_turn = await self.llm.call_with_tools(
@@ -1015,6 +1293,16 @@ class PlaygroundAgent:
     async def _rate_turn(
         self, session_id: str, argument: str | None, comment: str | None
     ) -> list[str]:
+        """Records a user preference rating for the last turn in `session_id`.
+
+        Args:
+            session_id: Conversation session identifier.
+            argument: Winning render mode name.
+            comment: Optional free-form feedback comment.
+
+        Returns:
+            Status lines confirming or rejecting the rating.
+        """
         if not argument:
             return [
                 "Usage: `/rate <mode> [comment]` (e.g. `/rate decision Looks cleaner`)."
@@ -1061,6 +1349,11 @@ class PlaygroundAgent:
         return [f"Recorded preference for `{winner}`{suffix}."]
 
     async def _show_ratings(self) -> list[str]:
+        """Summarizes recorded mode preference win counts from `RATINGS_PATH`.
+
+        Returns:
+            Status lines listing win counts and percentages per mode.
+        """
         wins = await asyncio.to_thread(summarize_ratings, RATINGS_PATH)
         if not wins:
             return ["No ratings recorded yet. Use `/rate <mode> [comment]` to vote."]
@@ -1082,6 +1375,18 @@ class PlaygroundAgent:
         version: str,
         session_id: str,
     ) -> RenderResult:
+        """Dispatches `block` to the renderer for `mode`.
+
+        Args:
+            mode: Target `RenderMode`.
+            block: Decision block to render.
+            settings: Active conversation settings.
+            version: Negotiated A2UI protocol version string.
+            session_id: Conversation session identifier.
+
+        Returns:
+            The resulting `RenderResult`.
+        """
         surface_id = surface_id_for(settings, mode)
         # Compare turns render fresh per-turn surfaces, so they skip the
         # conversation's surface state.
@@ -1119,6 +1424,18 @@ class PlaygroundAgent:
         settings: PlaygroundSettings,
         version: str,
     ) -> list[Part]:
+        """Builds the inline footer surface parts for `result` when the inspector is off.
+
+        Args:
+            mode: Render mode that produced `result`.
+            result: Completed `RenderResult`.
+            stage1: Completed stage-1 `LlmTurn`.
+            settings: Active conversation settings.
+            version: Negotiated A2UI protocol version string.
+
+        Returns:
+            A list of A2UI `Part` wrappers for the footer surface.
+        """
         metrics = result.metrics or TurnMetrics(
             mode=mode, backend="llm", llm_calls=0, latency_ms=0.0
         )
@@ -1134,6 +1451,17 @@ class PlaygroundAgent:
         settings: PlaygroundSettings,
         version: str,
     ) -> list[Part]:
+        """Builds the inline `/compare` summary card when the inspector is off.
+
+        Args:
+            results: Sequence of `(mode, result)` pairs across `CHAT_MODES`.
+            stage1: Completed stage-1 `LlmTurn`.
+            settings: Active conversation settings.
+            version: Negotiated A2UI protocol version string.
+
+        Returns:
+            A list of A2UI `Part` wrappers for the compare summary surface.
+        """
         lines = ["**Compare** (same intent and data through every mode)"]
         for mode, result in results:
             metrics = (

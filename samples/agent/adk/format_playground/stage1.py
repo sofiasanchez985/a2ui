@@ -88,15 +88,29 @@ UI_ACTION_PREFIX = "User interacted with the UI:"
 
 
 def stage1_instruction(grammar: ArchetypeGrammar) -> str:
-    """The stage-1 system instruction: the preamble plus the decision block contract."""
+    """Builds the stage-1 system instruction for `grammar`.
+
+    Args:
+        grammar: Archetype grammar providing valid layout brief roles.
+
+    Returns:
+        The combined preamble and decision-block formatting contract.
+    """
     return f"{STAGE1_PREAMBLE}\n\n{decision_rules(grammar)}"
 
 
 def extract_pasted_json(query: str) -> Mapping[str, Any] | Sequence[Any] | None:
-    """Returns the first JSON object or array embedded in `query`, or None.
+    """Extracts the first JSON object or array embedded in `query`.
 
     Scans from each `{` or `[` with `JSONDecoder.raw_decode`, so braces inside
-    prose that are not JSON are ignored.
+    surrounding prose that do not form valid JSON are ignored.
+
+    Args:
+        query: Raw user message text.
+
+    Returns:
+        The decoded JSON mapping or list, or `None` if no JSON object or array
+        is present.
     """
     decoder = json.JSONDecoder()
     for index, char in enumerate(query):
@@ -112,10 +126,17 @@ def extract_pasted_json(query: str) -> Mapping[str, Any] | Sequence[Any] | None:
 
 
 def stage1_user_text(query: str) -> str:
-    """The stage-1 user message, with pasted JSON pinned as the payload.
+    """Formats the stage-1 user message, pinning any pasted JSON as the payload.
 
-    UI action reports carry their context as JSON, which must not be mistaken
-    for a payload, so text starting with `UI_ACTION_PREFIX` is passed through.
+    UI action reports carry their bound context as JSON, which must not be
+    mistaken for a data payload, so text starting with `UI_ACTION_PREFIX` is
+    passed through unchanged.
+
+    Args:
+        query: Raw or executor-formatted user query string.
+
+    Returns:
+        The stage-1 user message string.
     """
     if query.startswith(UI_ACTION_PREFIX):
         return query
@@ -129,10 +150,15 @@ def stage1_user_text(query: str) -> str:
 
 
 def extract_block(text: str) -> DecisionBlock | None:
-    """Reads the first decision block out of a stage-1 reply.
+    """Extracts and validates the first `DecisionBlock` from a stage-1 reply.
 
-    Returns None when the reply has no block, the block is not JSON the SDK's
-    tolerant parser can fix, or `DecisionBlock.from_mapping` rejects it.
+    Args:
+        text: Raw stage-1 model response text.
+
+    Returns:
+        The parsed `DecisionBlock`, or `None` when the reply contains no block,
+        contains malformed JSON that the tolerant reader cannot repair, or
+        fails `DecisionBlock.from_mapping` validation.
     """
     lexer = BlockLexer(
         open_tag=A2UI_INFERENCE_OPEN_TAG,

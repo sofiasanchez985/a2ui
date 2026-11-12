@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 class MissingAPIKeyError(Exception):
-    """Exception for missing API key."""
+    """Raised when no Gemini API key or Vertex AI configuration is available."""
 
 
 @click.command()
@@ -58,6 +58,14 @@ class MissingAPIKeyError(Exception):
     ),
 )
 def main(host: str, port: int, mode: str, backend: str | None) -> None:
+    """Starts the A2A Starlette server for the format playground agent.
+
+    Args:
+        host: Network interface hostname to bind.
+        port: TCP port number for the HTTP server.
+        mode: Default render mode for new conversations.
+        backend: Optional decision backend override name.
+    """
     try:
         if not os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
             if not os.getenv("GEMINI_API_KEY"):

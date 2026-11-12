@@ -30,6 +30,7 @@ from modes import (
 
 
 def test_render_mode_round_trips_and_formats_as_value() -> None:
+    """Verifies `RenderMode` string formatting and `as_mode` parsing."""
     assert RenderMode("express") is RenderMode.EXPRESS
     assert str(RenderMode.DECISION) == "decision"
     assert f"{RenderMode.DIRECT}" == "direct"
@@ -38,6 +39,7 @@ def test_render_mode_round_trips_and_formats_as_value() -> None:
 
 
 def test_footer_with_every_field() -> None:
+    """Verifies `TurnMetrics.footer` when all latency, token, archetype, and block fields are set."""
     metrics = TurnMetrics(
         mode=RenderMode.DECISION,
         backend="mock",
@@ -57,6 +59,7 @@ def test_footer_with_every_field() -> None:
 
 
 def test_footer_minimal_and_plural_forms() -> None:
+    """Verifies `TurnMetrics.footer` pluralization and fallback suffixes."""
     metrics = TurnMetrics(
         mode=RenderMode.EXPRESS, backend="llm", llm_calls=2, latency_ms=4100.0
     )
@@ -73,6 +76,7 @@ def test_footer_minimal_and_plural_forms() -> None:
 
 
 def test_plus_stage1_folds_the_first_call_in() -> None:
+    """Verifies `TurnMetrics.plus_stage1` adds Stage 1 latency, tokens, and call count."""
     base = TurnMetrics(
         mode=RenderMode.DECISION, backend="mock", llm_calls=0, latency_ms=12.0
     )
@@ -86,6 +90,7 @@ def test_plus_stage1_folds_the_first_call_in() -> None:
 
 
 def test_surface_ids_and_turn_counter() -> None:
+    """Verifies `surface_id_for` and `status_surface_id` across single and compare turns."""
     settings = PlaygroundSettings().next_turn()
     assert settings.turn == 1
     assert surface_id_for(settings) == "turn-1"
@@ -101,12 +106,14 @@ def test_surface_ids_and_turn_counter() -> None:
 
 
 def test_render_result_ok_requires_parts_and_no_error() -> None:
+    """Verifies `RenderResult.ok` is true only when `parts` is non-empty and `error` is `None`."""
     assert not RenderResult().ok
     assert not RenderResult(parts=[object()], error="boom").ok  # type: ignore[list-item]
     assert RenderResult(parts=[object()]).ok  # type: ignore[list-item]
 
 
 def test_path_summary_and_decision_timing_across_stages() -> None:
+    """Verifies `TurnMetrics.footer` path summary formatting across archetype, template, and fallback."""
     archetype_m = TurnMetrics(
         mode=RenderMode.DECISION,
         backend="jev",
@@ -162,6 +169,7 @@ def test_path_summary_and_decision_timing_across_stages() -> None:
 
 
 def test_footer_shows_model_id_and_non_create_operations() -> None:
+    """Verifies `TurnMetrics.footer` displays `model_id`, `update_root`, `cache hit`, and `fit`."""
     metrics = TurnMetrics(
         mode=RenderMode.DECISION,
         backend="mock",

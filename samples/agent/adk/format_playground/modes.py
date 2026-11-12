@@ -37,6 +37,7 @@ class RenderMode(str, Enum):
     TOOL = "tool"
 
     def __str__(self) -> str:
+        """Returns the lowercase string value of this render mode."""
         return self.value
 
 
@@ -49,22 +50,39 @@ CHAT_MODES: tuple[RenderMode, ...] = (
 
 @dataclass(frozen=True)
 class PlaygroundSettings:
-    """Per-conversation state the slash commands change."""
+    """Per-conversation state controlled by slash commands.
+
+    Attributes:
+        mode: Active render mode for subsequent turns.
+        compare: Whether the next render request runs through all three chat
+            modes before resetting to `False`.
+        turn: Number of render requests processed so far, used to derive
+            per-turn surface identifiers.
+    """
 
     mode: RenderMode = RenderMode.DECISION
     compare: bool = False
-    """When True, the next render goes through all three modes, then resets."""
     turn: int = 0
-    """Number of render requests so far; drives the per-turn surface ids."""
 
     def next_turn(self) -> PlaygroundSettings:
-        """The settings for the next render request."""
+        """Returns updated settings with `turn` incremented by 1.
+
+        Returns:
+            A new `PlaygroundSettings` instance for the next render request.
+        """
         return replace(self, turn=self.turn + 1)
 
 
 @dataclass(frozen=True)
 class LlmTurn:
-    """One model call: its text and what it cost."""
+    """Result and usage metrics of a single language model call.
+
+    Attributes:
+        text: Concatenated text response from the model.
+        prompt_tokens: Input prompt token count.
+        output_tokens: Generated output token count.
+        latency_ms: Wall-clock duration of the model call in milliseconds.
+    """
 
     text: str
     prompt_tokens: int = 0
@@ -74,7 +92,18 @@ class LlmTurn:
 
 @dataclass(frozen=True)
 class LlmToolTurn:
-    """One model call that invokes a tool: the tool called and what it cost."""
+    """Result and usage metrics of a tool-enabled language model call.
+
+    Attributes:
+        tool_name: Name of the tool invoked by the model, or `None` if no tool
+            was called.
+        arguments: Arguments passed to the invoked tool.
+        result: Return value produced by the invoked tool.
+        prompt_tokens: Input prompt token count.
+        output_tokens: Generated output token count.
+        latency_ms: Wall-clock duration of the model call in milliseconds.
+        text: Any accompanying prose emitted by the model.
+    """
 
     tool_name: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
@@ -86,12 +115,12 @@ class LlmToolTurn:
 
 
 class LlmCaller(Protocol):
-    """Runs one instruction-plus-message turn against a language model.
+    """Protocol for running instruction-plus-message turns against a language model.
 
     `instruction_key` identifies the system instruction so an implementation
-    can keep one configured agent per key. `session_id=None` means a fresh
-    session with no history (stage 2); a string keeps conversation history
-    under that id (stage 1).
+    can cache one configured agent per key. Passing `session_id=None` starts a
+    stateless one-shot call (stage 2), whereas a string preserves conversation
+    history under that identifier (stage 1).
     """
 
     async def __call__(
@@ -101,7 +130,20 @@ class LlmCaller(Protocol):
         instruction: str,
         user_text: str,
         session_id: str | None,
-    ) -> LlmTurn: ...
+    ) -> LlmTurn:
+        """Executes a text-only turn against the language model.
+
+        Args:
+            instruction_key: Cache key for the system instruction.
+            instruction: System instruction text.
+            user_text: User message text.
+            session_id: Conversation session identifier, or `None` for a
+                stateless call.
+
+        Returns:
+            The completed `LlmTurn`.
+        """
+        ...
 
     async def call_with_tools(
         self,
@@ -111,11 +153,32 @@ class LlmCaller(Protocol):
         user_text: str,
         session_id: str | None,
         tools: Sequence[Any],
-    ) -> LlmToolTurn: ...
+    ) -> LlmToolTurn:
+        """Executes a tool-enabled turn against the language model.
+
+        Args:
+            instruction_key: Cache key for the system instruction.
+            instruction: System instruction text.
+            user_text: User message text.
+            session_id: Conversation session identifier, or `None` for a
+                stateless call.
+            tools: Sequence of callable tool functions exposed to the model.
+
+        Returns:
+            The completed `LlmToolTurn`.
+        """
+        ...
 
 
 def format_decision_ms(ms: float) -> str:
-    """Formats a decision-model latency in milliseconds (or seconds when >= 1000 ms)."""
+    """Formats a decision-model latency in milliseconds or seconds.
+
+    Args:
+        ms: Latency duration in milliseconds.
+
+    Returns:
+        A human-readable latency string.
+    """
     if ms < 1.0:
         return f"{ms:.2f} ms"
     if ms < 1000.0:
@@ -125,11 +188,36 @@ def format_decision_ms(ms: float) -> str:
 
 @dataclass(frozen=True)
 class TurnMetrics:
-    """What one render cost, shown in the footer under every surface."""
+    """Cost and synthesis metadata for one rendered candidate.
+
+    Attributes:
+        mode: Render mode that produced the candidate.
+        backend: Decision `backend_kind` (`"mock"`, `"jev"`, `"gemini"`, etc.)
+            or `"llm"` for stage-2 LLM modes.
+        llm_calls: Number of language model calls executed.
+        latency_ms: Total wall-clock latency in milliseconds.
+        prompt_tokens: Total input prompt tokens consumed.
+        output_tokens: Total output tokens generated.
+        archetype: Selected archetype identifier when `stage == "archetype"`.
+        confidence: Winning archetype or template confidence score.
+        block_count: Number of planned blocks in the layout plan.
+        fallback: `FallbackSource` value, or `"validation_retry"` when stage 2
+            required a retry.
+        fallback_reason: Reason the decision fallback chain ran.
+        stage: `SynthesisStage` value (`"template_select"`, `"archetype"`, or
+            `"abstain_fallback"`).
+        decision_latency_ms: Milliseconds spent waiting on the decision backend.
+        decision_calls: Number of decision backend `answer()` calls.
+        template_id: Selected template identifier when
+            `stage == "template_select"`.
+        model_id: Pinned model identifier on the decision backend.
+        operation: `SurfaceOperation` emitted by the decision synthesizer.
+        cache_hit: Whether a cached plan answered without calling the backend.
+        fit_score: Fit score of the chosen archetype against the payload.
+    """
 
     mode: RenderMode
     backend: str
-    """Decision `backend_kind` (`mock`, `jev`, `step0`, ...) or `llm` for stage-2 modes."""
     llm_calls: int
     latency_ms: float
     prompt_tokens: int = 0
@@ -138,28 +226,23 @@ class TurnMetrics:
     confidence: float | None = None
     block_count: int | None = None
     fallback: str | None = None
-    """A `FallbackSource` value, or `validation_retry` when stage 2 needed a retry."""
     fallback_reason: str | None = None
-    """Why the decision fallback chain ran (`SynthesisOutput.fallback_reason`)."""
     stage: str | None = None
-    """The `SynthesisStage` value (`template_select`, `archetype`, `abstain_fallback`)."""
     decision_latency_ms: float | None = None
-    """Wall-clock milliseconds spent waiting on the decision model."""
     decision_calls: int | None = None
-    """Number of decision model `answer()` calls."""
     template_id: str | None = None
-    """Registered template id when `stage == 'template_select'`."""
     model_id: str | None = None
-    """The decision backend's pinned model id."""
     operation: str | None = None
-    """The `SurfaceOperation` the decision render emitted."""
     cache_hit: bool = False
-    """Whether a cached plan answered without a decision backend call."""
     fit_score: float | None = None
-    """How well the chosen archetype fits the payload (`LayoutPlan.fit_score`)."""
 
     def path_summary(self) -> str | None:
-        """Describes whether rendering used the decision model, a template, or a fallback."""
+        """Formats the synthesis path summary for the footer card.
+
+        Returns:
+            A summary string describing whether rendering used a template, the
+            decision model, or a fallback, or `None` for non-decision modes.
+        """
         conf = f" ({self.confidence:.2f})" if self.confidence is not None else ""
         if self.stage == "template_select":
             tpl = f" {self.template_id}" if self.template_id else ""
@@ -177,12 +260,21 @@ class TurnMetrics:
         return None
 
     def backend_label(self) -> str:
-        """`backend_kind` plus the pinned model id when there is one."""
+        """Formats the backend kind and optional pinned model identifier.
+
+        Returns:
+            The backend label string.
+        """
         if self.model_id and self.model_id != self.backend:
             return f"{self.backend} ({self.model_id})"
         return self.backend
 
     def _timing(self) -> str:
+        """Formats decision and total latency for the footer card.
+
+        Returns:
+            A formatted timing string.
+        """
         if self.decision_latency_ms is None:
             return f"{self.latency_ms / 1000.0:.1f} s"
         dec_time = f"decision {format_decision_ms(self.decision_latency_ms)}"
@@ -191,13 +283,22 @@ class TurnMetrics:
         return dec_time
 
     def _call_label(self) -> str:
+        """Formats the LLM call count label for the footer card.
+
+        Returns:
+            A singular or plural LLM call count string.
+        """
         plural = "" if self.llm_calls == 1 else "s"
         if self.mode == RenderMode.TOOL and self.llm_calls > 0:
             return f"{self.llm_calls} LLM call{plural} (tool call{plural} only)"
         return f"{self.llm_calls} LLM call{plural}"
 
     def footer(self) -> str:
-        """One line summarizing the turn, fields separated by ` · `."""
+        """Formats a single-line footer summarizing this turn's metrics.
+
+        Returns:
+            A middle-dot-separated summary string.
+        """
         parts: list[str] = [
             f"**{self.mode}**",
             self.backend_label(),
@@ -217,7 +318,11 @@ class TurnMetrics:
         return " · ".join(parts)
 
     def _plan_parts(self) -> list[str]:
-        """Archetype, block count, and fallback when no decision stage is known."""
+        """Formats archetype, block count, and fallback when `stage` is unset.
+
+        Returns:
+            A list of summary fragments.
+        """
         parts: list[str] = []
         if self.archetype is not None:
             conf = f" ({self.confidence:.2f})" if self.confidence is not None else ""
@@ -231,7 +336,14 @@ class TurnMetrics:
         return parts
 
     def plus_stage1(self, stage1: LlmTurn) -> TurnMetrics:
-        """Folds the stage-1 call into these metrics."""
+        """Folds stage-1 LLM call counts, latency, and tokens into these metrics.
+
+        Args:
+            stage1: Completed stage-1 `LlmTurn`.
+
+        Returns:
+            A new `TurnMetrics` including the stage-1 call.
+        """
         return replace(
             self,
             llm_calls=self.llm_calls + 1,
@@ -243,27 +355,33 @@ class TurnMetrics:
 
 @dataclass(frozen=True)
 class RenderResult:
-    """The outcome of rendering one block through one mode."""
+    """Outcome of rendering one decision block through one mode.
+
+    Attributes:
+        parts: A2UI `Part` wrappers for the rendered surface; empty on failure.
+        metrics: Cost and synthesis metrics for the render.
+        trace_lines: Formatted planner question trace lines for `/trace`.
+        error: Error message when rendering failed, or `None` on success.
+        decision_answers: Raw `DecisionAnswer` tuple from the decision backend.
+        output: Full `SynthesisOutput` from the decision synthesizer, if any.
+        messages: Raw A2UI protocol message dictionaries.
+        raw_stage2_text: Raw stage-2 LLM reply text for `express` or `direct`.
+        decompiled_express: A2UI Express DSL decompiled from `messages`.
+    """
 
     parts: list[Part] = field(default_factory=list)
-    """A2UI data parts for the rendered surface; empty when `error` is set."""
     metrics: TurnMetrics | None = None
     trace_lines: tuple[str, ...] = ()
-    """Decision only: one line per planner question, for `/trace`."""
     error: str | None = None
-    """Why rendering failed, if it did."""
     decision_answers: tuple[Any, ...] = ()
     output: Any = None
     messages: tuple[dict[str, Any], ...] = ()
-    """Raw A2UI message dictionaries produced for this candidate."""
     raw_stage2_text: str | None = None
-    """Raw LLM Stage 2 reply text for `express` or `direct` renders."""
     decompiled_express: str = ""
-    """A2UI Express representation decompiled from the candidate's messages."""
 
     @property
     def ok(self) -> bool:
-        """Whether the render produced a surface."""
+        """Whether the render produced at least one surface part without error."""
         return self.error is None and bool(self.parts)
 
 
@@ -272,11 +390,18 @@ MAIN_SURFACE_ID = "main"
 
 
 def surface_id_for(settings: PlaygroundSettings, mode: RenderMode | None = None) -> str:
-    """The surface id a render of `mode` targets.
+    """Determines the target surface identifier for a render of `mode`.
 
-    Decision and tool renders reuse `MAIN_SURFACE_ID` across turns. Express and
-    direct renders, which a model writes from scratch, and every surface of a
-    `/compare` turn get per-turn ids.
+    Decision and tool renders reuse `MAIN_SURFACE_ID` across turns so repeated
+    shapes update in place. Express, direct, and `/compare` renders use
+    per-turn surface identifiers.
+
+    Args:
+        settings: Active conversation settings containing `turn` and `compare`.
+        mode: Render mode being executed, or `None` for the base turn id.
+
+    Returns:
+        The target A2UI surface identifier string.
     """
     base = f"turn-{settings.turn}"
     if settings.compare:
@@ -287,12 +412,27 @@ def surface_id_for(settings: PlaygroundSettings, mode: RenderMode | None = None)
 
 
 def status_surface_id(settings: PlaygroundSettings, suffix: str) -> str:
-    """The per-turn id of a status or footer surface."""
+    """Builds the per-turn surface identifier for a status or footer card.
+
+    Args:
+        settings: Active conversation settings.
+        suffix: Card suffix such as `"status"`, `"compare"`, or `"tool-footer"`.
+
+    Returns:
+        The status surface identifier string.
+    """
     return f"turn-{settings.turn}-{suffix}"
 
 
 def as_mode(value: Any) -> RenderMode | None:
-    """Parses a user-typed mode name, or None when it is not one."""
+    """Parses a user-supplied mode name into a `RenderMode`.
+
+    Args:
+        value: Raw mode name value.
+
+    Returns:
+        The matching `RenderMode`, or `None` if `value` is not a valid mode.
+    """
     try:
         return RenderMode(str(value).strip().lower())
     except ValueError:
