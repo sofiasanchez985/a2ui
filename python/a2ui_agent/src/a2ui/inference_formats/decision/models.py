@@ -23,9 +23,9 @@ import hashlib
 import json
 import math
 import re
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from a2ui.core import A2uiValidationError, CatalogApi
+from a2ui.core import A2uiError, A2uiValidationError, CatalogApi
 from a2ui.core.schema import AgentToRendererMessage
 
 if TYPE_CHECKING:
@@ -317,7 +317,20 @@ class SlotKind(str, Enum):
 
 @dataclass(frozen=True)
 class ComponentSlot:
-    """Metadata describing a single bindable or structural slot on a component."""
+    """Metadata describing a single bindable or structural slot on a component.
+
+    Attributes:
+        name: Property name on the component schema.
+        kind: Structural or data-binding category of the slot.
+        required: Whether the component schema requires this property.
+        value_type: Coarse value type for `DATA_VALUE` slots, when applicable.
+        enum_values: Allowed string values for `STATIC_ENUM` slots.
+        child_id_key: Object key holding the child component ID for
+            `NAMED_CHILD_ARRAY` slots.
+        label_key: Object key holding the tab or item label for
+            `NAMED_CHILD_ARRAY` slots.
+        description: Human-readable property description from the catalog.
+    """
 
     name: str
     kind: SlotKind
@@ -331,7 +344,19 @@ class ComponentSlot:
 
 @dataclass(frozen=True)
 class ComponentNodeSpec:
-    """Catalog-derived structural specification for a single A2UI component."""
+    """Catalog-derived structural specification for a single A2UI component.
+
+    Attributes:
+        name: Component type name in the catalog.
+        catalog_id: Identifier of the catalog defining this component.
+        description: Human-readable component summary from the catalog schema.
+        slots: Bindable and structural property slots on the component.
+        supports_checks: Whether the component supports validation `checks`.
+        is_container: Whether the component has child component slots.
+        is_multi_view_switcher: Whether the component has a
+            `NAMED_CHILD_ARRAY` slot.
+        has_action_slot: Whether the component has an `ACTION` slot.
+    """
 
     name: str
     catalog_id: str
@@ -343,7 +368,15 @@ class ComponentNodeSpec:
     has_action_slot: bool = False
 
     def get_slot(self, name: str) -> ComponentSlot | None:
-        """Returns the ComponentSlot matching name (ignoring index brackets like [0])."""
+        """Returns the `ComponentSlot` matching `name` (ignoring index brackets).
+
+        Args:
+            name: Slot name, optionally suffixed with an array index such as
+                ``"tabs[0]"``.
+
+        Returns:
+            The matching `ComponentSlot`, or None if absent.
+        """
         base_name = name.split("[", 1)[0]
         for slot in self.slots:
             if slot.name == base_name or slot.name == name:
@@ -353,7 +386,14 @@ class ComponentNodeSpec:
 
 @dataclass(frozen=True, eq=True)
 class DecisionDistribution:
-    """Probability distribution returned by a decision-model backend."""
+    """Probability distribution returned by a decision-model backend.
+
+    Attributes:
+        probabilities: Candidate option IDs mapped to their probabilities.
+        calibrated: Whether the probabilities are temperature-calibrated.
+        top_logit_margin: Logit margin between the top two candidates, when
+            known.
+    """
 
     probabilities: dict[str, float] = field(hash=False)
     calibrated: bool = True
@@ -484,7 +524,12 @@ class DecisionAnswer:
 
 @dataclass(frozen=True)
 class DecisionBatch:
-    """All speculative questions for one surface, answered in one call."""
+    """All speculative questions for one surface, answered in one call.
+
+    Attributes:
+        shared_context: Context dictionary shared by all questions in the batch.
+        questions: Ordered tuple of questions to answer.
+    """
 
     shared_context: dict[str, Any]
     questions: tuple[DecisionQuestion, ...]
@@ -499,13 +544,20 @@ class DecisionBatch:
             seen.add(question.id)
 
     def pair_count(self) -> int:
-        """Number of (question, candidate) pairs a cross-encoder would score."""
+        """Returns the number of (question, candidate) pairs in this batch."""
         return sum(len(q.candidates()) for q in self.questions)
 
 
 @dataclass(frozen=True)
 class DecisionRecord:
-    """One entry in a synthesis trace: a question, its answer, and the outcome."""
+    """One entry in a synthesis trace: a question, its answer, and the outcome.
+
+    Attributes:
+        question: The decision question asked by the planner.
+        answer: The backend's answer, if the question was evaluated.
+        threshold: Confidence threshold applied to `answer`, if any.
+        outcome: Planner outcome summary for this question.
+    """
 
     question: DecisionQuestion
     answer: DecisionAnswer | None = None
@@ -522,6 +574,14 @@ class SlotBinding:
     keys). A repeated slot assembled from scalar pointers (headline tiles,
     fact rows, action buttons) lists one field mapping per element in
     `items`.
+
+    Attributes:
+        pointer: Absolute or relative RFC 6901 JSON Pointer bound to the slot.
+        literal: Static literal value bound to the slot.
+        fields: Per-element field bindings for array-backed repeated slots.
+        items: Per-item field mappings for scalar-assembled repeated slots.
+        semantic_type: Semantic type of the bound pointer, when known; informs
+            `$byType` dispatch.
     """
 
     pointer: str | None = None
@@ -529,7 +589,6 @@ class SlotBinding:
     fields: Mapping[str, SlotBinding] = field(default_factory=dict, hash=False)
     items: tuple[Mapping[str, SlotBinding], ...] = ()
     semantic_type: SemanticType | None = field(default=None, compare=False)
-    """The bound pointer's semantic type, when known; informs `$byType` dispatch."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fields", dict(self.fields))
@@ -560,7 +619,11 @@ class SlotBinding:
 
 @dataclass(frozen=True)
 class BlockBindings:
-    """Slot bindings for one planned block, keyed by slot name."""
+    """Slot bindings for one planned block, keyed by slot name.
+
+    Attributes:
+        slots: Mapping from slot name to its resolved `SlotBinding`.
+    """
 
     slots: Mapping[str, SlotBinding] = field(default_factory=dict, hash=False)
 
@@ -568,16 +631,16 @@ class BlockBindings:
         object.__setattr__(self, "slots", dict(self.slots))
 
     def get(self, slot: str) -> SlotBinding | None:
-        """The binding for `slot`, or None when the slot was not bound."""
+        """Returns the binding for `slot`, or None when `slot` is unbound."""
         binding = self.slots.get(slot)
         return binding if binding is not None and binding.bound else None
 
     def is_bound(self, slot: str) -> bool:
-        """Whether `slot` resolved to a pointer, literal, or elements."""
+        """Returns whether `slot` resolved to a pointer, literal, or elements."""
         return self.get(slot) is not None
 
     def pointers(self) -> tuple[str, ...]:
-        """Every absolute pointer claimed by this block, in slot order."""
+        """Returns every absolute pointer claimed by this block, in slot order."""
         found: list[str] = []
         for binding in self.slots.values():
             found.extend(binding.pointers())
@@ -586,7 +649,15 @@ class BlockBindings:
 
 @dataclass(frozen=True)
 class PageBindings:
-    """Bindings for the page pattern's own slots and frame knobs."""
+    """Bindings for the page pattern's own slots and frame knobs.
+
+    Attributes:
+        title: Binding for the page title slot.
+        subtitle: Binding for the page subtitle slot.
+        mark: Binding for the page mark or badge slot.
+        dialog: Whether the page frame renders as a modal dialog.
+        sticky_actions: Whether the page frame pins actions to a sticky footer.
+    """
 
     title: SlotBinding = field(default_factory=SlotBinding)
     subtitle: SlotBinding = field(default_factory=SlotBinding)
@@ -597,14 +668,23 @@ class PageBindings:
 
 @dataclass(frozen=True)
 class PlannedBlock:
-    """A block the planner decided to render, with its knobs and bindings."""
+    """A block the planner decided to render, with its knobs and bindings.
+
+    Attributes:
+        block_id: Identifier of the block within the archetype.
+        pattern: Pattern name used to expand the block.
+        variant_knobs: Chosen anatomy variant knob options keyed by knob name.
+        bindings: Resolved slot bindings for the block.
+        instances: Per-element instance answers mapping element key to a map of
+            question name to chosen option.
+        probability: Gate confidence probability for the block.
+    """
 
     block_id: str
     pattern: str
     variant_knobs: Mapping[str, str] = field(default_factory=dict, hash=False)
     bindings: BlockBindings = field(default_factory=BlockBindings)
     instances: Mapping[str, Mapping[str, str]] = field(default_factory=dict, hash=False)
-    """Per-element instance answers: element key to (question name to option)."""
     probability: float = 1.0
 
     def __post_init__(self) -> None:
@@ -616,7 +696,21 @@ class PlannedBlock:
 
 @dataclass(frozen=True)
 class LayoutPlan:
-    """The planner's validated choice of archetype, blocks, and bindings."""
+    """The planner's validated choice of archetype, blocks, and bindings.
+
+    Attributes:
+        archetype: Winning archetype name.
+        family: Winning job family name.
+        blocks: Planned blocks in render order.
+        page: Page-level slot bindings and frame knobs.
+        stakes: Expected stakes level index from the stakes question.
+        urgency: Expected urgency level index from the urgency question.
+        confidence: Overall plan confidence score.
+        actions_allowed: Whether the action confidence gate permitted actions.
+        template_id: Registered template chosen by the template question, if
+            any.
+        fit_score: Archetype fit score in ``[0.0, 1.0]``, when scored.
+    """
 
     archetype: str
     family: str
@@ -627,9 +721,7 @@ class LayoutPlan:
     confidence: float = 0.0
     actions_allowed: bool = False
     template_id: str | None = None
-    """The registered template chosen by the batch's template question, if any."""
     fit_score: float | None = None
-    """How well the archetype fits the payload, in [0, 1], when the planner scored it."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
@@ -637,19 +729,25 @@ class LayoutPlan:
             _validate_unit_interval("fit_score", self.fit_score)
 
     def block_ids(self) -> tuple[str, ...]:
-        """The ids of the planned blocks in render order."""
+        """Returns the IDs of the planned blocks in render order."""
         return tuple(block.block_id for block in self.blocks)
 
 
 @dataclass(frozen=True)
 class PlanOutcome:
-    """Result of reading a batch of answers into a `LayoutPlan`."""
+    """Result of reading a batch of answers into a `LayoutPlan`.
+
+    Attributes:
+        plan: Validated `LayoutPlan` when `reason` is `PlanReason.PLANNED`, or
+            None otherwise.
+        reason: Outcome code explaining why planning succeeded or abstained.
+        fit_score: Planner fit score in ``[0.0, 1.0]``, preserved even on
+            `NO_FIT` outcomes without a plan.
+    """
 
     plan: LayoutPlan | None
     reason: PlanReason
     fit_score: float | None = None
-    """The planner's fit score, kept here so a `NO_FIT` outcome without a plan
-    still reports it."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "reason", PlanReason(self.reason))
@@ -905,7 +1003,7 @@ class ActionSpec:
         )
 
 
-class DecisionBackendError(Exception):
+class DecisionBackendError(A2uiError):
     """A decision backend failed to answer: a timeout, transport, or HTTP error.
 
     The format surfaces it as a compilation error; no fallback runs for it.
@@ -941,19 +1039,19 @@ class SynthesisConfig:
     """Host-level settings for decision-model UI synthesis.
 
     Confidence thresholds live in the archetype grammar, not here.
+
+    Attributes:
+        default_surface_id: Surface ID used when the decision block does not
+            name one.
+        max_pairs: Budget of (question, candidate) pairs for one batch; past it
+            the planner drops optional question groups and uses heuristics.
+        conservativeness: Action gate scale between the grammar's
+            `actionGateFloor` (0.0) and `actionGateCap` (1.0).
     """
 
     default_surface_id: str = "default_surface"
-    """Surface id used when the decision block does not name one."""
     max_pairs: int = 400
-    """Budget of (question, candidate) pairs for one batch.
-
-    Past it the planner stops adding optional question groups and falls back
-    to heuristics for them.
-    """
     conservativeness: float = 0.5
-    """Scales the action gate between the grammar's `actionGateFloor` (0.0)
-    and `actionGateCap` (1.0); higher values refuse actions more often."""
 
     def __post_init__(self) -> None:
         if not self.default_surface_id or not self.default_surface_id.strip():
@@ -965,6 +1063,10 @@ class SynthesisConfig:
 
 def validate_threshold_relations(thresholds: Mapping[str, float], owner: str) -> None:
     """Checks ordering constraints between grammar threshold keys that are present.
+
+    Args:
+        thresholds: Threshold name-to-value mapping from a grammar definition.
+        owner: Label identifying the grammar or archetype in error messages.
 
     Raises:
         ValueError: If ``actionGateFloor > actionGateCap`` or
@@ -985,6 +1087,12 @@ class PlanCacheKey:
     Two requests share a key only when they target the same surface with the
     same catalog and grammar, and their payload shape and planning inputs
     hash to the same `shape_signature` (see `plan_shape_signature`).
+
+    Attributes:
+        surface_id: Target A2UI surface identifier.
+        catalog_id: Catalog identifier for the surface.
+        grammar_version: Version string of the archetype grammar.
+        shape_signature: Hex SHA-256 digest from `plan_shape_signature`.
     """
 
     surface_id: str
@@ -994,7 +1102,7 @@ class PlanCacheKey:
 
 
 def _pointer_shape(pointer: PointerSummary) -> dict[str, Any]:
-    """The data-independent parts of one pointer summary."""
+    """Returns the data-independent shape fields of one `PointerSummary`."""
     return {
         "path": pointer.path,
         "valueType": pointer.value_type,
@@ -1009,7 +1117,7 @@ def _pointer_shape(pointer: PointerSummary) -> dict[str, Any]:
 
 
 def _action_shape(action: ActionSpec) -> dict[str, Any]:
-    """Every option of one action, so a changed option re-plans."""
+    """Returns the canonical dictionary representation of one `ActionSpec`."""
     return {
         "id": action.id,
         "label": action.label,
@@ -1085,7 +1193,30 @@ def plan_shape_signature(
 
 @dataclass(frozen=True)
 class SynthesisOutput:
-    """Result produced by a single decision-model synthesis pass."""
+    """Result produced by a single decision-model synthesis pass.
+
+    Attributes:
+        stage: Synthesis stage that produced `messages`.
+        messages: Synthesized A2UI wire messages.
+        confidence: Overall confidence score of the chosen template or plan.
+        entropy: Normalized Shannon entropy of the primary decision.
+        selected_template_id: Registered template ID when `stage` is
+            `TEMPLATE_SELECT`.
+        fallback_source: Fallback link that produced `messages` after the model
+            abstained, or None when no fallback ran.
+        fallback_reason: Free-text reason the fallback chain ran.
+        backend_kind: `DecisionBackend.backend_kind` of the answering backend.
+        model_id: `DecisionBackend.model_id` of the answering backend.
+        operation: How `messages` modify the client surface.
+        layout_plan: Archetype layout plan when `stage` is `ARCHETYPE`.
+        trace: Evaluated questions with their answers and threshold outcomes.
+        decision_latency_ms: Wall-clock milliseconds spent waiting on the
+            decision backend.
+        decision_calls: Number of backend `answer` calls made during synthesis.
+        decision_answers: Raw backend answers in question order.
+        cache_hit: Whether a cached plan produced `messages` without a backend
+            call.
+    """
 
     stage: SynthesisStage
     messages: list[AgentToRendererMessage]
@@ -1093,30 +1224,16 @@ class SynthesisOutput:
     entropy: float
     selected_template_id: str | None = None
     fallback_source: FallbackSource | None = None
-    """Which fallback produced `messages` after the model abstained.
-
-    None when the model did not abstain or no fallback applied.
-    """
     fallback_reason: str | None = None
-    """Free-text reason the fallback chain ran, for logs and traces."""
     backend_kind: str = ""
-    """`DecisionBackend.backend_kind` of the backend that answered."""
     model_id: str = ""
-    """`DecisionBackend.model_id` of the backend that answered."""
     operation: SurfaceOperation = SurfaceOperation.CREATE
-    """How `messages` change the client's surface."""
     layout_plan: LayoutPlan | None = None
-    """The archetype plan behind `messages` when `stage` is `ARCHETYPE`."""
     trace: tuple[DecisionRecord, ...] = ()
-    """Every question asked, with its answer and threshold outcome."""
     decision_latency_ms: float = 0.0
-    """Wall-clock milliseconds spent waiting on the decision model backend."""
     decision_calls: int = 0
-    """Number of backend `answer` calls made during synthesis."""
     decision_answers: tuple[DecisionAnswer, ...] = ()
-    """The batch answers that produced the layout plan, in question order."""
     cache_hit: bool = False
-    """Whether a cached plan produced `messages` without a backend call."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace", tuple(self.trace))
@@ -1128,7 +1245,17 @@ class SynthesisOutput:
         *,
         use_keyword_args: bool = False,
     ) -> str:
-        """Decompiles synthesized A2UI messages into A2UI Express DSL syntax."""
+        """Decompiles synthesized A2UI messages into A2UI Express DSL syntax.
+
+        Args:
+            catalogs: Catalogs defining the components present in `messages`.
+            use_keyword_args: Whether to emit keyword arguments for all
+                component properties.
+
+        Returns:
+            The decompiled A2UI Express string, or ``""`` when `messages` is
+            empty.
+        """
         if not self.messages:
             return ""
         from a2ui.inference_formats.express import ExpressDecompiler

@@ -77,6 +77,16 @@ class DecisionParser(Parser):
     parser overrides to read the `RendererState` before synthesis: a block
     whose surface already exists updates its root in place, or replaces it
     when the block sets `replace`. `compile` has no state and always creates.
+
+    Multiple blocks without `surfaceId` behave according to how they are
+    grouped: a JSON array of `N` blocks inside a single `<a2ui>` tag auto-numbers
+    its default surface IDs as ``<surface_id>_1`` through ``<surface_id>_N``,
+    whereas separate `<a2ui>` tags in the same response each target
+    `<surface_id>` sequentially (creating on the first tag and updating in
+    place on subsequent tags).
+
+    Attributes:
+        surface_id: Default surface identifier when a block omits `surfaceId`.
     """
 
     def __init__(
@@ -124,6 +134,7 @@ class DecisionParser(Parser):
         return super()._empty_state()
 
     def _default_surface_id(self, idx: int, count: int) -> str:
+        """Returns `surface_id` for a single block or ``<surface_id>_<idx>`` for an array."""
         return self.surface_id if count == 1 else f"{self.surface_id}_{idx}"
 
     def _synthesize_block_sync(
@@ -147,6 +158,8 @@ class DecisionParser(Parser):
                 state=state,
                 **block.to_synthesis_kwargs(default_surface_id=default_id),
             )
+        except DecisionBackendError as exc:
+            raise _as_compilation_error(exc, format_content) from exc
         except A2uiError:
             raise
         except Exception as exc:

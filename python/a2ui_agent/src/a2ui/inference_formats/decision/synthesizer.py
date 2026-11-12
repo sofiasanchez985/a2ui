@@ -275,6 +275,7 @@ def _abstention_reason(abstained: SynthesisOutput) -> str:
 def _creates_surface(
     messages: Sequence[AgentToRendererMessage], surface_id: str
 ) -> bool:
+    """Returns whether `messages` contain a `createSurface` envelope for `surface_id`."""
     return any(
         isinstance(d.get("createSurface"), Mapping)
         and d["createSurface"].get("surfaceId") == surface_id
@@ -321,17 +322,86 @@ class _SurfaceRequest:
     region: str | None = None
 
 
+def _is_excluded_path(path: str, exclude: Collection[str]) -> bool:
+    """Returns whether `path` equals or is nested under any entry in `exclude`."""
+    return any(path == ex or path.startswith(f"{ex}/") for ex in exclude)
+
+
+def _is_excluded_array_element(
+    array_path: str, element_key: str, exclude: Collection[str]
+) -> bool:
+    """Returns whether `element_key` under `array_path` is excluded by `exclude`."""
+    return _is_excluded_path(
+        f"{array_path}/0/{element_key}", exclude
+    ) or _is_excluded_path(f"{array_path}/{element_key}", exclude)
+
+
+def _filter_array_sample_pointers(
+    ptr: PointerSummary, exclude: Collection[str]
+) -> PointerSummary:
+    """Filters excluded subpaths out of an array pointer's element keys and samples."""
+    kept_samples = tuple(
+        sp for sp in ptr.sample_pointers if not _is_excluded_path(sp, exclude)
+    )
+    kept_keys = tuple(
+        k
+        for k in ptr.element_keys
+        if not _is_excluded_array_element(ptr.path, k, exclude)
+    )
+    if len(kept_samples) == len(ptr.sample_pointers) and len(kept_keys) == len(
+        ptr.element_keys
+    ):
+        return ptr
+    # Remove excluded array element subpaths so array blocks cannot bind them.
+    kept_key_set = set(kept_keys)
+    return replace(
+        ptr,
+        sample_pointers=kept_samples,
+        element_keys=kept_keys,
+        sample_type_by_key={
+            k: v for k, v in ptr.sample_type_by_key.items() if k in kept_key_set
+        },
+        element_semantic_types={
+            k: v for k, v in ptr.element_semantic_types.items() if k in kept_key_set
+        },
+    )
+
+
 def _without_excluded(
     pointers: Sequence[PointerSummary], exclude: Collection[str]
 ) -> tuple[PointerSummary, ...]:
-    """Drops pointers equal to, or nested under, any pointer in `exclude`."""
+    """Drops pointers and `sample_pointers` equal to or nested under `exclude`."""
     if not exclude:
         return tuple(pointers)
     return tuple(
-        p
+        _filter_array_sample_pointers(p, exclude)
         for p in pointers
-        if not any(p.path == ex or p.path.startswith(f"{ex}/") for ex in exclude)
+        if not _is_excluded_path(p.path, exclude)
     )
+
+
+def _without_non_mutable_secrets(
+    pointers: Sequence[PointerSummary],
+) -> tuple[PointerSummary, ...]:
+    """Strips secret pointers unless the caller explicitly marked them mutable."""
+    return tuple(p for p in pointers if p.mutable_hint or not is_secret_pointer(p))
+
+
+def _unrolled_array_cardinalities_match(
+    plan: LayoutPlan, pointers: Sequence[PointerSummary]
+) -> bool:
+    """Returns whether every statically unrolled array slot matches `pointers` cardinality."""
+    # Blocks such as `steps` and primitive scalar arrays unroll one component
+    # subtree per item at plan time (capped at 25), so a length change within
+    # the same cardinality bucket must miss the cache and re-plan.
+    cardinalities = {p.path: p.cardinality for p in pointers if p.value_type == "array"}
+    for block in plan.blocks:
+        for slot in block.bindings.slots.values():
+            if slot.pointer and slot.items:
+                expected = min(cardinalities.get(slot.pointer, -1), 25)
+                if len(slot.items) != expected:
+                    return False
+    return True
 
 
 def _with_labels(
@@ -639,12 +709,14 @@ class DecisionSynthesizer:
             region=region,
         )
         data = _as_data_model(payload)
-        pointers = _with_labels(
-            _without_excluded(
-                inspect_payload_pointers(data, mutable_paths=mutable_paths or ()),
-                exclude,
-            ),
-            request.labels,
+        pointers = _without_non_mutable_secrets(
+            _with_labels(
+                _without_excluded(
+                    inspect_payload_pointers(data, mutable_paths=mutable_paths or ()),
+                    exclude,
+                ),
+                request.labels,
+            )
         )
         if operation is SurfaceOperation.REPLACE:
             self._invalidate_surface_cache(state, target_surface_id)
@@ -666,7 +738,9 @@ class DecisionSynthesizer:
         )
         if operation is SurfaceOperation.UPDATE_ROOT and state is not None:
             cached = self.plan_cache.get(state, cache_key)
-            if cached is not None:
+            if cached is not None and _unrolled_array_cardinalities_match(
+                cached.plan, pointers
+            ):
                 return self._cached_data_only_output(cached, target_surface_id, data)
         return await self._run_full_synthesis(
             intent,
@@ -685,6 +759,7 @@ class DecisionSynthesizer:
         operation: SurfaceOperation,
         surface_sends_data_model: bool,
     ) -> tuple[SurfaceOperation, bool]:
+        """Infers `UPDATE_ROOT` and existing `sendDataModel` when `surface_id` is in `state`."""
         if state is None or operation is not SurfaceOperation.CREATE:
             return operation, surface_sends_data_model
         existing = state.get_surface(surface_id)
@@ -695,6 +770,7 @@ class DecisionSynthesizer:
     def _invalidate_surface_cache(
         self, state: RendererState | None, surface_id: str
     ) -> None:
+        """Evicts cached plans for `surface_id` from `plan_cache` and `_stateless_plans`."""
         if state is not None:
             self.plan_cache.invalidate(state, surface_id)
         self._stateless_plans.pop(surface_id, None)
@@ -710,6 +786,7 @@ class DecisionSynthesizer:
         state: RendererState | None,
         cache_key: PlanCacheKey,
     ) -> SynthesisOutput:
+        """Executes full-surface synthesis, caches the plan, or runs the fallback chain."""
         timings: list[float] = []
         token = _DECISION_CALL_TIMINGS.set(timings)
         try:
@@ -740,6 +817,7 @@ class DecisionSynthesizer:
         cache_key: PlanCacheKey,
         output: SynthesisOutput,
     ) -> CachedPlan | None:
+        """Builds and stores a `CachedPlan` from `output` when it produced components."""
         if output.layout_plan is None or not output.messages:
             return None
         components = _extract_components_from_messages(output.messages)
@@ -771,14 +849,16 @@ class DecisionSynthesizer:
         data: Mapping[str, Any],
     ) -> SynthesisOutput:
         """Emits only `updateDataModel` for an `UPDATE_ROOT` cache hit."""
-        raw_messages = [{
-            "version": _WIRE_VERSION,
-            "updateDataModel": {
-                "surfaceId": surface_id,
-                "path": "/",
-                "value": dict(data),
-            },
-        }]
+        raw_messages = [
+            {
+                "version": _WIRE_VERSION,
+                "updateDataModel": {
+                    "surfaceId": surface_id,
+                    "path": "/",
+                    "value": dict(data),
+                },
+            }
+        ]
         messages = to_message_models(raw_messages)
         validate_payload(self.graph.catalogs, messages)
         stage = (
@@ -844,6 +924,7 @@ class DecisionSynthesizer:
     def _lookup_region_plan(
         self, state: RendererState | None, surface_id: str
     ) -> tuple[PlanCacheKey, CachedPlan]:
+        """Returns the cached `(PlanCacheKey, CachedPlan)` for a region update on `surface_id`."""
         found = (
             self.plan_cache.get_for_surface(
                 state,
@@ -860,6 +941,52 @@ class DecisionSynthesizer:
                 " layout plan for this surface."
             )
         return found
+
+    def _existing_block_prefix(
+        self, cached: CachedPlan, block_id: str, pattern: str
+    ) -> tuple[str, str | None]:
+        """Returns `(id_prefix, owner_catalog_id)` preserving the cached block root prefix."""
+        default_prefix, owner = self._block_prefix_and_owner(block_id, pattern)
+        if self.graph.surface_catalog_id is not None:
+            return default_prefix, owner
+        # Preserve the existing block root prefix wired into `root.children`
+        # even if a multi-catalog region re-plan resolves to a different owner.
+        candidate_roots = {
+            f"{block_id}_root",
+            *(
+                f"{_catalog_slug(c.catalog_id)}_{block_id}_root"
+                for c in self.graph.catalogs
+            ),
+        }
+        for comp in cached.components:
+            cid = comp.get("id")
+            if isinstance(cid, str) and cid in candidate_roots:
+                return cid.removesuffix("_root"), owner
+        return default_prefix, owner
+
+    def _region_tainted_cache_key(
+        self,
+        existing_key: PlanCacheKey,
+        region: str,
+        intent: str,
+        pointers: Sequence[PointerSummary],
+        request: _SurfaceRequest,
+    ) -> PlanCacheKey:
+        """Builds a region-tainted `PlanCacheKey` so full-surface turns miss after region edits."""
+        region_key = self.make_cache_key(
+            request.surface_id,
+            intent,
+            pointers,
+            actions=request.actions,
+            labels=request.labels,
+            layout=request.brief,
+            title=request.copy.title if request.copy is not None else None,
+            summary=request.copy.summary if request.copy is not None else None,
+        )
+        return replace(
+            existing_key,
+            shape_signature=f"region:{region}:{region_key.shape_signature}",
+        )
 
     async def _synthesize_region(
         self,
@@ -888,8 +1015,8 @@ class DecisionSynthesizer:
         finally:
             _DECISION_CALL_TIMINGS.reset(token)
 
-        prefix, owner = self._block_prefix_and_owner(
-            new_block.block_id, new_block.pattern
+        prefix, owner = self._existing_block_prefix(
+            cached, new_block.block_id, new_block.pattern
         )
         expanded = self.expander.expand_block(
             new_block.block_id,
@@ -929,9 +1056,13 @@ class DecisionSynthesizer:
             components=updated_comps,
             all_surface_ids=cached.all_surface_ids | new_ids,
         )
+        tainted_key = self._region_tainted_cache_key(
+            existing_key, region, intent, pointers, request
+        )
         if state is not None:
-            self.plan_cache.put(state, existing_key, updated_entry)
-        self._stateless_plans[request.surface_id] = (existing_key, updated_entry)
+            self.plan_cache.invalidate(state, request.surface_id)
+            self.plan_cache.put(state, tainted_key, updated_entry)
+        self._stateless_plans[request.surface_id] = (tainted_key, updated_entry)
         return SynthesisOutput(
             stage=SynthesisStage.ARCHETYPE,
             messages=messages,
@@ -1011,12 +1142,14 @@ class DecisionSynthesizer:
         """
 
         async def _run() -> SynthesisOutput:
+            """Runs `synthesize` and closes loop-bound backend resources."""
             try:
                 return await self.synthesize(intent, payload, **kwargs)
             finally:
                 await self.backend.aclose_current_loop()
 
         def run_in_new_loop() -> SynthesisOutput:
+            """Executes `_run` inside a fresh `asyncio` event loop."""
             return asyncio.run(_run())
 
         try:
@@ -1036,8 +1169,9 @@ class DecisionSynthesizer:
         """Renders the registered template the plan's template question chose.
 
         The template's components go through the same message builder as an
-        expanded plan, so all three surface operations apply. Templates carry
-        no `sendDataModel` requirement, so they never escalate.
+        expanded plan, so all three surface operations apply. A mutable
+        template sets `sendDataModel` on `createSurface` and escalates
+        `UPDATE_ROOT` to `REPLACE` when the existing surface lacks it.
 
         Raises:
             ValueError: If `plan.template_id` names no registered template.
@@ -1052,8 +1186,17 @@ class DecisionSynthesizer:
             )
         components = [copy_lib.deepcopy(dict(c)) for c in template.components]
         self._stamp_multi_catalog_id(components, template.catalog_id)
+        operation = resolve_surface_operation(
+            request.operation,
+            send_data_model=template.is_mutable,
+            surface_sends_data_model=request.surface_sends_data_model,
+        )
         messages = self._build_validated_messages(
-            request.surface_id, components, data, request.operation
+            request.surface_id,
+            components,
+            data,
+            operation,
+            send_data_model=template.is_mutable,
         )
         _, entropy = _archetype_confidence_and_entropy(state, plan)
         return SynthesisOutput(
@@ -1065,7 +1208,7 @@ class DecisionSynthesizer:
             layout_plan=plan,
             trace=tuple(state.trace),
             decision_answers=tuple(state.answers_by_id.values()),
-            operation=request.operation,
+            operation=operation,
         )
 
     async def _fallback(
@@ -1237,14 +1380,18 @@ class DecisionSynthesizer:
         )
         if data and not any(_populates_data_model(m) for m in messages):
             messages.extend(
-                to_message_models([{
-                    "version": _WIRE_VERSION,
-                    "updateDataModel": {
-                        "surfaceId": surface_id,
-                        "path": "/",
-                        "value": dict(data),
-                    },
-                }])
+                to_message_models(
+                    [
+                        {
+                            "version": _WIRE_VERSION,
+                            "updateDataModel": {
+                                "surfaceId": surface_id,
+                                "path": "/",
+                                "value": dict(data),
+                            },
+                        }
+                    ]
+                )
             )
         validate_payload(self.graph.catalogs, messages)
         return messages
@@ -1459,6 +1606,7 @@ class DecisionSynthesizer:
     def _action_gate_output(
         self, state: PlannerState, trace: list[DecisionRecord]
     ) -> SynthesisOutput:
+        """Builds an `ABSTAIN_FALLBACK` output when `action-gate` blocks the plan."""
         _record_trace_reason(trace, "action_gate", "Action confidence gate")
         conf, entropy = _archetype_confidence_and_entropy(state, None)
         return SynthesisOutput(
@@ -1574,19 +1722,23 @@ class DecisionSynthesizer:
             if send_data_model:
                 create_body["sendDataModel"] = True
             raw_messages.append({"version": wire_ver, "createSurface": create_body})
-        raw_messages.append({
-            "version": wire_ver,
-            "updateComponents": {"surfaceId": surface_id, "components": components},
-        })
-        if payload:
-            raw_messages.append({
+        raw_messages.append(
+            {
                 "version": wire_ver,
-                "updateDataModel": {
-                    "surfaceId": surface_id,
-                    "path": "/",
-                    "value": dict(payload),
-                },
-            })
+                "updateComponents": {"surfaceId": surface_id, "components": components},
+            }
+        )
+        if payload:
+            raw_messages.append(
+                {
+                    "version": wire_ver,
+                    "updateDataModel": {
+                        "surfaceId": surface_id,
+                        "path": "/",
+                        "value": dict(payload),
+                    },
+                }
+            )
         models = to_message_models(raw_messages)
         validate_payload(self.graph.catalogs, models)
         return models

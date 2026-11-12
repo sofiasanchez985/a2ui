@@ -71,14 +71,16 @@ def _make_catalog() -> Catalog:
 
 
 def test_decision_block_minimal_defaults_and_aliases() -> None:
-    block = DecisionBlock.from_mapping({
-        "intent": "  Show service health  ",
-        "data": json.dumps({"serviceName": "checkout", "latencyMs": 42}),
-        "surface_id": "  ",
-        "fallback_dsl": "",
-        "title": "   ",
-        "summary": "",
-    })
+    block = DecisionBlock.from_mapping(
+        {
+            "intent": "  Show service health  ",
+            "data": json.dumps({"serviceName": "checkout", "latencyMs": 42}),
+            "surface_id": "  ",
+            "fallback_dsl": "",
+            "title": "   ",
+            "summary": "",
+        }
+    )
     assert block.intent == "Show service health"
     assert block.payload == {"serviceName": "checkout", "latencyMs": 42}
     assert block.surface_id is None
@@ -213,12 +215,14 @@ def test_decision_block_full_round_trip_every_field() -> None:
     round_tripped = DecisionBlock.from_mapping(serialized)
     assert round_tripped == block
 
-    replace_block = DecisionBlock.from_mapping({
-        "intent": "Review and submit the transfer",
-        "payload": raw["payload"],
-        "surfaceId": "transfer_surface",
-        "replace": True,
-    })
+    replace_block = DecisionBlock.from_mapping(
+        {
+            "intent": "Review and submit the transfer",
+            "payload": raw["payload"],
+            "surfaceId": "transfer_surface",
+            "replace": True,
+        }
+    )
     assert replace_block.replace is True
     assert replace_block.to_json()["replace"] is True
     assert DecisionBlock.from_mapping(replace_block.to_json()) == replace_block
@@ -241,17 +245,19 @@ def test_decision_block_full_round_trip_every_field() -> None:
 
 def test_decision_block_preserves_action_order_and_accepts_layout_brief() -> None:
     brief = LayoutBrief.parse(["picture:name"], roles=frozenset({"picture"}))
-    block = DecisionBlock.from_mapping({
-        "intent": "Manage items",
-        "payload": [{"id": "1", "name": "First"}],
-        "layout": brief,
-        "actions": {
-            "zeta": "Zeta action",
-            "alpha": {"label": "Alpha action", "style": "secondary"},
-            "middle": {"label": "Middle action", "scope": "/items"},
-            "omega": "Omega action",
-        },
-    })
+    block = DecisionBlock.from_mapping(
+        {
+            "intent": "Manage items",
+            "payload": [{"id": "1", "name": "First"}],
+            "layout": brief,
+            "actions": {
+                "zeta": "Zeta action",
+                "alpha": {"label": "Alpha action", "style": "secondary"},
+                "middle": {"label": "Middle action", "scope": "/items"},
+                "omega": "Omega action",
+            },
+        }
+    )
     assert block.layout == ("picture:/name",)
     assert [a.id for a in block.actions] == ["zeta", "alpha", "middle", "omega"]
     serialized_actions = block.to_json()["actions"]
@@ -520,28 +526,32 @@ def test_decision_block_rejects_replace_with_region() -> None:
         ValueError,
         match="DecisionBlock cannot combine replace=True with a region update",
     ):
-        DecisionBlock.from_mapping({
-            "intent": "x",
-            "payload": {"a": 1},
-            "replace": True,
-            "region": "facts",
-        })
+        DecisionBlock.from_mapping(
+            {
+                "intent": "x",
+                "payload": {"a": 1},
+                "replace": True,
+                "region": "facts",
+            }
+        )
 
 
 def test_decision_block_from_messages_reconstructs_surface_and_payload() -> None:
-    messages = to_message_models([
-        {
-            "version": "1.0",
-            "createSurface": {"surfaceId": "s1", "catalogId": CATALOG_ID},
-        },
-        {
-            "version": "1.0",
-            "updateDataModel": {
-                "surfaceId": "s1",
-                "value": {"serviceName": "checkout", "latencyMs": 42},
+    messages = to_message_models(
+        [
+            {
+                "version": "1.0",
+                "createSurface": {"surfaceId": "s1", "catalogId": CATALOG_ID},
             },
-        },
-    ])
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "s1",
+                    "value": {"serviceName": "checkout", "latencyMs": 42},
+                },
+            },
+        ]
+    )
     recovered = decision_block_from_messages(messages)
     assert recovered == DecisionBlock(
         intent="Render s1",
@@ -591,20 +601,24 @@ def test_prompt_generator_contains_new_surface_id_rules_and_no_template() -> Non
 
 def test_prompt_generator_renders_native_decision_block_examples_only() -> None:
     catalog = _make_catalog()
-    example_one = DecisionBlock.from_mapping({
-        "intent": "Sign in to your account",
-        "payload": {"email": "alex@example.com", "password": "", "secret": "tok"},
-        "surfaceId": "auth",
-        "mutablePaths": ["/email", "/password"],
-        "actions": {"sign_in": {"label": "Sign In", "style": "primary"}},
-        "exclude": ["/secret"],
-    })
-    example_two = DecisionBlock.from_mapping({
-        "intent": "Reset the dashboard surface",
-        "payload": {"serviceName": "checkout", "latencyMs": 19},
-        "surfaceId": "main",
-        "replace": True,
-    })
+    example_one = DecisionBlock.from_mapping(
+        {
+            "intent": "Sign in to your account",
+            "payload": {"email": "alex@example.com", "password": "", "secret": "tok"},
+            "surfaceId": "auth",
+            "mutablePaths": ["/email", "/password"],
+            "actions": {"sign_in": {"label": "Sign In", "style": "primary"}},
+            "exclude": ["/secret"],
+        }
+    )
+    example_two = DecisionBlock.from_mapping(
+        {
+            "intent": "Reset the dashboard surface",
+            "payload": {"serviceName": "checkout", "latencyMs": 19},
+            "surfaceId": "main",
+            "replace": True,
+        }
+    )
 
     gen = DecisionPromptGenerator([catalog], block_examples=[example_one, example_two])
     assert gen.block_examples == [example_one, example_two]

@@ -411,14 +411,18 @@ async def test_fallback_fn_runs_when_there_is_no_dsl() -> None:
 
     async def fallback_fn(intent: str, payload: Any, surface_id: str) -> Any:
         seen.append((intent, surface_id))
-        return [{
-            "version": "1.0",
-            "createSurface": {
-                "surfaceId": surface_id,
-                "catalogId": CATALOG.catalog_id,
-                "components": [{"id": "root", "component": "Text", "text": "Fallback"}],
-            },
-        }]
+        return [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": surface_id,
+                    "catalogId": CATALOG.catalog_id,
+                    "components": [
+                        {"id": "root", "component": "Text", "text": "Fallback"}
+                    ],
+                },
+            }
+        ]
 
     out = await _synth(ABSTAIN, fallback_fn=fallback_fn).synthesize(
         HOST.intent, HOST.payload, surface_id="s2"
@@ -507,16 +511,18 @@ async def test_no_fit_routes_through_fallback_chain_in_order() -> None:
 
     async def fallback_fn(intent: str, payload: Any, surface_id: str) -> Any:
         calls.append(surface_id)
-        return [{
-            "version": "1.0",
-            "createSurface": {
-                "surfaceId": surface_id,
-                "catalogId": CATALOG.catalog_id,
-                "components": [
-                    {"id": "root", "component": "Text", "text": "Callback UI"}
-                ],
-            },
-        }]
+        return [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": surface_id,
+                    "catalogId": CATALOG.catalog_id,
+                    "components": [
+                        {"id": "root", "component": "Text", "text": "Callback UI"}
+                    ],
+                },
+            }
+        ]
 
     # 1. fallback_dsl wins first when supplied.
     dsl_out = await _synth(NO_FIT_SCRIPTED, fallback_fn=fallback_fn).synthesize(
@@ -549,6 +555,12 @@ async def test_no_fit_routes_through_fallback_chain_in_order() -> None:
     # (for example, a payload whose only scalar is a secret pointer that
     # `_facts_plan` refuses to render).
     with pytest.raises(A2uiCompilationError, match="no_fit"):
+        await _synth(NO_FIT_SCRIPTED).synthesize(
+            "Draw a game canvas",
+            {"apiToken": "secret-token"},
+            mutable_paths=["/apiToken"],
+        )
+    with pytest.raises(A2uiCompilationError, match="no eligible archetype"):
         await _synth(NO_FIT_SCRIPTED).synthesize(
             "Draw a game canvas", {"apiToken": "secret-token"}
         )
@@ -636,7 +648,6 @@ async def test_compare_archetype_binds_repeated_attributes_and_validates() -> No
 @pytest.mark.asyncio
 async def test_synthesizer_uses_server_reported_last_call_latency_ms() -> None:
     class _DelayedServerReportedBackend(DeterministicMockBackend):
-
         def __init__(self) -> None:
             super().__init__(scripted_answers=HOST_SCRIPTED)
             self.last_call_latency_ms = 0.05
@@ -651,3 +662,122 @@ async def test_synthesizer_uses_server_reported_last_call_latency_ms() -> None:
     out = await synth.synthesize(HOST.intent, HOST.payload)
     assert out.decision_calls == 1
     assert out.decision_latency_ms == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_non_mutable_secret_pointers_excluded_from_batches_and_facts() -> None:
+    backend = mock_backend(**HOST_SCRIPTED)
+    synth = DecisionSynthesizer([CATALOG], backend)
+    payload_with_secrets = {
+        **HOST.payload,
+        "api_key": "sk-live-secret",
+        "password": "hunter2-password",
+    }
+    out = await synth.synthesize(HOST.intent, payload_with_secrets)
+    assert out.stage is SynthesisStage.ARCHETYPE
+    assert len(backend.batches) == 1
+    batch = backend.batches[0]
+    assert "/api_key" not in batch.shared_context.get("pointers", [])
+    assert "/password" not in batch.shared_context.get("pointers", [])
+    for q in batch.questions:
+        assert "/api_key" not in q.id and "api_key" not in q.prompt
+        assert "/password" not in q.id and "password" not in q.prompt
+    assert out.layout_plan is not None
+    bound_ptrs = {ptr for b in out.layout_plan.blocks for ptr in b.bindings.pointers()}
+    assert "/api_key" not in bound_ptrs
+    assert "/password" not in bound_ptrs
+
+
+@pytest.mark.asyncio
+async def test_mutable_template_sets_send_data_model_and_escalates_update_root() -> (
+    None
+):
+    registry = TemplateRegistry()
+    registry.register(
+        SurfaceTemplate(
+            template_id="edit_host_tpl",
+            description="Editable host settings template",
+            surface_id="ops",
+            catalog_id=CATALOG.catalog_id,
+            protocol_version="1.0",
+            required_pointers=("/host", "/cpu"),
+            is_mutable=True,
+            components=(
+                {
+                    "id": "root",
+                    "component": "Text",
+                    "text": {"path": "/host"},
+                },
+            ),
+        )
+    )
+    scripted = {**HOST_SCRIPTED, "template": {"edit_host_tpl": 0.99, "compose": 0.01}}
+    synth = DecisionSynthesizer([CATALOG], mock_backend(**scripted), registry=registry)
+
+    created = await synth.synthesize(
+        HOST.intent,
+        HOST.payload,
+        surface_id="ops",
+        operation=SurfaceOperation.CREATE,
+    )
+    assert created.stage is SynthesisStage.TEMPLATE_SELECT
+    assert created.operation is SurfaceOperation.CREATE
+    created_dicts = to_message_dicts(created.messages)
+    assert created_dicts[0]["createSurface"].get("sendDataModel") is True
+
+    escalated = await synth.synthesize(
+        HOST.intent,
+        HOST.payload,
+        surface_id="ops",
+        operation=SurfaceOperation.UPDATE_ROOT,
+        surface_sends_data_model=False,
+    )
+    assert escalated.stage is SynthesisStage.TEMPLATE_SELECT
+    assert escalated.operation is SurfaceOperation.REPLACE
+    escalated_dicts = to_message_dicts(escalated.messages)
+    assert "deleteSurface" in escalated_dicts[0]
+    assert escalated_dicts[1]["createSurface"].get("sendDataModel") is True
+
+
+@pytest.mark.asyncio
+async def test_without_excluded_strips_excluded_subpaths_from_array_sample_pointers() -> (
+    None
+):
+    payload = {
+        "items": [
+            {
+                "name": "Node A",
+                "status": "ok",
+                "secretToken": "tok-a",
+                "photoUrl": "https://example.com/a.png",
+            },
+            {
+                "name": "Node B",
+                "status": "ok",
+                "secretToken": "tok-b",
+                "photoUrl": "https://example.com/b.png",
+            },
+        ]
+    }
+    scripted: dict[str, ScriptedValue] = {
+        "family": ("browse", 0.90),
+        "stakes": 0.4,
+        "urgency": 0.2,
+        "archetype:browse": ("feed", 0.90),
+        "gate:collection": 0.95,
+    }
+    synth = DecisionSynthesizer([CATALOG], mock_backend(**scripted))
+    out = await synth.synthesize(
+        "Browse cluster nodes",
+        payload,
+        exclude=["/items/0/secretToken", "/items/0/photoUrl"],
+    )
+    assert out.layout_plan is not None
+    bound_ptrs = {ptr for b in out.layout_plan.blocks for ptr in b.bindings.pointers()}
+    assert "/items/0/secretToken" not in bound_ptrs
+    assert "/items/0/photoUrl" not in bound_ptrs
+    comp_messages = [
+        d for d in to_message_dicts(out.messages) if "updateComponents" in d
+    ]
+    assert "secretToken" not in str(comp_messages)
+    assert "photoUrl" not in str(comp_messages)

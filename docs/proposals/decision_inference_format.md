@@ -202,9 +202,9 @@ The backend (`backend.answer(batch)`) scores all questions in one call and appli
 `LayoutPlanner.read(state, answers)` checks the calibrated probabilities against the grammar thresholds in `catalogs/decision/v1/archetypes.json`:
 
 1. `family` selects `act` (`p = 0.96 >= 0.40`).
-2. `archetype:act` selects `checkout` (`p = 0.94 >= 0.40`), giving overall plan confidence `sqrt(0.96 * 0.94) = 0.9499`.
-3. `stakes` is `2.4` on the `[0.0, 3.0]` scale (`clamped_stakes = 0.8`), which sets the stakes-scaled action gate threshold at `conservativeness = 0.5` to `0.70 + (0.95 - 0.70) * 0.8 = 0.90`. Because `plan.confidence` (`0.9499`) is at least `0.90`, `actions_allowed` is `True`.
-4. The planner honours the `layout` brief roles (`collection`, `facts`, `form`, `actions`), binds the page title and summary from `AuthoredCopy`, attaches the scoped `inspect_event` action to `/events` (`rows` variant, where `"id"` is bound on each repeated row), and computes `fit_score = 0.88` via `compute_fit_score`.
+2. `archetype:act` selects `checkout` (`p = 0.94 >= 0.40`), giving overall plan confidence `0.94`.
+3. `stakes` is `2.4` on the `[0.0, 3.0]` scale (`clamped_stakes = 0.8`), which sets the stakes-scaled action gate threshold at `conservativeness = 0.5` to `0.70 + (0.95 - 0.70) * 0.8 = 0.90`. Because `plan.confidence` (`0.94`) is at least `0.90`, `actions_allowed` is `True`.
+4. The planner honors the `layout` brief roles (`collection`, `facts`, `form`, `actions`), binds the page title from `AuthoredCopy`, attaches the scoped `inspect_event` action to `/events` (`rows` variant, where `"id"` is bound on each repeated row), and computes `fit_score = 0.88` via `compute_fit_score`.
 
 ### Worked example: Stages 6, 7, and 8 (`PatternExpander` and v1.0 messages)
 
@@ -231,7 +231,6 @@ Because `acknowledge` omits an explicit `ActionSpec.context` and the surface has
           "component": "Column",
           "children": [
             "page_head",
-            "page_subtitle",
             "collection_root",
             "facts_root",
             "form_root",
@@ -248,12 +247,6 @@ Because `acknowledge` omits an explicit `ActionSpec.context` and the surface has
           "id": "page_title",
           "component": "Text",
           "text": "## Incident INC-482: Checkout latency spike"
-        },
-        {
-          "id": "page_subtitle",
-          "component": "Text",
-          "text": "Elevated p99 latency in us-east1 after build 2026.11.10-rc3",
-          "variant": "caption"
         },
         {
           "id": "form_fields_0",
@@ -341,7 +334,7 @@ Every emitted message passes `CatalogApi.validator.validate` before leaving `Dec
 
 ## 4. Decision block contract
 
-In chat mode, the conversational model emits a JSON object (or a JSON array of objects, one per surface) inside `<a2ui>...</a2ui>`. In tool mode, the model passes the same JSON fields as arguments to `DecisionRenderTool` (default tool name `"render_decision_ui"`).
+In chat mode, the conversational model emits a JSON object (or a JSON array of objects, one per surface) inside `<a2ui>...</a2ui>`. In tool mode, the model passes the same JSON fields as arguments to `DecisionRenderTool` (default tool name `"render_a2ui_decision"`).
 
 ### Block fields and `DecisionBlock.from_mapping` normalization
 
@@ -351,7 +344,7 @@ In chat mode, the conversational model emits a JSON object (or a JSON array of o
 | :--- | :--- | :--- | :--- |
 | `intent` | `string` | Yes | Non-empty natural-language description of what the data represents and how the user should inspect or interact with it. |
 | `payload` (`data` alias) | `object`, `array`, or JSON `string` | Yes | The data to bind. If passed as a JSON-encoded string, `from_mapping` decodes it and requires a JSON object or array. An array payload is wrapped at `{"items": [...]}` so bindings address `/items/0/...`. `from_mapping` accepts `"data"` as a wire alias when `"payload"` is absent and serializes back to `"payload"`. |
-| `surfaceId` (`surface_id`) | `string` | No | Target surface identifier. When omitted: chat mode (`DecisionFormat` / `DecisionParser`) defaults to `"main"` (or `"main_1"`, `"main_2"` when a single `<a2ui>` block contains a JSON array of multiple blocks without explicit `surfaceId`s); tool mode (`DecisionRenderTool`) defaults to `tool.name` (`"render_decision_ui"`); direct `DecisionSynthesizer.synthesize()` calls default to `SynthesisConfig.default_surface_id` (`"default_surface"`). |
+| `surfaceId` (`surface_id`) | `string` | No | Target surface identifier. When omitted: chat mode (`DecisionFormat` / `DecisionParser`) defaults to `"main"` (or `"main_1"`, `"main_2"` when a single `<a2ui>` block contains a JSON array of multiple blocks without explicit `surfaceId`s); tool mode (`DecisionRenderTool`) defaults to the tool's configured `surface_id` (or `SynthesisConfig.default_surface_id`, `"default_surface"`); direct `DecisionSynthesizer.synthesize()` calls default to `SynthesisConfig.default_surface_id` (`"default_surface"`). |
 | `replace` | `boolean` | No | Defaults to `false`. When `true` on an existing `surfaceId`, the synthesizer emits `deleteSurface` followed by `createSurface`, `updateComponents`, and `updateDataModel`. Setting both `replace: true` and `region` raises `ValueError` in `DecisionBlock.__post_init__`. |
 | `region` | `string` | No | Block role name (such as `"headline"` or `"actions"`) of a single planned block to re-plan and update on an existing cached archetype surface. Cannot be combined with `replace: true`. |
 | `actions` | `object` | No | Ordered map from a non-empty string action ID to either a button label string or an options object (`{"label", "scope"?, "key"?, "context"?, "style"?}`). The action ID becomes the wire `event.name`. |
@@ -412,7 +405,7 @@ Because `generate_catalog_instructions()` lists only component names (`- Card`, 
 Multi-turn surface updates require tracking which `surfaceId` values already exist and whether each active surface was created with `sendDataModel: true`. `RendererState` owns that per-conversation surface state, while `PlanCache` retains the most recent `CachedPlan` (including expanded components by block role) for each surface:
 
 1. Explicit caller state: An application managing its own session object can pass `state=RendererState()` to `parser.parse_response(..., state=state)` or `synthesizer.synthesize(..., state=state)`.
-2. Per-conversation state map: Calling `format.create_parser(conversation_id="conv_42")` or `format.state_for("conv_42")` returns a dedicated `RendererState` for that conversation ID from `DecisionFormat._states`. Calling `create_parser()` with no `conversation_id` allocates a fresh isolated `RendererState` for that turn so concurrent conversations never bleed surface state into one another.
+2. Per-conversation state map: Calling `format.create_parser(conversation_id="conv_42")` or `format.state_for("conv_42")` returns a dedicated `RendererState` for that conversation ID from `DecisionFormat._conversation_states` (a bounded LRU cache with `clear_conversation` for explicit eviction). Calling `create_parser()` with no `conversation_id` allocates a fresh isolated `RendererState` for that turn so concurrent conversations never bleed surface state into one another.
 
 ### Surface lifecycle operations and `sendDataModel`
 
@@ -655,7 +648,7 @@ Bundled calibration profiles live in `python/a2ui_agent/src/a2ui/inference_forma
 }
 ```
 
-When a backend is instantiated without an explicit `Calibration`, `Calibration.load(path, backend_kind=..., model_id=...)` resolves its profile from `calibration_profiles.json` (falling back to `"<backend_kind>"`, then `Calibration(temperature=1.0)`). To fit a temperature for a new backend or model checkpoint, run `eval/bin/calibrate_decision_backend.py`, which minimizes negative log-likelihood on the `"tuning"` split of `decision_bench` only (never on the `"heldout"` split) and writes the fitted temperature into `calibration_profiles.json`.
+When a backend is instantiated without an explicit `Calibration`, `Calibration.load(path, backend_kind=..., model_id=...)` resolves its profile from `calibration_profiles.json` (falling back to `"<backend_kind>"`, then `Calibration(temperature=1.0)`). To fit a temperature for a new backend or model checkpoint, the companion evaluation harness provides `eval/bin/calibrate_decision_backend.py`, which minimizes negative log-likelihood on the `"tuning"` split of `decision_bench` only (never on the `"heldout"` split) and writes the fitted temperature into `calibration_profiles.json`.
 
 ---
 
@@ -706,7 +699,7 @@ Inside a pattern's `components` and `fieldVariants`, JSON objects whose keys beg
 
 ### Authoring and validating patterns with `a2ui-generate-catalog-patterns`
 
-Catalog authors do not have to map every archetype by hand. The `a2ui-generate-catalog-patterns` skill (`.agents/skills/a2ui-generate-catalog-patterns/SKILL.md`, backed by `a2ui.inference_formats.decision.catalog_patterns_tool`) provides two deterministic commands:
+Catalog authors do not have to map every archetype by hand. The companion `a2ui-generate-catalog-patterns` skill (`.agents/skills/a2ui-generate-catalog-patterns/SKILL.md`, backed by `a2ui.inference_formats.decision.catalog_patterns_tool`, tracked as a companion tooling deliverable) provides two deterministic commands:
 
 1. `inspect`: Runs `inspect_catalog(catalog_path)` to classify the catalog's components by role (containers, text, media, collection templates, input controls, and action triggers), reports which of the 20 abstract patterns and 14 archetypes the catalog can support, and lists the recommended pattern mappings.
 2. `validate`: Runs `validate_patterns(catalog_path, patterns_path)` across five checks: JSON Schema conformance against `pattern_definition.json`, `catalogId` and `grammarVersion` match against `catalog.json` and `archetypes.json`, directive and slot integrity against the grammar's `BlockSpec` definitions, dry-run `PatternExpander` expansion of every pattern variant and `fieldVariants` entry against synthetic `BlockBindings` verified by `CatalogApi.validator`, and archetype eligibility coverage (`eligible_archetypes`).
@@ -723,7 +716,7 @@ Applications can expose `a2ui-decision` to the conversational model in two ways:
 
 | Dimension | Chat mode (`DecisionFormat`) | Tool mode (`DecisionRenderTool`) |
 | :--- | :--- | :--- |
-| Model interface | Emits `<a2ui>{...}</a2ui>` blocks inside assistant text responses (`default_surface_id = "main"`). | Calls the structured tool (`tool.name`, defaulting to `"render_decision_ui"`) with JSON arguments matching `tool.parameters_json_schema()`. |
+| Model interface | Emits `<a2ui>{...}</a2ui>` blocks inside assistant text responses (`default_surface_id = "main"`). | Calls the structured tool (`tool.name`, defaulting to `"render_a2ui_decision"`) with JSON arguments matching `tool.parameters_json_schema()`. |
 | Prompt footprint | `DecisionPromptGenerator` injects the 13-field contract and available component names into the system prompt. | `tool.name`, `tool.description`, and `tool.parameters_json_schema()` carry the contract; no `<a2ui>` tag parser is needed. |
 | Lifecycle state | `DecisionFormat.create_parser(conversation_id=...)` binds a per-conversation `RendererState` (enabling `UPDATE_ROOT`, data-only `updateDataModel` hits, `region`, and `REPLACE`). | `DecisionRenderTool` uses a tool-level `PlanCache` without a `RendererState`; tool-cache hits skip the backend (`decision_calls = 0`, `cache_hit = True`) and emit `CREATE` messages (`createSurface`, `updateComponents`, `updateDataModel`). |
 | Template promotion | Templates are registered ahead of time in `TemplateRegistry`. | `tool.promote(template_id, description, is_mutable=...)` promotes the most recent synthesized plan into a reusable `SurfaceTemplate` in `TemplateRegistry` at runtime. |
@@ -747,7 +740,7 @@ template = tool.promote(
 )
 ```
 
-Once promoted, future turns still make 1 backend call (`decision_calls = 1`) to score the `"template"` choice question (`SynthesisStage.TEMPLATE_SELECT`), bypassing full archetype block planning when the template wins above threshold (`0.75` read-only / `0.85` mutable). Note that a `SurfaceTemplate` expands a fixed component snapshot and does not store a `LayoutPlan` in `PlanCache` or set `sendDataModel: true` on `createSurface`, so `region` updates and `sendDataModel: true` require archetype synthesis rather than a promoted static template.
+Once promoted, future turns still make 1 backend call (`decision_calls = 1`) to score the `"template"` choice question (`SynthesisStage.TEMPLATE_SELECT`), bypassing full archetype block planning when the template wins above threshold (`0.75` read-only / `0.85` mutable). Note that a `SurfaceTemplate` expands a fixed component snapshot rather than an archetype block tree (while honoring `template.is_mutable` for `sendDataModel` on `createSurface`), so `region` updates require archetype synthesis rather than a promoted static template.
 
 ### When to author a static `SurfaceTemplate` directly
 
@@ -764,9 +757,9 @@ Calling `await synthesizer.synthesize(intent, payload, ..., state=state)` (or `a
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `stage` | `SynthesisStage` | Which path produced the messages: `TEMPLATE_SELECT`, `ARCHETYPE`, or `ABSTAIN_FALLBACK`. |
-| `messages` | `list[dict[str, Any]]` | Validated A2UI v1.0 protocol messages (`createSurface`, `updateComponents`, `updateDataModel`, `deleteSurface`). |
+| `messages` | `list[AgentToRendererMessage]` | Validated A2UI v1.0 protocol messages (`createSurface`, `updateComponents`, `updateDataModel`, `deleteSurface`). |
 | `operation` | `SurfaceOperation` | Lifecycle operation executed (`CREATE`, `UPDATE_ROOT`, or `REPLACE`). |
-| `backend_kind` | `str` | Backend identifier (`"jev"`, `"gemini"`, `"step0"`, or `"mock"`). |
+| `backend_kind` | `str` | Backend identifier (`"jev"`, `"systemone"`, `"gemini"`, `"step0"`, or `"mock"`). |
 | `model_id` | `str` | Pinned model identifier used for scoring (such as `"jev-1.14.0"`). |
 | `decision_calls` | `int` | Number of `backend.answer` calls made during the turn (`0` on `PlanCache` hit, `1` for single-batch backends, `1` or `2` for two-stage backends). |
 | `decision_latency_ms` | `float` | Wall-clock time spent inside `backend.answer` calls in milliseconds. |
@@ -782,7 +775,7 @@ Calling `await synthesizer.synthesize(intent, payload, ..., state=state)` (or `a
 
 ### Evaluation suite (`decision_bench` and `decision_scorecard`)
 
-The evaluation suite under `eval/a2ui_eval/decision_bench.py`, `eval/bin/decision_bench.py`, and `eval/bin/decision_scorecard.py` measures the decision pipeline across a stratified corpus of cases in `eval/datasets/decision_plans/`. Cases are split into `"tuning"` (used for prompt tuning and temperature calibration via `eval/bin/calibrate_decision_backend.py`) and `"heldout"` (reserved strictly for final release scoring; tuning or calibrating on `"heldout"` is rejected by the calibration script).
+The companion evaluation suite under `eval/a2ui_eval/decision_bench.py`, `eval/bin/decision_bench.py`, and `eval/bin/decision_scorecard.py` (shipped in the companion evaluation package PR) measures the decision pipeline across a stratified corpus of cases in `eval/datasets/decision_plans/`. Cases are split into `"tuning"` (used for prompt tuning and temperature calibration via `eval/bin/calibrate_decision_backend.py`) and `"heldout"` (reserved strictly for final release scoring; tuning or calibrating on `"heldout"` is rejected by the calibration script).
 
 The benchmark and scorecard measure:
 

@@ -52,7 +52,6 @@ from a2ui.inference_formats.decision.layout_planner import (
 from a2ui.inference_formats.decision.models import (
     ActionSpec,
     ActionStyle,
-    AuthoredCopy,
     BlockBindings,
     DecisionAnswer,
     DecisionDistribution,
@@ -697,12 +696,14 @@ def test_lint_components_catches_structural_and_plan_level_violations() -> None:
 
     # Explicit `child_slot_keys` from `CatalogDecisionGraph` flags custom slot names
     explicit_slot_findings = lint_components(
-        [{
-            "id": "root",
-            "component": "CustomOverlay",
-            "opener": "missing_opener",
-            "pane": "",
-        }],
+        [
+            {
+                "id": "root",
+                "component": "CustomOverlay",
+                "opener": "missing_opener",
+                "pane": "",
+            }
+        ],
         child_slot_keys=("opener", "pane"),
     )
     assert {f.code for f in explicit_slot_findings} == {
@@ -1603,14 +1604,16 @@ def test_build_block_batch_and_read_block_replan_single_region() -> None:
         for q_id in asked_ids
     )
 
-    reg_sa = ScriptedAnswers({
-        "salience:/memoryPct": 2.9,
-        "salience:/cpu": 2.5,
-        "anatomy:headline.deltas": 0.90,
-        "anatomy:headline.gauge": 0.85,
-        "instance:headline.news:/memoryPct": ("bad", 0.90),
-        "instance:headline.news:/cpu": ("good", 0.85),
-    })
+    reg_sa = ScriptedAnswers(
+        {
+            "salience:/memoryPct": 2.9,
+            "salience:/cpu": 2.5,
+            "anatomy:headline.deltas": 0.90,
+            "anatomy:headline.gauge": 0.85,
+            "instance:headline.news:/memoryPct": ("bad", 0.90),
+            "instance:headline.news:/cpu": ("good", 0.85),
+        }
+    )
     reg_answers = asyncio.run(reg_sa.backend().answer(reg_batch))
     updated_block = planner.read_block(reg_state, reg_answers)
     assert updated_block.block_id == "headline"
@@ -1650,10 +1653,12 @@ def test_build_block_batch_and_read_block_replan_single_region() -> None:
         intent=_TRANSFER_FIXTURE.intent,
     )
     act_ans = asyncio.run(
-        ScriptedAnswers({
-            "instance:actions.primary:buttons": ("send", 0.95),
-            "instance:actions.destructive:send": 0.10,
-        })
+        ScriptedAnswers(
+            {
+                "instance:actions.primary:buttons": ("send", 0.95),
+                "instance:actions.destructive:send": 0.10,
+            }
+        )
         .backend()
         .answer(act_batch)
     )
@@ -1666,3 +1671,75 @@ def test_build_block_batch_and_read_block_replan_single_region() -> None:
         planner.build_block_batch(plan, "timeline", updated_ptrs)
     with pytest.raises(A2uiValidationError, match="build_block_batch"):
         planner.read_block(full_state, ())
+
+
+def test_terminal_fallback_capabilities_ineligible_pinned_family_and_urgency_at_least() -> (
+    None
+):
+    """Covers terminal fallback capability checks, ineligible pinned families, and `urgency-terse`."""
+    from a2ui.inference_formats.decision.layout_planner import (
+        _resolve_block_pattern,
+    )
+
+    grammar = ArchetypeGrammar.default()
+    # H3: terminal fallback entries (`facts`, `prose`) still check `capabilities.has_pattern`.
+    caps_no_terminals = StubCapabilities(
+        disabled=frozenset(
+            {
+                ("headline", None),
+                ("facts", None),
+                ("banner", None),
+                ("prose", None),
+            }
+        )
+    )
+    assert _resolve_block_pattern(grammar.block("headline"), caps_no_terminals) is None
+    assert _resolve_block_pattern(grammar.block("banner"), caps_no_terminals) is None
+
+    # M3: brief pinning an ineligible family (`input` on a read-only payload) falls back to `family`.
+    brief_input = LayoutBrief.parse(["input:host,cpu"], roles=grammar.brief_roles())
+    _, _, _, pinned_out, pinned_sa = _run_fixture(
+        HOST,
+        {
+            "family": ("monitor", 0.90),
+            "archetype:monitor": ("dashboard", 0.88),
+            "gate:banner": 0.85,
+            "gate:headline": 0.90,
+            "gate:facts": 0.85,
+        },
+        brief=brief_input,
+    )
+    assert "family" in pinned_sa.asked
+    assert pinned_out.reason == "planned"
+    assert pinned_out.plan is not None
+    assert pinned_out.plan.family == "monitor"
+
+    # Q1: `apply_urgency_terse` preserves `prose` when dropping it would violate `archetype.at_least`.
+    planner = LayoutPlanner(grammar, SynthesisConfig())
+    ptrs = inspect_payload_pointers(RESORT.payload)
+    batch, state = planner.build_batch(
+        intent=RESORT.intent, pointers=ptrs, payload=RESORT.payload
+    )
+    ans = asyncio.run(ScriptedAnswers().backend().answer(batch))
+    planner.read(state, ans)
+    state.selected_archetype = grammar.archetype("detail")
+    two_block_plan = LayoutPlan(
+        family="inspect",
+        archetype="detail",
+        stakes=0.5,
+        urgency=2.5,
+        blocks=(
+            PlannedBlock(
+                block_id="prose",
+                pattern="prose",
+                bindings=BlockBindings({"body": SlotBinding(pointer="/about")}),
+            ),
+            PlannedBlock(
+                block_id="facts",
+                pattern="facts",
+                bindings=BlockBindings(),
+            ),
+        ),
+    )
+    kept = apply_urgency_terse(two_block_plan, state)
+    assert [b.block_id for b in kept.blocks] == ["prose", "facts"]

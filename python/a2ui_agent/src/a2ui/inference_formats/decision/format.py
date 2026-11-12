@@ -25,6 +25,7 @@ Plugs local decision-model synthesis into the processor pipeline the same way
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 import threading
 from typing import TYPE_CHECKING, Any
@@ -90,6 +91,7 @@ class DecisionFormat(InferenceFormat):
         surface_id: str = "main",
         fallback_fn: FallbackCallback | None = None,
         block_examples: Sequence[DecisionBlock] = (),
+        max_conversations: int = 256,
     ) -> None:
         """Creates a decision format.
 
@@ -113,16 +115,24 @@ class DecisionFormat(InferenceFormat):
             fallback_fn: Custom fallback called when the model abstains and
                 the block carries no `fallbackDsl`.
             block_examples: Few-shot decision blocks for the prompt.
+            max_conversations: Maximum number of conversation `RendererState`
+                entries retained in the LRU cache. Defaults to 256.
 
         Raises:
             TypeError: If `backend` is None.
-            ValueError: If any catalog's protocol version is not v1.0.
+            ValueError: If any catalog's protocol version is not v1.0, or if
+                `max_conversations` is less than 1.
         """
+        if max_conversations < 1:
+            raise ValueError(
+                f"max_conversations must be >= 1, got {max_conversations}."
+            )
         _warn_message_examples(examples)
         self._catalogs = list(check_mixed_catalogs(catalogs))
         self._block_examples = tuple(block_examples)
         self._registry = registry if registry is not None else TemplateRegistry()
         self.surface_id = surface_id
+        self._max_conversations = int(max_conversations)
         self._synthesizer = DecisionSynthesizer(
             CatalogDecisionGraph(self._catalogs),
             backend,
@@ -133,7 +143,7 @@ class DecisionFormat(InferenceFormat):
             fallback_fn=fallback_fn,
         )
         self._prompt_generator: DecisionPromptGenerator | None = None
-        self._conversation_states: dict[str, RendererState] = {}
+        self._conversation_states: OrderedDict[str, RendererState] = OrderedDict()
         self._states_lock = threading.Lock()
 
     @property
@@ -165,7 +175,14 @@ class DecisionFormat(InferenceFormat):
     def state_for(self, conversation_id: str) -> RendererState:
         """Returns the `RendererState` this format keeps for `conversation_id`.
 
-        Created empty on first use and kept for the life of the format.
+        Created empty on first use and retained in a bounded LRU cache capped
+        at `max_conversations` entries.
+
+        Args:
+            conversation_id: Identifier of the conversation to look up.
+
+        Returns:
+            The `RendererState` associated with `conversation_id`.
         """
         from a2ui.utils import RendererState
 
@@ -174,7 +191,20 @@ class DecisionFormat(InferenceFormat):
             if state is None:
                 state = RendererState(self._catalogs)
                 self._conversation_states[conversation_id] = state
+            else:
+                self._conversation_states.move_to_end(conversation_id)
+            while len(self._conversation_states) > self._max_conversations:
+                self._conversation_states.popitem(last=False)
             return state
+
+    def clear_conversation(self, conversation_id: str) -> None:
+        """Removes the stored `RendererState` for `conversation_id`, if present.
+
+        Args:
+            conversation_id: Identifier of the conversation to evict.
+        """
+        with self._states_lock:
+            self._conversation_states.pop(conversation_id, None)
 
     def create_parser(self, *, conversation_id: str | None = None) -> DecisionParser:
         """Creates a parser that renders blocks through the shared synthesizer.

@@ -50,6 +50,7 @@ import catalog_patterns_tool  # noqa: E402
 
 
 def test_cli_inspect_external_directories_and_modes(tmp_path: Path) -> None:
+    """Verifies that `inspect` classifies external catalogs and honors `--out-dir`."""
     comp_dir = tmp_path / "external_composable"
     comp_cat = write_json(comp_dir, "catalog.json", design_system_catalog_dict("1.0"))
     comp_out = tmp_path / "comp_inspect.json"
@@ -80,16 +81,18 @@ def test_cli_inspect_external_directories_and_modes(tmp_path: Path) -> None:
     custom_out_dir = tmp_path / "custom_out"
     hybrid_out = tmp_path / "hybrid_inspect.json"
 
-    rc_hybrid = catalog_patterns_tool.main([
-        "inspect",
-        str(hybrid_cat),
-        "--out-dir",
-        str(custom_out_dir),
-        "--format",
-        "json",
-        "--out",
-        str(hybrid_out),
-    ])
+    rc_hybrid = catalog_patterns_tool.main(
+        [
+            "inspect",
+            str(hybrid_cat),
+            "--out-dir",
+            str(custom_out_dir),
+            "--format",
+            "json",
+            "--out",
+            str(hybrid_out),
+        ]
+    )
     assert rc_hybrid == 0
     hybrid_data = json.loads(hybrid_out.read_text(encoding="utf-8"))
     assert hybrid_data["mode"] == "hybrid"
@@ -97,6 +100,7 @@ def test_cli_inspect_external_directories_and_modes(tmp_path: Path) -> None:
 
 
 def test_cli_validate_exit_codes_and_auto_discovery(tmp_path: Path) -> None:
+    """Verifies `validate` exit codes (`0`, `1`, `2`), `--strict`, and sidecar auto-discovery."""
     ext_dir = tmp_path / "design_system_repo"
     cat_path = write_json(ext_dir, "catalog.json", design_system_catalog_dict("1.0"))
     write_json(ext_dir, "patterns.json", DESIGN_SYSTEM_PATTERNS)
@@ -105,17 +109,19 @@ def test_cli_validate_exit_codes_and_auto_discovery(tmp_path: Path) -> None:
     )
     out_md = tmp_path / "report.md"
 
-    rc_ok = catalog_patterns_tool.main([
-        "validate",
-        "--catalog",
-        str(cat_path),
-        "--payload",
-        str(pay_path),
-        "--format",
-        "markdown",
-        "--out",
-        str(out_md),
-    ])
+    rc_ok = catalog_patterns_tool.main(
+        [
+            "validate",
+            "--catalog",
+            str(cat_path),
+            "--payload",
+            str(pay_path),
+            "--format",
+            "markdown",
+            "--out",
+            str(out_md),
+        ]
+    )
     assert rc_ok == 0
     assert "# Catalog Validation (PASSED)" in out_md.read_text(encoding="utf-8")
 
@@ -125,38 +131,44 @@ def test_cli_validate_exit_codes_and_auto_discovery(tmp_path: Path) -> None:
         DESIGN_SYSTEM_PATTERNS["patterns"]["prose"]
     )
     unk_pat = write_json(tmp_path, "unknown_patterns.json", with_unknown)
-    rc_non_strict = catalog_patterns_tool.main([
-        "validate",
-        str(unk_pat),
-        "--catalog",
-        str(cat_path),
-        "--payload",
-        str(pay_path),
-    ])
+    rc_non_strict = catalog_patterns_tool.main(
+        [
+            "validate",
+            str(unk_pat),
+            "--catalog",
+            str(cat_path),
+            "--payload",
+            str(pay_path),
+        ]
+    )
     assert rc_non_strict == 0
 
-    rc_strict = catalog_patterns_tool.main([
-        "validate",
-        str(unk_pat),
-        "--catalog",
-        str(cat_path),
-        "--payload",
-        str(pay_path),
-        "--strict",
-    ])
+    rc_strict = catalog_patterns_tool.main(
+        [
+            "validate",
+            str(unk_pat),
+            "--catalog",
+            str(cat_path),
+            "--payload",
+            str(pay_path),
+            "--strict",
+        ]
+    )
     assert rc_strict == 1
 
     # Broken patterns trigger exit code 1.
     broken_pat = write_json(tmp_path, "broken_patterns.json", BROKEN_PATTERNS)
-    rc_broken = catalog_patterns_tool.main([
-        "validate",
-        "--catalog",
-        str(cat_path),
-        "--patterns",
-        str(broken_pat),
-        "--payload",
-        str(pay_path),
-    ])
+    rc_broken = catalog_patterns_tool.main(
+        [
+            "validate",
+            "--catalog",
+            str(cat_path),
+            "--patterns",
+            str(broken_pat),
+            "--payload",
+            str(pay_path),
+        ]
+    )
     assert rc_broken == 1
 
     # Broken templates trigger exit code 1.
@@ -166,14 +178,16 @@ def test_cli_validate_exit_codes_and_auto_discovery(tmp_path: Path) -> None:
     fixed_pay = write_json(
         fixed_dir, "sample_payloads.json", FIXED_FORMS_SAMPLE_PAYLOADS
     )
-    rc_broken_tpl = catalog_patterns_tool.main([
-        "validate",
-        str(broken_tpl),
-        "--catalog",
-        str(fixed_cat),
-        "--payload",
-        str(fixed_pay),
-    ])
+    rc_broken_tpl = catalog_patterns_tool.main(
+        [
+            "validate",
+            str(broken_tpl),
+            "--catalog",
+            str(fixed_cat),
+            "--payload",
+            str(fixed_pay),
+        ]
+    )
     assert rc_broken_tpl == 1
 
     # ToolError (missing catalog or mismatched catalogId) triggers exit code 2.
@@ -185,19 +199,22 @@ def test_cli_validate_exit_codes_and_auto_discovery(tmp_path: Path) -> None:
     mismatched_tpl = copy.deepcopy(FIXED_FORMS_TEMPLATES)
     mismatched_tpl["catalogId"] = HYBRID_CATALOG_ID
     mismatch_path = write_json(tmp_path, "mismatched_templates.json", mismatched_tpl)
-    rc_mismatch = catalog_patterns_tool.main([
-        "validate",
-        "--catalog",
-        str(fixed_cat),
-        "--templates",
-        str(mismatch_path),
-        "--payload",
-        str(fixed_pay),
-    ])
+    rc_mismatch = catalog_patterns_tool.main(
+        [
+            "validate",
+            "--catalog",
+            str(fixed_cat),
+            "--templates",
+            str(mismatch_path),
+            "--payload",
+            str(fixed_pay),
+        ]
+    )
     assert rc_mismatch == 2
 
 
 def test_cli_requires_payload_flag(tmp_path: Path) -> None:
+    """Verifies that `validate` rejects invocations missing the required `--payload` flag."""
     cat_path = write_json(tmp_path, "catalog.json", design_system_catalog_dict("1.0"))
     with pytest.raises(SystemExit) as exc_info:
         catalog_patterns_tool.main(["validate", "--catalog", str(cat_path)])
@@ -205,6 +222,7 @@ def test_cli_requires_payload_flag(tmp_path: Path) -> None:
 
 
 def test_cli_subprocess_smoke_on_basic_catalog(tmp_path: Path) -> None:
+    """Verifies end-to-end subprocess execution of `catalog_patterns_tool.py` on the basic catalog."""
     basic_cat = REPO_ROOT / "catalogs" / "basic" / "v1" / "catalog.json"
     basic_pat = REPO_ROOT / "catalogs" / "basic" / "v1" / "patterns.json"
     pay_path = write_json(

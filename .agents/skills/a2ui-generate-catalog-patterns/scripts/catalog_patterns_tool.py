@@ -42,7 +42,11 @@ from validate_patterns import (  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Builds the `catalog_patterns_tool.py` argument parser."""
+    """Builds the `catalog_patterns_tool.py` argument parser.
+
+    Returns:
+        The configured `ArgumentParser` with `inspect` and `validate` subcommands.
+    """
     parser = argparse.ArgumentParser(
         prog="catalog_patterns_tool.py",
         description=(
@@ -167,9 +171,20 @@ def _resolve_positional_artifact(
     patterns_path: Path | None,
     templates_path: Path | None,
 ) -> tuple[Path | None, Path | None]:
-    """Routes an optional positional artifact path to `patterns_path` or `templates_path`."""
+    """Routes an optional positional artifact path to `patterns_path` or `templates_path`.
+
+    Args:
+        artifact: Optional positional sidecar path passed on the CLI.
+        patterns_path: Explicit `--patterns` flag path, if supplied.
+        templates_path: Explicit `--templates` flag path, if supplied.
+
+    Returns:
+        A `(patterns_path, templates_path)` pair with `artifact` assigned by filename
+        or top-level JSON structure when the corresponding flag was omitted.
+    """
     if artifact is None:
         return patterns_path, templates_path
+    # Inspect the filename first, then fall back to checking for a top-level "templates" key.
     is_templates = artifact.name == "templates.json"
     if not is_templates and artifact.is_file():
         try:
@@ -188,7 +203,14 @@ def _emit_report(
     fmt: str,
     out_path: Path | None,
 ) -> None:
-    """Writes `report_dict` or `markdown_text` to `out_path` or `sys.stdout`."""
+    """Writes `report_dict` or `markdown_text` to `out_path` or `sys.stdout`.
+
+    Args:
+        report_dict: Serialized JSON dictionary representation of the report.
+        markdown_text: Rendered Markdown summary of the report.
+        fmt: Output format name (`"json"` or `"markdown"`).
+        out_path: Optional file path to write instead of `sys.stdout`.
+    """
     resolved_fmt: Literal["json", "markdown"] = "json" if fmt == "json" else "markdown"
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,7 +231,14 @@ def _emit_report(
 
 
 def _run_inspect(args: argparse.Namespace) -> int:
-    """Executes the `inspect` subcommand."""
+    """Executes the `inspect` subcommand.
+
+    Args:
+        args: Parsed CLI arguments for `inspect`.
+
+    Returns:
+        Exit code `0` on successful inspection.
+    """
     loaded = load_catalog(args.catalog, out_dir=args.out_dir)
     report = inspect_catalog(loaded)
     _emit_report(
@@ -222,7 +251,15 @@ def _run_inspect(args: argparse.Namespace) -> int:
 
 
 def _run_validate(args: argparse.Namespace) -> int:
-    """Executes the `validate` subcommand."""
+    """Executes the `validate` subcommand.
+
+    Args:
+        args: Parsed CLI arguments for `validate`.
+
+    Returns:
+        Exit code `0` when all checks pass, or `1` when validation fails or `--strict`
+        rejects unknown pattern names.
+    """
     loaded = load_catalog(args.catalog, out_dir=args.out_dir)
     patterns_path, templates_path = _resolve_positional_artifact(
         args.artifact, args.patterns, args.templates
@@ -247,7 +284,14 @@ def _run_validate(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entrypoint returning 0 on success, 1 on validation failure, or 2 on `ToolError`."""
+    """Runs the CLI entrypoint and returns its process exit code.
+
+    Args:
+        argv: Optional command-line argument sequence; defaults to `sys.argv[1:]`.
+
+    Returns:
+        `0` on success, `1` on validation failure, or `2` on `ToolError`.
+    """
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:

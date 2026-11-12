@@ -309,7 +309,8 @@
     `DecisionQuestion`, `DecisionAnswer`, `DecisionBatch`, and `QuestionKind`
     (`choice`, `boolean`, `score`) describe batched questions;
     `TemplateRegistry` holds reviewable surface templates, and
-    `promote_synthesized` turns an output into one.
+    `promote_synthesized` turns an output into one
+    ([#4155](https://github.com/a2ui-project/a2ui/pull/4155)).
 - Express variable and check identifiers now follow Unicode UAX 31 in the
   grammar and decompiler ([#3390](https://github.com/a2ui-project/a2ui/issues/3390)).
   From protocol v1.0 onward, `ExpressDecompiler` rejects component IDs that are

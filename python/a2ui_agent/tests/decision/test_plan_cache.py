@@ -231,17 +231,23 @@ async def test_hit_is_rejected_when_surface_components_changed() -> None:
 
     # Mutate the surface's components on the state (adding a component and
     # changing `root`'s children), so the cached plan no longer matches.
-    state.apply([{
-        "version": "1.0",
-        "updateComponents": {
-            "surfaceId": "ops",
-            "components": [{
-                "id": "root",
-                "component": "Text",
-                "text": "Manual override",
-            }],
-        },
-    }])
+    state.apply(
+        [
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "ops",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Text",
+                            "text": "Manual override",
+                        }
+                    ],
+                },
+            }
+        ]
+    )
 
     second = await synth.synthesize(
         HOST.intent,
@@ -356,13 +362,15 @@ async def test_cache_never_serves_across_catalogs_or_grammar_versions() -> None:
     assert len(backend.batches) == 2
 
     # A key for a different catalog id also misses on the same state and cache.
-    other_catalog = Catalog.from_json({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "catalogId": "https://example.com/other/v1/catalog.json",
-        "protocolVersion": "1.0",
-        "components": {},
-        "functions": {},
-    })
+    other_catalog = Catalog.from_json(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "catalogId": "https://example.com/other/v1/catalog.json",
+            "protocolVersion": "1.0",
+            "components": {},
+            "functions": {},
+        }
+    )
     other_key = PlanCacheKey(
         surface_id="ops",
         catalog_id=other_catalog.catalog_id,
@@ -371,3 +379,79 @@ async def test_cache_never_serves_across_catalogs_or_grammar_versions() -> None:
     )
     assert synth_basic.plan_cache.get(state, other_key) is None
     assert LayoutPlan(archetype="dashboard", family="monitor", blocks=()) is not None
+
+
+@pytest.mark.asyncio
+async def test_unrolled_array_length_change_misses_cache_and_replans() -> None:
+    steps_scripted: dict[str, ScriptedValue] = {
+        "family": ("follow", 0.90),
+        "stakes": 0.2,
+        "urgency": 0.2,
+        "archetype:follow": ("guide", 0.92),
+        "gate:steps": 0.95,
+    }
+    backend = mock_backend(**steps_scripted)
+    synth = DecisionSynthesizer([CATALOG], backend)
+    state = RendererState([CATALOG])
+
+    payload_2 = {
+        "title": "Deploy guide",
+        "steps": [
+            {"title": "Build", "detail": "Run build"},
+            {"title": "Test", "detail": "Run pytest"},
+        ],
+    }
+    first = await synth.synthesize(
+        "Show the deployment guide steps",
+        payload_2,
+        surface_id="guide",
+        state=state,
+    )
+    state.apply(first.messages)
+    assert first.cache_hit is False
+    assert len(backend.batches) == 1
+
+    # Adding a third step stays in the `"2..6"` cardinality bucket, but because
+    # `steps` statically unrolls its items, it must miss the cache and re-plan.
+    payload_3 = {
+        "title": "Deploy guide",
+        "steps": [
+            {"title": "Build", "detail": "Run build"},
+            {"title": "Test", "detail": "Run pytest"},
+            {"title": "Ship", "detail": "Tag release"},
+        ],
+    }
+    second = await synth.synthesize(
+        "Show the deployment guide steps",
+        payload_3,
+        surface_id="guide",
+        operation=SurfaceOperation.UPDATE_ROOT,
+        state=state,
+    )
+    state.apply(second.messages)
+    assert second.cache_hit is False
+    assert len(backend.batches) == 2
+    assert _kinds(to_message_dicts(second.messages)) == [
+        "updateComponents",
+        "updateDataModel",
+    ]
+
+    # Updating step text while keeping 3 steps hits the cache as data-only.
+    payload_3_edited = {
+        "title": "Deploy guide",
+        "steps": [
+            {"title": "Build", "detail": "Run fast build"},
+            {"title": "Test", "detail": "Run pytest"},
+            {"title": "Ship", "detail": "Tag release"},
+        ],
+    }
+    third = await synth.synthesize(
+        "Show the deployment guide steps",
+        payload_3_edited,
+        surface_id="guide",
+        operation=SurfaceOperation.UPDATE_ROOT,
+        state=state,
+    )
+    assert third.cache_hit is True
+    assert len(backend.batches) == 2
+    assert _kinds(to_message_dicts(third.messages)) == ["updateDataModel"]
