@@ -158,6 +158,8 @@ class DecisionParser(Parser):
                 state=state,
                 **block.to_synthesis_kwargs(default_surface_id=default_id),
             )
+        except DecisionBackendError as exc:
+            raise _as_compilation_error(exc, format_content) from exc
         except A2uiError:
             raise
         except Exception as exc:

@@ -279,8 +279,13 @@ async def _post_json(
 
 
 def _record_token_logprob(result: dict[str, float], token: Any, logprob: Any) -> None:
-    """Inserts `token` and its stripped form into `result` with max `logprob`."""
-    lp = float(logprob)
+    """Inserts `token` and its stripped form into `result` with max finite `logprob`."""
+    try:
+        lp = float(logprob)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(lp):
+        return
     token_str = str(token)
     result[token_str] = lp
     stripped = token_str.strip()
@@ -448,8 +453,15 @@ class Calibration:
         """Returns `probabilities` scaled by this calibration's temperature."""
         if self.temperature == 1.0:
             return dict(probabilities)
+        max_p = max(
+            (p for p in probabilities.values() if math.isfinite(p) and p > 0.0),
+            default=0.0,
+        )
+        if max_p <= 0.0:
+            return dict(probabilities)
+        inv_temp = 1.0 / self.temperature
         scaled = {
-            option: p ** (1.0 / self.temperature) if p > 0.0 else 0.0
+            option: (p / max_p) ** inv_temp if math.isfinite(p) and p > 0.0 else 0.0
             for option, p in probabilities.items()
         }
         total = sum(scaled.values())
@@ -750,6 +762,7 @@ class _HttpClientOwner(_AsyncClosable):
     def _backend_error(
         self, reason: str, endpoint_url: str, cause: BaseException
     ) -> DecisionBackendError:
+        """Builds a `DecisionBackendError` tagged with this backend's kind and model."""
         return DecisionBackendError(
             f"Decision backend {self.backend_kind!r} (model {self.model_id!r})"
             f" request to {endpoint_url} {reason}",
@@ -1071,6 +1084,26 @@ def _single_candidate_answer(question: DecisionQuestion) -> DecisionAnswer:
     )
 
 
+def _extract_systemone_answer_entry(
+    answers_map: Mapping[str, Any],
+    wire_id: str,
+    question_id: str,
+    *,
+    allow_fallback_q: bool,
+) -> Mapping[str, Any]:
+    """Resolves a question's answer mapping from a systemone ``answers`` dictionary."""
+    raw_entry = answers_map.get(wire_id)
+    if not isinstance(raw_entry, Mapping) and wire_id != question_id:
+        raw_entry = answers_map.get(question_id)
+    if isinstance(raw_entry, Mapping):
+        return raw_entry
+    if allow_fallback_q:
+        fallback_q = answers_map.get("q")
+        if isinstance(fallback_q, Mapping):
+            return fallback_q
+    return {}
+
+
 class JevHttpBackend(_HttpClientOwner):
     """HTTP backend for Jev and Gemini Decisions endpoints (native, ``/v1/systemone``, or ``/v1beta/decisions``).
 
@@ -1253,18 +1286,18 @@ class JevHttpBackend(_HttpClientOwner):
             self._record_server_latency(data)
         raw_answers = data.get("answers", {})
         answers_map = raw_answers if isinstance(raw_answers, Mapping) else {}
-        fallback_q = answers_map.get("q")
-        fallback_entry = fallback_q if isinstance(fallback_q, Mapping) else {}
+        allow_fallback_q = len(batch.questions) == 1
         results: list[DecisionAnswer] = []
         for idx, q in enumerate(batch.questions):
             if q.kind is QuestionKind.CHOICE and len(q.candidates()) < 2:
                 results.append(_single_candidate_answer(q))
                 continue
-            wire_id = wire_id_by_index[idx]
-            raw_entry = answers_map.get(wire_id)
-            if not isinstance(raw_entry, Mapping) and wire_id != q.id:
-                raw_entry = answers_map.get(q.id)
-            entry = raw_entry if isinstance(raw_entry, Mapping) else fallback_entry
+            entry = _extract_systemone_answer_entry(
+                answers_map,
+                wire_id_by_index[idx],
+                q.id,
+                allow_fallback_q=allow_fallback_q,
+            )
             answer = _parse_systemone_question_answer(q, entry, data)
             results.append(_apply_calibration(q, answer, self.calibration))
         return tuple(results)
@@ -1360,6 +1393,8 @@ class StepZeroLogprobBackend(_HttpClientOwner):
         if self._auth is None:
             return None
         raw = self._auth() if callable(self._auth) else self._auth
+        if asyncio.iscoroutine(raw):
+            raw = await raw
         if raw == "adc":
             raw = await asyncio.to_thread(_get_adc_token_sync, self._timeout_seconds)
         token = str(raw).strip() if raw else ""
@@ -1688,6 +1723,7 @@ def _default_jev_url_and_model(vendor_key: str | None) -> tuple[str | None, str]
 
 
 def _create_jev_backend(settings: _BackendSettings) -> JevHttpBackend:
+    """Creates a `JevHttpBackend` configured for Jev, SystemOne, or Gemini Decisions."""
     default_url, default_model = _default_jev_url_and_model(settings.vendor_key)
     endpoint = _require_url(settings.kind, settings.url or default_url)
     if endpoint.rstrip("/").endswith("/v1beta/decisions"):
@@ -1715,6 +1751,7 @@ def _create_jev_backend(settings: _BackendSettings) -> JevHttpBackend:
 
 
 def _create_gemini_backend(settings: _BackendSettings) -> JevHttpBackend:
+    """Creates a `JevHttpBackend` configured for the Gemini Decisions API."""
     default_url = _DEFAULT_GEMINI_DECISIONS_URL if settings.vendor_key else None
     default_model = (
         os.environ.get("GEMINI_DECISION_MODEL") or DEFAULT_GEMINI_DECISION_MODEL
@@ -1731,6 +1768,7 @@ def _create_gemini_backend(settings: _BackendSettings) -> JevHttpBackend:
 
 
 def _create_step_zero_backend(settings: _BackendSettings) -> StepZeroLogprobBackend:
+    """Creates a `StepZeroLogprobBackend` from resolved backend settings."""
     endpoint = _require_url(DecisionBackendType.STEP_ZERO.value, settings.url)
     return StepZeroLogprobBackend(
         endpoint,
@@ -1742,6 +1780,7 @@ def _create_step_zero_backend(settings: _BackendSettings) -> StepZeroLogprobBack
 
 
 def _create_mock_backend(settings: _BackendSettings) -> DeterministicMockBackend:
+    """Creates a default `DeterministicMockBackend`."""
     del settings  # The mock takes no configuration from the factory.
     return DeterministicMockBackend()
 
@@ -1756,6 +1795,7 @@ _BACKEND_BUILDERS: dict[str, Callable[[_BackendSettings], DecisionBackend]] = {
 
 
 def _backend_choices() -> str:
+    """Returns a comma-separated string of supported backend kind names."""
     return ", ".join(f"'{k}'" for k in _BACKEND_BUILDERS)
 
 

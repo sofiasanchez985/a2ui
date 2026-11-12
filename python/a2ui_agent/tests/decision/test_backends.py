@@ -27,7 +27,7 @@ from typing import Any
 import httpx
 import pytest
 
-from a2ui.core import A2uiValidationError
+from a2ui.core import A2uiError, A2uiValidationError
 from a2ui.inference_formats.decision import (
     DEFAULT_GEMINI_DECISION_MODEL,
     DEFAULT_TIMEOUT_SECONDS,
@@ -203,6 +203,8 @@ def test_calibration_apply_divides_log_probabilities_by_temperature() -> None:
     assert scaled["a"] == pytest.approx(expected_a)
     assert scaled["c"] == 0.0
     assert Calibration().apply({"a": 0.8, "b": 0.2}) == {"a": 0.8, "b": 0.2}
+    sharp = Calibration(temperature=1e-4).apply({"a": 0.8, "b": 0.2})
+    assert sharp == {"a": pytest.approx(1.0), "b": pytest.approx(0.0)}
 
 
 @pytest.mark.asyncio
@@ -261,6 +263,7 @@ async def test_slow_backend_raises_backend_error_after_the_timeout() -> None:
         elapsed = time.monotonic() - started
 
     assert 0.2 <= elapsed < 0.9
+    assert isinstance(info.value, A2uiError)
     assert info.value.backend_kind == "jev"
     assert info.value.model_id == "m"
     assert info.value.cause is not None
@@ -450,6 +453,24 @@ async def test_jev_systemone_short_circuits_single_option_choices() -> None:
     assert len(requests) == 1
     assert empty.distribution.probabilities == {"a": 0.0, "b": 0.0}
 
+    def partial_handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={"answers": {"q": {"probabilities": {"a": 0.9, "b": 0.1}}}},
+        )
+
+    async with _json_client(partial_handler) as client:
+        partial_backend = JevHttpBackend("http://local/v1/systemone", client=client)
+        first, missing = await partial_backend.answer(
+            _batch(_choice("q", "a", "b"), _choice("other", "a", "b"))
+        )
+    assert first.distribution.probabilities == {
+        "a": pytest.approx(0.9),
+        "b": pytest.approx(0.1),
+    }
+    assert missing.distribution.probabilities == {"a": 0.0, "b": 0.0}
+
 
 @pytest.mark.asyncio
 async def test_jev_http_backend_auth_callable_and_cached_adc(
@@ -622,6 +643,41 @@ async def test_step_zero_missing_tokens_and_logprob_cap() -> None:
     assert missing.distribution.top_logit_margin == pytest.approx(0.0)
     assert captured[1]["logprobs"] == 8
 
+    def non_finite_handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            text=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "logprobs": {
+                                "top_logprobs": [
+                                    {
+                                        "A": float("-inf"),
+                                        "B": float("nan"),
+                                        "C": "bad",
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                allow_nan=True,
+            ),
+        )
+
+    async with _json_client(non_finite_handler) as client:
+        nf_backend = StepZeroLogprobBackend(
+            "http://vllm.local/v1/completions", "gemma", client=client
+        )
+        (nf_answer,) = await nf_backend.answer(_batch(_choice("q", "OptA", "OptB")))
+    assert nf_answer.distribution.probabilities == {
+        "OptA": pytest.approx(0.5),
+        "OptB": pytest.approx(0.5),
+    }
+    assert nf_answer.distribution.top_logit_margin == pytest.approx(0.0)
+
 
 @pytest.mark.asyncio
 async def test_step_zero_chat_completions_case_insensitive_and_bearer_auth() -> None:
@@ -686,6 +742,16 @@ async def test_step_zero_auth_headers(clean_env: pytest.MonkeyPatch) -> None:
     )
     assert await callable_step0._build_headers() == {
         "Authorization": "Bearer from-callable"
+    }
+
+    async def async_auth() -> str:
+        return "from-async-callable"
+
+    async_step0 = StepZeroLogprobBackend(
+        "http://localhost:8000/v1/completions", "m", auth=async_auth
+    )
+    assert await async_step0._build_headers() == {
+        "Authorization": "Bearer from-async-callable"
     }
 
     clean_env.setattr(

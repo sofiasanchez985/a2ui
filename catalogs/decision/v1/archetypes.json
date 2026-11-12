@@ -18,7 +18,7 @@
       "kind": "choice",
       "question": "What is the person here to do?",
       "options": {
-        "browse": "Look through a set of similar things: results, a catalogue, a feed, an inbox, a directory, records.",
+        "browse": "Look through a set of similar things: results, a catalog, a feed, an inbox, a directory, records.",
         "monitor": "See numbers and status at a glance: usage, health, progress, balances, today's summary.",
         "inspect": "Understand one thing in depth: a product, a place, a person, an order, an event, an article.",
         "act": "Commit to or confirm one action, or review something just before or just after it happens.",
@@ -297,7 +297,7 @@
       "gate": {
         "kind": "boolean",
         "question": "Will the person need to search or narrow down what is shown?",
-        "yes": "There are many items, more than fit on a screen, in recognisable categories.",
+        "yes": "There are many items, more than fit on a screen, in recognizable categories.",
         "no": "There are only a few items, or nothing to narrow."
       },
       "slots": {
@@ -541,7 +541,7 @@
       "gate": {
         "kind": "boolean",
         "question": "Are there particulars the person would look up, such as a reference, a date, an address, a status, a total?",
-        "yes": "Labelled values that are read, not acted on: order number, date, address, status, total, owner.",
+        "yes": "Labeled values that are read, not acted on: order number, date, address, status, total, owner.",
         "no": "There are no such particulars, or they are already shown as headline figures."
       },
       "slots": {
@@ -726,6 +726,10 @@
             "picture": {
               "from": ["image_url", "media_object"]
             },
+            "icon": {
+              "from": ["icon", "enum", "tag"],
+              "avoidKeys": ["id", "status", "state", "type", "kind", "tier", "role"]
+            },
             "meta": {
               "from": [
                 "currency",
@@ -837,7 +841,17 @@
             "attributes": {
               "from": ["any"],
               "repeat": true,
-              "max": 5
+              "max": 5,
+              "fields": {
+                "label": {
+                  "from": ["key"],
+                  "required": true
+                },
+                "value": {
+                  "from": ["any"],
+                  "required": true
+                }
+              }
             },
             "highlight": {
               "from": ["currency", "number", "date"]

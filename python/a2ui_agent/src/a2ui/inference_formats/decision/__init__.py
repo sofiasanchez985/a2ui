@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public facade for catalog-agnostic local decision-model A2UI synthesis."""
+"""Public facade for catalog-agnostic local decision-model A2UI synthesis.
+
+Exports the data models, payload pointer inspector, semantic detectors,
+catalog decision graph, surface template registry, and inference backends.
+"""
 
 from __future__ import annotations
 
