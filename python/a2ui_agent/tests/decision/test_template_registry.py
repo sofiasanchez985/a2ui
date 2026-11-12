@@ -415,3 +415,37 @@ class TestTemplateRegistry:
         with pytest.raises(A2uiValidationError):
             registry.promote_plan("t", "", plan, components)
         assert registry.list_templates() == ()
+
+    def test_register_validates_id_description_and_required_pointers(self) -> None:
+        registry = TemplateRegistry()
+        components = ({"id": "root", "component": "Text", "text": "hi"},)
+        for bad in (
+            SurfaceTemplate(
+                template_id=" ",
+                description="desc",
+                surface_id="s",
+                catalog_id=None,
+                protocol_version="v1.0",
+                components=components,
+            ),
+            SurfaceTemplate(
+                template_id="t",
+                description=" ",
+                surface_id="s",
+                catalog_id=None,
+                protocol_version="v1.0",
+                components=components,
+            ),
+            SurfaceTemplate(
+                template_id="t",
+                description="desc",
+                surface_id="s",
+                catalog_id=None,
+                protocol_version="v1.0",
+                components=components,
+                required_pointers=("cpu",),
+            ),
+        ):
+            with pytest.raises(A2uiValidationError):
+                registry.register(bad)
+        assert registry.list_templates() == ()

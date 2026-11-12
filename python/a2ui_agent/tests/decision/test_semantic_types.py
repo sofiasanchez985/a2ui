@@ -339,6 +339,15 @@ class TestDetectorPrecedenceAndHints:
             classify_array_field(["Alice", "Bob", "Carol", "Dave"])
             == SemanticType.STRING
         )
+        assert (
+            classify_array_field(["open", "Alice", "Bob", "Carol"], "notes")
+            == SemanticType.STRING
+        )
+        assert (
+            classify_array_field(["open", "custom_a", "custom_b"], "status")
+            == SemanticType.STATUS
+        )
+        assert classify_array_field([[], ["a", "b"]], "tags") == SemanticType.ARRAY
         assert classify_array_field([1, 2.5, 3], "values") == SemanticType.NUMBER
         assert classify_array_field([None, "", "  "], "notes") == SemanticType.EMPTY
 

@@ -25,19 +25,46 @@ from typing import Any
 
 
 def is_v10(protocol_version: str) -> bool:
-    """Returns whether `protocol_version` targets A2UI v1.0 or later."""
+    """Returns whether `protocol_version` targets A2UI v1.0 or later.
+
+    Args:
+        protocol_version: A2UI protocol version string (for example, ``"v1.0"``
+            or ``"0.9"``).
+
+    Returns:
+        Whether `protocol_version` is in the 1.x major series.
+    """
     clean = protocol_version.lstrip("v")
     return clean == "1" or clean.startswith("1.")
 
 
 def make_data_binding(path: str, *, is_v10: bool) -> dict[str, Any]:
-    """Creates a protocol-versioned A2UI DataBinding dictionary."""
+    """Creates a protocol-versioned A2UI DataBinding dictionary.
+
+    Args:
+        path: RFC 6901 JSON Pointer path in the surface data model.
+        is_v10: Whether to format the binding for protocol version 1.0 or later.
+
+    Returns:
+        A dictionary using ``"@path"`` for v1.0 and later, or ``"path"`` before
+        v1.0.
+    """
     return {"@path": path} if is_v10 else {"path": path}
 
 
 def make_function_call(
     name: str, args: Mapping[str, Any], *, is_v10: bool
 ) -> dict[str, Any]:
-    """Creates a protocol-versioned A2UI catalog function call dictionary."""
+    """Creates a protocol-versioned A2UI catalog function call dictionary.
+
+    Args:
+        name: Catalog function name to invoke.
+        args: Named arguments passed to the catalog function.
+        is_v10: Whether to format the call for protocol version 1.0 or later.
+
+    Returns:
+        A dictionary using ``"@call"`` for v1.0 and later, or ``"call"`` before
+        v1.0.
+    """
     call_key = "@call" if is_v10 else "call"
     return {call_key: name, "args": dict(args)}
