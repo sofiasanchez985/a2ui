@@ -24,6 +24,7 @@ export const playgroundConfig: AppConfig = {
   serverUrl: 'http://localhost:10010',
   // The playground reuses its main surface id across turns.
   clearSurfacesOnResponse: false,
+  inspector: true,
   quickActions: [
     {
       label: 'Host Health',

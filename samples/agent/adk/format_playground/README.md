@@ -6,7 +6,7 @@ In chat mode, the agent works in two stages. Stage 1 is a single model call that
 
 In `tool` mode, the language model is provided domain tools (`get_host_health`, `get_resort`, `get_transfer_quote`, `get_playback_settings`, `get_order_details`, `get_deploy_runbook`). The tool output is passed directly to the decision synthesizer without asking the language model to write UI code. You can also run any tool directly with zero LLM calls via the example buttons under the input bar or `/tool <name>`.
 
-Every turn ends with a footer card naming the mode, the decision backend and its model id, the number of model calls, the latency, token counts, and archetype or path details, including why a fallback ran.
+Every turn ends with a footer card naming the mode, the decision backend and its model id, the number of model calls, the latency, token counts, and archetype or path details, including why a fallback ran. When opened through the Lit shell (`?app=playground`), a split-screen pipeline inspector replaces the inline footer and `/compare` summary cards with an interactive four-stage waterfall.
 
 ## Prerequisites
 
@@ -67,14 +67,41 @@ Open `http://localhost:<port>/?app=playground` with the port Vite prints.
 
 Three things about this client are worth knowing. It renders A2UI surfaces
 only, so the agent's text replies (`/help`, the footer, `/trace`) arrive as
-small cards. The playground config sets `clearSurfacesOnResponse: false`, so
-surfaces stay on screen: `decision` and `tool` renders reuse one `main`
-surface and update it in place from turn to turn (or recreate it when a block
-sets `replace`), while `express`, `direct`, and `/compare` renders get a new
-surface per turn. The `decision` and `tool` modes need a client that speaks
-A2UI v1.0. And if you paste a message that is a bare JSON object, the shell sends
-it as data rather than text; the agent uses it verbatim as the payload, which is
-the quickest way to try your own data shapes.
+small cards. The playground config sets `clearSurfacesOnResponse: false` and
+`inspector: true`, keeping surfaces on screen while `<playground-inspector>`
+shows the turn trace on the right. The client persists the A2A `contextId`
+across turns so `PlanCache` hits on repeated payload shapes (`Reset session`
+in the inspector clears `contextId`).
+
+`decision` and `tool` renders
+reuse one `main` surface and update it in place from turn to turn (or recreate
+it when a block sets `replace`), while `express`, `direct`, and `/compare`
+renders get a new surface per turn. The `decision` and `tool` modes need a
+client that speaks A2UI v1.0. And if you paste a message that is a bare JSON
+object, the shell sends it as data rather than text; the agent uses it verbatim
+as the payload, which is the quickest way to try your own data shapes.
+
+### Split-screen pipeline inspector
+
+When the client sends `a2uiPlaygroundInspector: true` in A2A request metadata,
+the server omits the inline `turn-N-*-footer` and `turn-N-compare` cards and
+attaches an in-band `application/x-a2ui-playground-trace+json` `DataPart` to the
+response. The `<playground-inspector>` component renders that trace as a
+four-stage collapsible waterfall:
+
+1. `1. Block Input` shows how the `DecisionBlock` was produced (Stage 1 LLM call,
+   direct `/tool` command, tool call, or pasted JSON) along with its `intent`,
+   `payload`, `mutablePaths`, and `actions`.
+2. `2. Decision Input` (collapsed initially) shows the backend, model id,
+   `PlanCache` hit status, `shapeSignature`, decision context JSON, and
+   planner question batch (with pruned questions and `Raw Wire JSON`).
+3. `3. Decision Output & Plan` shows the chosen synthesis stage, confidence, fit
+   score, per-question probability bars with threshold ticks, and the resulting
+   `LayoutPlan` block tree (or raw backend answers).
+4. `4. A2UI JSON` shows the synthesized A2UI v1.0 wire messages with a toggle to
+   view the decompiled A2UI Express source. On `/compare` turns, a mode switcher
+   in the inspector header lets you inspect `decision`, `express`, and `direct`
+   side by side.
 
 ## Commands
 

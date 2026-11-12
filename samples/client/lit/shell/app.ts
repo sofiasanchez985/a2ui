@@ -19,6 +19,8 @@ import {provide} from '@lit/context';
 import {LitElement, html, css, nothing} from 'lit';
 import {customElement, state, query} from 'lit/decorators.js';
 import {SnackbarMessage, SnackType} from './types/types.js';
+import {A2UIClientTurnResult, PlaygroundTurnTrace} from './types/inspector.js';
+import './ui/inspector.js';
 import {Snackbar} from './ui/snackbar.js';
 import {repeat} from 'lit/directives/repeat.js';
 
@@ -72,6 +74,12 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   @state()
   private _toastType = 'info';
 
+  @state()
+  private _trace: PlaygroundTurnTrace | null = null;
+
+  @state()
+  private _inspectorOpen = true;
+
   private _toastTimeout: number | undefined;
 
   static override styles = [
@@ -87,6 +95,66 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
         min-height: 100%;
         color: light-dark(var(--n-10), var(--n-90));
         font-family: var(--font-family);
+      }
+
+      :host([inspector-layout]) {
+        max-width: 1480px;
+        padding: 0 16px;
+      }
+
+      :host([inspector-layout][inspector-collapsed]) {
+        max-width: 720px;
+      }
+
+      .workspace-grid {
+        display: grid;
+        grid-template-columns: minmax(420px, 620px) minmax(440px, 1fr);
+        gap: 20px;
+        align-items: start;
+        width: 100%;
+      }
+
+      .workspace-grid.inspector-collapsed {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      @media (max-width: 960px) {
+        .workspace-grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+
+      .canvas-column {
+        min-width: 0;
+      }
+
+      .inspector-column {
+        min-width: 0;
+        position: sticky;
+        top: 16px;
+        max-height: calc(100vh - 32px);
+        overflow: auto;
+      }
+
+      .inspector-drawer-toggle {
+        padding: 0 12px;
+        margin: 0;
+        border: 1px solid var(--p-60);
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        position: fixed;
+        top: var(--bb-grid-size-3);
+        right: calc(var(--bb-grid-size-4) + 56px);
+        background: light-dark(var(--n-100), var(--n-10));
+        border-radius: 999px;
+        color: light-dark(var(--p-40), var(--n-90));
+        cursor: pointer;
+        height: 48px;
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 500;
+        z-index: 10;
       }
 
       #hero-img {
@@ -650,6 +718,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     // Set the CSS Overrides for the given appKey.
     if (
       this.config.cssOverrides &&
+      Array.isArray(document.adoptedStyleSheets) &&
       !document.adoptedStyleSheets.includes(this.config.cssOverrides)
     ) {
       document.adoptedStyleSheets = [...document.adoptedStyleSheets, this.config.cssOverrides];
@@ -659,6 +728,31 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     // Initialize client with configured URL
     this._a2uiClient = new A2UIClient(this.config.serverUrl);
   }
+
+  protected override updated() {
+    const inspectorEnabled = this.#isInspectorEnabled();
+    this.classList.toggle('inspector-layout', inspectorEnabled);
+    this.classList.toggle('inspector-collapsed', inspectorEnabled && !this._inspectorOpen);
+    this.toggleAttribute('inspector-layout', inspectorEnabled);
+    this.toggleAttribute('inspector-collapsed', inspectorEnabled && !this._inspectorOpen);
+  }
+
+  #isInspectorEnabled(): boolean {
+    return Boolean(this.config.inspector) && !this._isLocalMode;
+  }
+
+  #toggleInspector = () => {
+    this._inspectorOpen = !this._inspectorOpen;
+  };
+
+  #resetSession = () => {
+    this._a2uiClient.resetSession();
+    for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
+      this._processor.model.deleteSurface(surfaceId);
+    }
+    this._lastMessages = [];
+    this._trace = null;
+  };
 
   protected override firstUpdated() {
     if (this._pendingSnackbarMessages.length > 0) {
@@ -670,6 +764,32 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   }
 
   override render() {
+    if (this.#isInspectorEnabled()) {
+      return [
+        this.#renderLocalModeHeader(),
+        this.#renderInspectorToggle(),
+        this.#renderThemeToggle(),
+        html`<div class="workspace-grid ${this._inspectorOpen ? '' : 'inspector-collapsed'}">
+          <div class="canvas-column">
+            ${this.#maybeRenderForm()} ${this.#maybeRenderQuickActions()} ${this.#maybeRenderData()}
+            ${this.#maybeRenderError()}
+          </div>
+          ${this._inspectorOpen
+            ? html`<aside class="inspector-column" aria-label="Pipeline Inspector">
+                <playground-inspector
+                  .trace=${this._trace}
+                  .loading=${this._requesting}
+                  @toggle-inspector=${this.#toggleInspector}
+                  @reset-session=${this.#resetSession}
+                ></playground-inspector>
+              </aside>`
+            : nothing}
+        </div>`,
+        this.#renderToast(),
+        html`<ui-snackbar></ui-snackbar>`,
+      ];
+    }
+
     return [
       this.#renderLocalModeHeader(),
       this.#renderThemeToggle(),
@@ -680,6 +800,19 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
       this.#renderToast(),
       html`<ui-snackbar></ui-snackbar>`,
     ];
+  }
+
+  #renderInspectorToggle() {
+    return html`<button
+      type="button"
+      class="inspector-drawer-toggle"
+      @click=${this.#toggleInspector}
+      aria-expanded=${this._inspectorOpen ? 'true' : 'false'}
+      title=${this._inspectorOpen ? 'Hide pipeline inspector' : 'Show pipeline inspector'}
+    >
+      <span class="material-symbols">${this._inspectorOpen ? 'visibility_off' : 'visibility'}</span>
+      <span>${this._inspectorOpen ? 'Hide Inspector' : 'Inspector'}</span>
+    </button>`;
   }
 
   #renderLocalModeHeader() {
@@ -720,90 +853,20 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
 
   #maybeRenderForm() {
     const clearsSurfaces = this.config.clearSurfacesOnResponse ?? true;
-    if (this._requesting && clearsSurfaces) return nothing;
-    if (this._lastMessages.length > 0 && clearsSurfaces) return nothing;
+    if ((this._requesting || this._lastMessages.length > 0) && clearsSurfaces) {
+      return nothing;
+    }
     if (this._isLocalMode) return nothing;
-
     if (this.config.key === 'local') {
-      return html`
-        <div class="local-header-section">
-          <h1>${this.config.title}</h1>
-          <p>
-            Upload an A2UI JSON mockup file to render and test your interactive layouts locally.
-          </p>
-          <p class="support-info">
-            Supports A2UI Protocol v0.9 (Renderer v0.9.3). Only supports the basic catalog for now.
-          </p>
-        </div>
-
-        <div class="local-upload-container">
-          <button type="button" class="primary-upload-btn" @click=${this.#triggerFileUpload}>
-            Browse JSON File
-          </button>
-
-          <input
-            type="file"
-            accept=".json"
-            id="local-file-input"
-            style="display: none"
-            @change=${this.#onLocalFileChange}
-          />
-
-          <div class="samples-section">
-            <h3>Or quick-load a built-in sample:</h3>
-            <div class="samples-grid">
-              <button
-                type="button"
-                class="sample-btn"
-                @click=${() => this.#loadBuiltinSample('contact_card.json')}
-              >
-                Contact Card
-              </button>
-              <button
-                type="button"
-                class="sample-btn"
-                @click=${() => this.#loadBuiltinSample('workspace_settings.json')}
-              >
-                Workspace Setup
-              </button>
-            </div>
-          </div>
-        </div>
-      `;
+      return this.#renderLocalUploadSection();
     }
 
-    const showHero = clearsSurfaces || this._lastMessages.length === 0;
+    const showHero = this.#shouldShowHero(clearsSurfaces);
     return html`<form
       class=${showHero ? '' : 'compact'}
-      @submit=${async (evt: Event) => {
-        evt.preventDefault();
-        if (!(evt.target instanceof HTMLFormElement)) {
-          return;
-        }
-        const formEl = evt.target;
-        const data = new FormData(formEl);
-        const body = data.get('body') ?? null;
-        if (!body) {
-          return;
-        }
-        if (!clearsSurfaces) {
-          formEl.reset();
-        }
-        const message = body as any;
-        await this.#sendAndProcessMessage(message);
-      }}
+      @submit=${(evt: Event) => this.#onFormSubmit(evt, clearsSurfaces)}
     >
-      ${showHero && this.config.heroImage
-        ? html`<div
-            style=${styleMap({
-              '--background-image-light': `url(${this.config.heroImage})`,
-              '--background-image-dark': `url(${
-                this.config.heroImageDark ?? this.config.heroImage
-              })`,
-            })}
-            id="hero-img"
-          ></div>`
-        : nothing}
+      ${this.#maybeRenderHero(showHero)}
       ${showHero ? html`<h1 class="app-title">${this.config.title}</h1>` : nothing}
       <div>
         <input
@@ -821,6 +884,84 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
         </button>
       </div>
     </form>`;
+  }
+
+  #shouldShowHero(clearsSurfaces: boolean): boolean {
+    if (clearsSurfaces) return true;
+    return (
+      this._lastMessages.length === 0 &&
+      this._trace === null &&
+      this._processor.model.surfacesMap.size === 0
+    );
+  }
+
+  #maybeRenderHero(showHero: boolean) {
+    if (!showHero || !this.config.heroImage) return nothing;
+    return html`<div
+      style=${styleMap({
+        '--background-image-light': `url(${this.config.heroImage})`,
+        '--background-image-dark': `url(${this.config.heroImageDark ?? this.config.heroImage})`,
+      })}
+      id="hero-img"
+    ></div>`;
+  }
+
+  async #onFormSubmit(evt: Event, clearsSurfaces: boolean) {
+    evt.preventDefault();
+    if (!(evt.target instanceof HTMLFormElement)) return;
+    const formEl = evt.target;
+    const body = new FormData(formEl).get('body') ?? null;
+    if (!body) return;
+    if (!clearsSurfaces) {
+      formEl.reset();
+    }
+    await this.#sendAndProcessMessage(body as any);
+  }
+
+  #renderLocalUploadSection() {
+    return html`
+      <div class="local-header-section">
+        <h1>${this.config.title}</h1>
+        <p>Upload an A2UI JSON mockup file to render and test your interactive layouts locally.</p>
+        <p class="support-info">
+          Supports A2UI Protocol v0.9 (Renderer v0.9.3). Only supports the basic catalog for now.
+        </p>
+      </div>
+
+      <div class="local-upload-container">
+        <button type="button" class="primary-upload-btn" @click=${this.#triggerFileUpload}>
+          Browse JSON File
+        </button>
+
+        <input
+          type="file"
+          accept=".json"
+          id="local-file-input"
+          style="display: none"
+          @change=${this.#onLocalFileChange}
+        />
+
+        <div class="samples-section">
+          <h3>Or quick-load a built-in sample:</h3>
+          <div class="samples-grid">
+            <button
+              type="button"
+              class="sample-btn"
+              @click=${() => this.#loadBuiltinSample('contact_card.json')}
+            >
+              Contact Card
+            </button>
+            <button
+              type="button"
+              class="sample-btn"
+              @click=${() => this.#loadBuiltinSample('workspace_settings.json')}
+            >
+              Workspace Setup
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   #maybeRenderQuickActions() {
@@ -863,14 +1004,15 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
     }
   }
 
-  async #sendMessage(message: any): Promise<any[]> {
+  async #sendMessage(message: any): Promise<A2UIClientTurnResult> {
     try {
       this._requesting = true;
       this.#startLoadingAnimation();
       // The catalogs that the processor renders, sent with every request.
-      const response = this._a2uiClient.send(
+      const response = this._a2uiClient.sendTurn(
         message,
         this._processor.getRendererCapabilities({versions: ['v0.9', '1.0']}),
+        {inspector: Boolean(this.config.inspector)},
       );
       await response;
       this._requesting = false;
@@ -884,7 +1026,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
       this.#stopLoadingAnimation();
     }
 
-    return [];
+    return {messages: [], trace: null, contextId: null};
   }
 
   #maybeRenderData() {
@@ -926,45 +1068,53 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   }
 
   async #sendAndProcessMessage(request) {
-    const messages = await this.#sendMessage(request);
+    const result = await this.#sendMessage(request);
+    const messages = result.messages as any[];
     console.debug('Received messages', messages);
 
     this._lastMessages = messages;
+    if (result.trace !== null) {
+      this._trace = result.trace;
+    }
 
-    // Most demo agents send a fresh surface every turn, so the shell clears
-    // the old ones first. Agents that update surfaces across turns (by
-    // reusing a surface id or sending `deleteSurface` themselves) opt out
-    // with `clearSurfacesOnResponse: false`.
     if (this.config.clearSurfacesOnResponse ?? true) {
-      for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
-        this._processor.model.deleteSurface(surfaceId);
-      }
+      this.#deleteAllSurfaces();
     } else {
-      const deletedInBatch = new Set<string>();
-      for (const msg of messages) {
-        const deletedId = msg?.deleteSurface?.surfaceId;
-        if (typeof deletedId === 'string') {
-          deletedInBatch.add(deletedId);
-        }
-      }
-      for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
-        if (surfaceId.startsWith('turn-')) {
-          this._processor.model.deleteSurface(surfaceId);
-        }
-      }
-      for (const msg of messages) {
-        const createdId = msg?.createSurface?.surfaceId;
-        if (
-          typeof createdId === 'string' &&
-          !deletedInBatch.has(createdId) &&
-          this._processor.model.surfacesMap.has(createdId)
-        ) {
-          this._processor.model.deleteSurface(createdId);
-        }
-      }
+      this.#pruneTurnSurfacesBeforeBatch(messages);
     }
 
     this._processor.processMessages(messages);
+  }
+
+  #deleteAllSurfaces() {
+    for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
+      this._processor.model.deleteSurface(surfaceId);
+    }
+  }
+
+  #pruneTurnSurfacesBeforeBatch(messages: any[]) {
+    const deletedInBatch = new Set<string>();
+    for (const msg of messages) {
+      const deletedId = msg?.deleteSurface?.surfaceId;
+      if (typeof deletedId === 'string') {
+        deletedInBatch.add(deletedId);
+      }
+    }
+    for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
+      if (surfaceId.startsWith('turn-')) {
+        this._processor.model.deleteSurface(surfaceId);
+      }
+    }
+    for (const msg of messages) {
+      const createdId = msg?.createSurface?.surfaceId;
+      if (
+        typeof createdId === 'string' &&
+        !deletedInBatch.has(createdId) &&
+        this._processor.model.surfacesMap.has(createdId)
+      ) {
+        this._processor.model.deleteSurface(createdId);
+      }
+    }
   }
 
   #triggerFileUpload() {
@@ -988,6 +1138,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
         const messages = Array.isArray(parsed) ? parsed : [parsed];
 
         this._isLocalMode = true;
+        this._trace = null;
 
         // Clear all existing surfaces
         for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
@@ -1012,6 +1163,7 @@ export class A2UILayoutEditor extends SignalWatcher(LitElement) {
   #clearLocalFile() {
     this._isLocalMode = false;
     this._localFileName = '';
+    this._trace = null;
     for (const surfaceId of Array.from(this._processor.model.surfacesMap.keys())) {
       this._processor.model.deleteSurface(surfaceId);
     }

@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {test, expect} from 'vitest';
+import {describe, it, test, expect, beforeEach, afterEach} from 'vitest';
+import type {A2UILayoutEditor} from '../app.js';
 
 /**
  * Smoke test to ensure that the Vite dev server compilation pipeline correctly
@@ -36,3 +37,61 @@ test(
   },
   VITE_COMPILE_TIMEOUT,
 );
+
+describe('a2ui-shell layout and inspector integration', () => {
+  beforeEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('renders <playground-inspector> when ?app=playground is active and toggles/resets cleanly', async () => {
+    await import('../app.js');
+    window.history.replaceState({}, '', '/?app=playground');
+    const el = document.createElement('a2ui-shell') as A2UILayoutEditor;
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    expect(el.hasAttribute('inspector-layout')).toBe(true);
+    const inspector = el.shadowRoot?.querySelector('playground-inspector') as
+      | (HTMLElement & {trace: unknown})
+      | null;
+    expect(inspector).not.toBeNull();
+
+    // Dispatch toggle-inspector event from the inspector
+    inspector!.dispatchEvent(new CustomEvent('toggle-inspector', {bubbles: true, composed: true}));
+    await el.updateComplete;
+    expect(el.hasAttribute('inspector-collapsed')).toBe(true);
+    expect(el.shadowRoot?.querySelector('playground-inspector')).toBeNull();
+
+    // Re-open via top drawer toggle button
+    const toggleBtn = el.shadowRoot?.querySelector('.inspector-drawer-toggle') as HTMLButtonElement;
+    expect(toggleBtn).not.toBeNull();
+    toggleBtn.click();
+    await el.updateComplete;
+    expect(el.hasAttribute('inspector-collapsed')).toBe(false);
+    const reopened = el.shadowRoot?.querySelector('playground-inspector') as
+      | (HTMLElement & {trace: unknown})
+      | null;
+    expect(reopened).not.toBeNull();
+
+    // Dispatch reset-session event
+    reopened!.dispatchEvent(new CustomEvent('reset-session', {bubbles: true, composed: true}));
+    await el.updateComplete;
+    expect(reopened!.trace).toBeNull();
+  });
+
+  it('omits <playground-inspector> for ?app=restaurant', async () => {
+    await import('../app.js');
+    window.history.replaceState({}, '', '/?app=restaurant');
+    const el = document.createElement('a2ui-shell') as A2UILayoutEditor;
+    document.body.appendChild(el);
+    await el.updateComplete;
+
+    expect(el.hasAttribute('inspector-layout')).toBe(false);
+    expect(el.shadowRoot?.querySelector('playground-inspector')).toBeNull();
+  });
+});
