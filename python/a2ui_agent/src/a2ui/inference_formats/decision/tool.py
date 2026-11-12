@@ -48,14 +48,16 @@ from .models import (
     SynthesisOutput,
 )
 from .patterns import MergedPatternLibrary, PatternLibrary
-from .payload_inspector import inspect_payload_pointers
+from .payload_inspector import PointerSummary, inspect_payload_pointers
 from .plan_cache import CachedPlan, PlanCache
 from .synthesizer import (
     DecisionSynthesizer,
     FallbackCallback,
     _as_data_model,
+    _unrolled_array_cardinalities_match,
     _with_labels,
     _without_excluded,
+    _without_non_mutable_secrets,
 )
 from .template_registry import SurfaceTemplate, TemplateRegistry
 
@@ -313,6 +315,7 @@ class DecisionRenderTool:
     def _synthesis_kwargs(
         self, args: Mapping[str, Any]
     ) -> tuple[DecisionBlock, dict[str, Any]]:
+        """Parses tool `args` into a `DecisionBlock` and synthesizer keyword arguments."""
         block = DecisionBlock.from_mapping(args)
         kwargs = block.to_synthesis_kwargs(default_surface_id=self._surface_id)
         if block.replace:
@@ -321,14 +324,17 @@ class DecisionRenderTool:
 
     def _tool_cache_key(
         self, block: DecisionBlock
-    ) -> tuple[PlanCacheKey, Mapping[str, Any]]:
+    ) -> tuple[PlanCacheKey, Mapping[str, Any], tuple[PointerSummary, ...]]:
+        """Builds the tool-mode `PlanCacheKey`, normalized data model, and pointers."""
         data = _as_data_model(block.payload)
-        pointers = _with_labels(
-            _without_excluded(
-                inspect_payload_pointers(data, mutable_paths=block.mutable_paths),
-                block.exclude,
-            ),
-            block.labels,
+        pointers = _without_non_mutable_secrets(
+            _with_labels(
+                _without_excluded(
+                    inspect_payload_pointers(data, mutable_paths=block.mutable_paths),
+                    block.exclude,
+                ),
+                block.labels,
+            )
         )
         key = self.synthesizer.make_cache_key(
             self.name,
@@ -342,21 +348,24 @@ class DecisionRenderTool:
             title=block.title,
             summary=block.summary,
         )
-        return key, data
+        return key, data, pointers
 
     def _check_tool_cache(
         self, block: DecisionBlock, kwargs: Mapping[str, Any]
     ) -> tuple[PlanCacheKey, str, SynthesisOutput | None]:
+        """Checks the tool-mode `PlanCache` and returns a rendered hit when eligible."""
         target_surface_id = str(
             kwargs.get("surface_id") or self.synthesizer.config.default_surface_id
         )
         cache = self.synthesizer.plan_cache
         if block.replace:
             cache.invalidate_tool(self.name)
-        cache_key, data = self._tool_cache_key(block)
+        cache_key, data, pointers = self._tool_cache_key(block)
         if not block.replace and block.region is None:
             cached = cache.get_tool(cache_key)
-            if cached is not None:
+            if cached is not None and _unrolled_array_cardinalities_match(
+                cached.plan, pointers
+            ):
                 self._last_cached = cached
                 self._last_surface_id = target_surface_id
                 return (
@@ -370,17 +379,24 @@ class DecisionRenderTool:
 
     def _record_tool_output(
         self,
+        block: DecisionBlock,
         cache_key: PlanCacheKey,
         target_surface_id: str,
         output: SynthesisOutput,
     ) -> SynthesisOutput:
+        """Records a full-surface `SynthesisOutput` in the tool-mode plan cache."""
+        # Region updates emit only the replaced block subtree (without `root`)
+        # and must not overwrite the full-surface tool plan cache or `_last_cached`.
         if (
-            output.layout_plan is not None
+            block.region is None
+            and output.layout_plan is not None
             and output.messages
             and output.fallback_source is None
         ):
             entry = self.synthesizer._store_cached_plan(None, cache_key, output)
-            if entry is not None:
+            if entry is not None and any(
+                c.get("id") == "root" for c in entry.components
+            ):
                 self.synthesizer.plan_cache.put_tool(cache_key, entry)
                 self._last_cached = entry
                 self._last_surface_id = target_surface_id
@@ -465,10 +481,13 @@ class DecisionRenderTool:
 
         Args:
             args: The tool-call arguments, with the field names from
-                `parameters_json_schema` (snake_case spellings are accepted).
+                `parameters_json_schema` (snake_case aliases are accepted).
             include_trace: Accepted for compatibility; the trace is always on
                 the returned output, and `format_result` decides whether to
                 serialize it.
+
+        Returns:
+            The `SynthesisOutput` emitted for the tool call.
 
         Raises:
             ValueError: If `intent` is missing, `payload` is an invalid JSON
@@ -483,7 +502,7 @@ class DecisionRenderTool:
         output = await self.synthesizer.synthesize(
             block.intent, block.payload, **kwargs
         )
-        return self._record_tool_output(cache_key, target_surface_id, output)
+        return self._record_tool_output(block, cache_key, target_surface_id, output)
 
     def run_sync(
         self, args: Mapping[str, Any], *, include_trace: bool | None = None
@@ -495,7 +514,7 @@ class DecisionRenderTool:
         if hit is not None:
             return hit
         output = self.synthesizer.synthesize_sync(block.intent, block.payload, **kwargs)
-        return self._record_tool_output(cache_key, target_surface_id, output)
+        return self._record_tool_output(block, cache_key, target_surface_id, output)
 
 
 __all__ = ["DecisionRenderTool"]

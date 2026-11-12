@@ -170,6 +170,7 @@ class PlanCache:
         self._tool_entries: OrderedDict[PlanCacheKey, CachedPlan] = OrderedDict()
 
     def _evict(self, lru: OrderedDict[PlanCacheKey, CachedPlan]) -> None:
+        """Evicts oldest entries from `lru` until its length is at most `max_entries`."""
         while len(lru) > self.max_entries:
             lru.popitem(last=False)
 

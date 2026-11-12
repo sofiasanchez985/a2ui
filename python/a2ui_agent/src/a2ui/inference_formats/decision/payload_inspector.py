@@ -113,6 +113,26 @@ class PointerSummary:
     `value_type` is the coarse JSON type; `semantic_type` and the fields after
     it are the semantic view the archetype grammar binds slots against. They
     default so callers that only know the coarse type keep working.
+
+    Attributes:
+        path: RFC 6901 JSON Pointer path in the payload.
+        value_type: Coarse JSON value type at `path`.
+        cardinality: Number of elements for containers, or 1 for scalars.
+        element_keys: Escaped field names observed across object elements of an
+            array.
+        sample_type_by_key: Coarse value type for each key in `element_keys`.
+        mutable_hint: Whether the pointer or a parent path is user-editable.
+        semantic_type: Fine-grained `SemanticType` classification for `path`.
+        hints: Detector hints such as `wordCount`, `unit`, `currency`, `min`,
+            and `max`.
+        key: Last pointer segment, unescaped; derived from `path` when empty.
+        label: Humanized display label derived from `key`.
+        parent: Parent JSON Pointer (``""`` for top-level keys); derived when
+            None.
+        element_semantic_types: Mapping from array element key to its
+            `SemanticType`.
+        sample_pointers: Element-level pointers offered to single-value slots,
+            such as ``"/photos/0/url"``.
     """
 
     path: str
@@ -122,21 +142,14 @@ class PointerSummary:
     sample_type_by_key: dict[str, str] = field(default_factory=dict, hash=False)
     mutable_hint: bool = False
     semantic_type: SemanticType = field(default=cast(SemanticType, None))
-    """The payload inspector populates it; plain strings are coerced."""
     hints: Mapping[str, Any] = field(default_factory=dict, hash=False)
-    """Detector hints such as `wordCount`, `unit`, `currency`, `min`, `max`."""
     key: str = ""
-    """The last pointer segment, unescaped; derived from `path` when empty."""
     label: str = ""
-    """Humanized key for display."""
     parent: str | None = None
-    """The parent pointer (``""`` for top-level keys); derived when None."""
     element_semantic_types: Mapping[str, SemanticType] = field(
         default_factory=dict, hash=False
     )
-    """For arrays: element key to its `SemanticType`."""
     sample_pointers: tuple[str, ...] = ()
-    """Element-level pointers offered to single-value slots, e.g. ``/photos/0/url``."""
 
     def __post_init__(self) -> None:
         was_unlabeled = not self.label
@@ -202,6 +215,12 @@ def split_pointer(path: str) -> tuple[str, str]:
 
     ``"/a/b~1c"`` becomes ``("/a", "b/c")``; a relative key such as ``"name"``
     becomes ``("", "name")``; the root pointer ``""`` becomes ``("", "")``.
+
+    Args:
+        path: RFC 6901 JSON Pointer or relative key string.
+
+    Returns:
+        A ``(parent_pointer, unescaped_last_key)`` pair.
     """
     if "/" not in path:
         return "", _unescape_pointer_segment(path)
@@ -396,12 +415,12 @@ def inspect_payload_pointers(
     """Extracts RFC 6901 JSON Pointer summaries from a structured data payload.
 
     Args:
-      payload: The root dictionary representing the surface data model.
-      mutable_paths: Collection of JSON Pointer paths (or parent prefixes) that
-        are mutable or user-editable.
+        payload: Root mapping representing the surface data model.
+        mutable_paths: JSON Pointer paths (or parent prefixes) that are
+            user-editable.
 
     Returns:
-      A list of `PointerSummary` entries in traversal order.
+        A list of `PointerSummary` entries in traversal order.
     """
     results: list[PointerSummary] = []
     mutable_set = {str(p) for p in mutable_paths}

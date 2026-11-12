@@ -57,30 +57,32 @@ from .layout_fixtures import HOST, RESORT, SETTINGS, TRANSFER, mock_backend
 
 def _two_component_domain_catalog() -> Catalog:
     """Two-component domain catalog (`TelemetryBadge`, `AlertFrame`) with no basic patterns."""
-    return Catalog.from_json({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "catalogId": "https://example.com/catalogs/telemetry/v1/catalog.json",
-        "protocolVersion": "1.0",
-        "components": {
-            "TelemetryBadge": {
-                "type": "object",
-                "properties": {
-                    "component": {"const": "TelemetryBadge"},
-                    "metric": {"$ref": "common_types.json#/$defs/DynamicString"},
+    return Catalog.from_json(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "catalogId": "https://example.com/catalogs/telemetry/v1/catalog.json",
+            "protocolVersion": "1.0",
+            "components": {
+                "TelemetryBadge": {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "TelemetryBadge"},
+                        "metric": {"$ref": "common_types.json#/$defs/DynamicString"},
+                    },
+                    "required": ["component", "metric"],
                 },
-                "required": ["component", "metric"],
-            },
-            "AlertFrame": {
-                "type": "object",
-                "properties": {
-                    "component": {"const": "AlertFrame"},
-                    "child": {"$ref": "common_types.json#/$defs/ComponentId"},
+                "AlertFrame": {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "AlertFrame"},
+                        "child": {"$ref": "common_types.json#/$defs/ComponentId"},
+                    },
+                    "required": ["component", "child"],
                 },
-                "required": ["component", "child"],
             },
-        },
-        "functions": {},
-    })
+            "functions": {},
+        }
+    )
 
 
 def _wrap_surface(components: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -199,20 +201,24 @@ def test_multi_catalog_merge_and_primary_precedence() -> None:
             "chart": {
                 "slots": ["series", "title"],
                 "root": "chart_root",
-                "components": [{
-                    "id": "chart_root",
-                    "component": "Text",
-                    "text": {"$slot": "title", "$default": "Chart"},
-                }],
+                "components": [
+                    {
+                        "id": "chart_root",
+                        "component": "Text",
+                        "text": {"$slot": "title", "$default": "Chart"},
+                    }
+                ],
             },
             "headline": {
                 "slots": ["items"],
                 "root": "domain_headline",
-                "components": [{
-                    "id": "domain_headline",
-                    "component": "Text",
-                    "text": {"$slot": "items", "$default": "Headline"},
-                }],
+                "components": [
+                    {
+                        "id": "domain_headline",
+                        "component": "Text",
+                        "text": {"$slot": "items", "$default": "Headline"},
+                    }
+                ],
             },
         },
     }
@@ -526,25 +532,29 @@ def test_expand_every_basic_v1_pattern_validates_without_coercion() -> None:
         {"label": "Beta", "value": "B"},
     ]
     form_items = []
-    for idx, control in enumerate((
-        "shortText",
-        "longText",
-        "number",
-        "obscured",
-        "toggle",
-        "choice",
-        "multiChoice",
-        "range",
-        "date",
-    )):
-        form_items.append({
-            "label": SlotBinding(literal=f"Field {idx}"),
-            "value": SlotBinding(pointer=f"/f{idx}"),
-            "options": SlotBinding(literal=choice_opts),
-            "min": SlotBinding(literal=0),
-            "max": SlotBinding(literal=100),
-            "control": SlotBinding(literal=control),
-        })
+    for idx, control in enumerate(
+        (
+            "shortText",
+            "longText",
+            "number",
+            "obscured",
+            "toggle",
+            "choice",
+            "multiChoice",
+            "range",
+            "date",
+        )
+    ):
+        form_items.append(
+            {
+                "label": SlotBinding(literal=f"Field {idx}"),
+                "value": SlotBinding(pointer=f"/f{idx}"),
+                "options": SlotBinding(literal=choice_opts),
+                "min": SlotBinding(literal=0),
+                "max": SlotBinding(literal=100),
+                "control": SlotBinding(literal=control),
+            }
+        )
     form_exp = expander.expand_block(
         "form",
         "form",
@@ -1216,11 +1226,13 @@ def test_by_type_honors_slot_binding_semantic_type_and_fallback_remaps() -> None
     raw_pat["patterns"]["media"]["components"][0]["children"].append(
         {"id": "empty_sub"}
     )
-    raw_pat["patterns"]["media"]["components"].append({
-        "id": "empty_sub",
-        "component": "Row",
-        "children": [{"id": "opt_txt", "$if": "nonexistent_slot"}],
-    })
+    raw_pat["patterns"]["media"]["components"].append(
+        {
+            "id": "empty_sub",
+            "component": "Row",
+            "children": [{"id": "opt_txt", "$if": "nonexistent_slot"}],
+        }
+    )
     raw_pat["patterns"]["media"]["components"].append(
         {"id": "opt_txt", "component": "Text", "text": "Never"}
     )
@@ -1316,19 +1328,21 @@ def test_region_expand_block_preserves_stable_component_ids_single_and_multi_cat
     ptrs = inspect_payload_pointers(HOST.payload)
     batch, state = planner.build_batch(HOST.intent, ptrs, payload=HOST.payload)
     answers = asyncio.run(
-        ScriptedAnswers({
-            "family": ("monitor", 0.90),
-            "archetype:monitor": ("dashboard", 0.85),
-            "gate:banner": 0.85,
-            "gate:headline": 0.90,
-            "gate:facts": 0.80,
-            "salience:/cpu": 2.9,
-            "salience:/status": 2.1,
-            "salience:/uptimeHours": 1.4,
-            "salience:/host": 0.5,
-            "instance:banner.tone:/status": ("warning", 0.90),
-            "instance:headline.news:/cpu": ("bad", 0.85),
-        })
+        ScriptedAnswers(
+            {
+                "family": ("monitor", 0.90),
+                "archetype:monitor": ("dashboard", 0.85),
+                "gate:banner": 0.85,
+                "gate:headline": 0.90,
+                "gate:facts": 0.80,
+                "salience:/cpu": 2.9,
+                "salience:/status": 2.1,
+                "salience:/uptimeHours": 1.4,
+                "salience:/host": 0.5,
+                "instance:banner.tone:/status": ("warning", 0.90),
+                "instance:headline.news:/cpu": ("bad", 0.85),
+            }
+        )
         .backend()
         .answer(batch)
     )
@@ -1376,28 +1390,30 @@ def test_region_expand_block_preserves_stable_component_ids_single_and_multi_cat
 
     # Multi-catalog surface (`graph.surface_catalog_id is None`): default prefix includes catalog slug
     domain_cat = _two_component_domain_catalog()
-    domain_lib = PatternLibrary.from_json({
-        "grammarVersion": "1",
-        "catalogId": domain_cat.catalog_id,
-        "patterns": {
-            "banner": {
-                "slots": ["title"],
-                "root": "alert_root",
-                "components": [
-                    {
-                        "id": "alert_root",
-                        "component": "AlertFrame",
-                        "child": "alert_badge",
-                    },
-                    {
-                        "id": "alert_badge",
-                        "component": "TelemetryBadge",
-                        "metric": {"$slot": "title", "$default": "ok"},
-                    },
-                ],
-            }
-        },
-    })
+    domain_lib = PatternLibrary.from_json(
+        {
+            "grammarVersion": "1",
+            "catalogId": domain_cat.catalog_id,
+            "patterns": {
+                "banner": {
+                    "slots": ["title"],
+                    "root": "alert_root",
+                    "components": [
+                        {
+                            "id": "alert_root",
+                            "component": "AlertFrame",
+                            "child": "alert_badge",
+                        },
+                        {
+                            "id": "alert_badge",
+                            "component": "TelemetryBadge",
+                            "metric": {"$slot": "title", "$default": "ok"},
+                        },
+                    ],
+                }
+            },
+        }
+    )
     basic_lib = PatternLibrary.from_json(
         copy.deepcopy(load_asset("patterns/basic_v1_0.json"))
     )
@@ -1458,13 +1474,15 @@ def test_form_field_variants_all_emit_required_checks_with_at_call() -> None:
     field_comps = [c for c in exp.components if c["id"] != "form_root"]
     assert len(field_comps) == len(controls)
     for comp in field_comps:
-        assert comp["checks"] == [{
-            "condition": {
-                "@call": "required",
-                "args": {"value": comp["value"]},
-            },
-            "message": "Required",
-        }]
+        assert comp["checks"] == [
+            {
+                "condition": {
+                    "@call": "required",
+                    "args": {"value": comp["value"]},
+                },
+                "message": "Required",
+            }
+        ]
 
 
 def test_stamp_function_calls_and_hatch_build_hook_empty_build_data(

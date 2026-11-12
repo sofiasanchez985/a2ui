@@ -48,6 +48,7 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 def _first_present(source: Mapping[str, Any], names: Sequence[str]) -> Any:
+    """Returns the value of the first key from `names` present in `source`, or None."""
     for name in names:
         if name in source:
             return source[name]
@@ -148,6 +149,7 @@ def _parse_actions(raw: Any) -> tuple[ActionSpec, ...]:
 
 
 def _parse_replace(raw: Any) -> bool:
+    """Validates an optional boolean ``replace`` flag, defaulting to False."""
     if raw is None:
         return False
     if not isinstance(raw, bool):
@@ -285,6 +287,7 @@ class DecisionBlock:
         payload = coerce_decision_payload(raw_payload)
 
         def _optional_str(key: str) -> str | None:
+            """Reads and trims an optional string field aliased under `key`."""
             value = _first_present(source, _FIELD_ALIASES[key])
             if value is None:
                 return None
@@ -400,10 +403,13 @@ def _data_model_in(msg: Mapping[str, Any]) -> Mapping[str, Any] | Sequence[Any] 
     Reads `updateDataModel.value`, v0.8 `dataModelUpdate.contents`, and a
     v1.0 `createSurface.dataModel`.
     """
-    for key, field in (("updateDataModel", "value"), ("dataModelUpdate", "contents")):
+    for key, field_name in (
+        ("updateDataModel", "value"),
+        ("dataModelUpdate", "contents"),
+    ):
         body = msg.get(key)
         if isinstance(body, Mapping):
-            value = body.get(field)
+            value = body.get(field_name)
             return value if isinstance(value, (Mapping, list, tuple)) else None
     create = msg.get("createSurface")
     if isinstance(create, Mapping):

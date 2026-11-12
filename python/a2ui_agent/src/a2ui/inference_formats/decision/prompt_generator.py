@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from a2ui.constants import A2UI_INFERENCE_CLOSE_TAG, A2UI_INFERENCE_OPEN_TAG
 from a2ui.core import CatalogApi
@@ -127,7 +127,12 @@ def decision_rules(archetypes: ArchetypeGrammar) -> str:
     return DECISION_RULES_TEMPLATE.format(brief_roles=roles)
 
 
+if TYPE_CHECKING:
+    DECISION_RULES: str
+
+
 def __getattr__(name: str) -> Any:
+    """Resolves `DECISION_RULES` lazily on first attribute access."""
     # `DECISION_RULES` is resolved lazily so importing this module does not load
     # and validate the bundled grammar.
     if name == "DECISION_RULES":
@@ -205,6 +210,7 @@ class DecisionPromptGenerator(PromptGenerator):
         return self._archetypes
 
     def _get_graph(self) -> CatalogDecisionGraph:
+        """Returns the cached `CatalogDecisionGraph` for `self._catalogs`."""
         if self._graph is None:
             self._graph = CatalogDecisionGraph(self._catalogs)
         return self._graph
